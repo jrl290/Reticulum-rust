@@ -666,14 +666,29 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                     let _ = reply.send(result);
                 }
                 LinkMsg::Initiate(reply) => {
-                    match link.initiate() {
-                        Ok(()) => {
-                            // Update the shared cached id
+                    // Three-step initiation so a LINKPROOF arriving on the
+                    // wire (which can happen the instant `packet.send()`
+                    // returns, or even slightly before for loopback paths)
+                    // can always be routed to this handle:
+                    //   1. `initiate_prepare` builds the LR packet and
+                    //      derives the real `link.link_id`.
+                    //   2. We update the shared cached id on the handle
+                    //      AND insert this handle into the runtime
+                    //      registry under the real id — both before the
+                    //      packet hits the wire.
+                    //   3. `initiate_send` performs the (potentially
+                    //      blocking) `packet.send()`.
+                    match link.initiate_prepare() {
+                        Ok(packet) => {
                             let new_id = link.link_id.clone();
                             if let Ok(mut id) = self_handle.id.lock() {
                                 *id = new_id;
                             }
-                            let _ = reply.send(Ok(()));
+                            register_runtime_link_handle(self_handle.clone());
+                            match link.initiate_send(packet) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(_) => { let _ = reply.send(Err(LinkGone)); }
+                            }
                         }
                         Err(_) => { let _ = reply.send(Err(LinkGone)); }
                     }
@@ -935,21 +950,34 @@ static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, LinkHandle>>> =
 /// Register a link handle in the global registry.
 /// The actor thread is already running (spawned in LinkHandle::spawn),
 /// so no separate watchdog thread is needed.
+///
+/// If a handle is already registered under the same `link_id`, it is
+/// REPLACED. Suppressing duplicates is unsafe because most callers run
+/// the actor's `LinkMsg::Initiate` flow, which always calls this with
+/// the freshly-derived real `link_id`; an older entry with the same id
+/// is necessarily stale (e.g. a previous registration during an earlier
+/// reconnect cycle that never got cleaned up).
 pub fn register_runtime_link_handle(handle: LinkHandle) {
     let link_id = handle.link_id();
     let link_id_hex = crate::hexrep(&link_id, false);
     if let Ok(mut links) = RUNTIME_LINKS.lock() {
-        if links.contains_key(&link_id) {
+        let was_present = links.contains_key(&link_id);
+        links.insert(link_id, handle);
+        if was_present {
             crate::log(
-                &format!("RUNTIME duplicate link registration suppressed link={} total={}", link_id_hex, links.len()),
-                crate::LOG_WARNING,
+                &format!("RUNTIME register link={} (replaced existing entry) total={}", link_id_hex, links.len()),
+                crate::LOG_NOTICE,
                 false,
                 false,
             );
-            return;
+        } else {
+            crate::log(
+                &format!("RUNTIME register link={} total={}", link_id_hex, links.len()),
+                crate::LOG_NOTICE,
+                false,
+                false,
+            );
         }
-        crate::log(&format!("RUNTIME register link={} total={}", link_id_hex, links.len() + 1), crate::LOG_NOTICE, false, false);
-        links.insert(link_id, handle);
     }
 }
 
@@ -1598,6 +1626,20 @@ impl Link {
     }
 
     pub fn initiate(&mut self) -> Result<(), String> {
+        let packet = self.initiate_prepare()?;
+        self.initiate_send(packet)
+    }
+
+    /// First half of `initiate()`: generate ephemeral keys, build the LR
+    /// packet, derive the link_id, and register the link with `Transport`.
+    /// Returns the prepared packet for the caller to send.
+    ///
+    /// Split out so the link actor can update its cached `LinkHandle.id`
+    /// and runtime registry entry BEFORE the slow `packet.send()` lets a
+    /// LINKPROOF race back in. Without this split, the cached id stays at
+    /// its placeholder value (see `new_outbound`/`new_inbound`), causing
+    /// runtime registry collisions and dropped LINKPROOFs.
+    pub fn initiate_prepare(&mut self) -> Result<Packet, String> {
         if !self.initiator {
             return Err("Cannot initiate inbound link".to_string());
         }
@@ -1667,15 +1709,27 @@ impl Link {
         self.request_time = Some(now_seconds());
 
         crate::transport::Transport::register_link(self.clone());
+        Ok(packet)
+    }
+
+    /// Second half of `initiate()`: actually transmit the LR packet.
+    /// This is the slow part — `packet.send()` may block on `Transport::outbound`.
+    pub fn initiate_send(&mut self, mut packet: Packet) -> Result<(), String> {
         packet.send()?;
         self.had_outbound(false);
-
         Ok(())
     }
 
     /// Create a new outbound link to a destination
     pub fn new_outbound(destination: Destination, mode: u8) -> Result<Self, String> {
-        let link_id = (0..16).map(|i| ((i * 7) % 256) as u8).collect::<Vec<_>>();
+        // Random placeholder — the REAL link_id is derived from the LR
+        // packet inside `initiate_prepare()`. We never use this value to
+        // route packets, but it's exposed via `LinkHandle::link_id()`
+        // before initiate runs, so it must be unique to avoid spurious
+        // collisions in the runtime registry.
+        let mut link_id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut link_id);
+        let link_id = link_id.to_vec();
         let established_at = current_time();
         
         Ok(Link {
@@ -1744,7 +1798,13 @@ impl Link {
     
     /// Create a new inbound link for an incoming request
     pub fn new_inbound(owner_destination: Destination) -> Result<Self, String> {
-        let link_id = (0..16).map(|i| ((i * 7) % 256) as u8).collect::<Vec<_>>();
+        // Random placeholder — the real link_id is set by
+        // `validate_request` from the inbound LR packet. Random avoids
+        // spurious runtime-registry collisions if the handle is exposed
+        // before validation completes.
+        let mut link_id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut link_id);
+        let link_id = link_id.to_vec();
         let established_at = current_time();
         
         Ok(Link {

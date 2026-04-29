@@ -274,6 +274,73 @@ pub extern "C" fn rns_interface_online(name: *const c_char) -> i32 {
 }
 
 // =========================================================================
+// Published destinations (Transport-managed announce daemon)
+// =========================================================================
+
+/// Opt a destination into Transport's auto-announce daemon.
+///
+/// `dest_hash` / `hash_len` — destination hash (16 bytes typical).
+/// `refresh_secs`           — periodic refresh interval in seconds. Pass
+///                            `0.0` to only re-announce on interface
+///                            up-edges (no periodic timer).
+/// `app_data` / `app_data_len` — optional app_data; pass `null`/0 to use
+///                               the destination's configured app_data.
+///
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn rns_transport_publish_destination(
+    dest_hash: *const u8,
+    hash_len: u32,
+    refresh_secs: f64,
+    app_data: *const u8,
+    app_data_len: u32,
+) -> i32 {
+    let h = slice_from_raw(dest_hash, hash_len);
+    if h.is_empty() {
+        set_error("destination hash is empty".into());
+        return -1;
+    }
+    let app = if app_data.is_null() || app_data_len == 0 {
+        None
+    } else {
+        Some(slice_from_raw(app_data, app_data_len))
+    };
+    ffi::transport_publish_destination(&h, refresh_secs, app.as_deref());
+    0
+}
+
+/// Remove a destination from the announce daemon's published set.
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn rns_transport_unpublish_destination(
+    dest_hash: *const u8,
+    hash_len: u32,
+) -> i32 {
+    let h = slice_from_raw(dest_hash, hash_len);
+    if h.is_empty() {
+        set_error("destination hash is empty".into());
+        return -1;
+    }
+    ffi::transport_unpublish_destination(&h);
+    0
+}
+
+/// Query whether a destination is currently published.
+/// Returns 1 = published, 0 = not published, -1 = invalid input.
+#[no_mangle]
+pub extern "C" fn rns_transport_is_published(
+    dest_hash: *const u8,
+    hash_len: u32,
+) -> i32 {
+    let h = slice_from_raw(dest_hash, hash_len);
+    if h.is_empty() {
+        set_error("destination hash is empty".into());
+        return -1;
+    }
+    if ffi::transport_is_published(&h) { 1 } else { 0 }
+}
+
+// =========================================================================
 // Settings (stateless)
 // =========================================================================
 
@@ -443,4 +510,356 @@ pub extern "C" fn rns_link_request(
 #[no_mangle]
 pub extern "C" fn rns_nudge_reconnect() {
     crate::interfaces::tcp_interface::nudge_reconnect();
+}
+
+// =========================================================================
+// RNode callback interface (KISS framing + radio config in Rust, raw bytes
+// shuttled by a native bridge — e.g. CoreBluetooth on iOS).
+// =========================================================================
+
+/// C-ABI radio configuration for an RNode interface.
+///
+/// All fields are required. To leave an `Option<>` field unset, pass the
+/// matching `_set` flag as 0; the value is then ignored.
+#[repr(C)]
+pub struct RnsRNodeRadioConfig {
+    pub frequency: u64,
+    pub bandwidth: u32,
+    pub txpower: u8,
+    pub sf: u8,
+    pub cr: u8,
+    /// 0 = no flow control, non-zero = enabled.
+    pub flow_control: u8,
+    /// 0 = no short-term airtime limit, 1 = use `st_alock_pct` (0..=100).
+    pub st_alock_set: u8,
+    pub st_alock_pct: f32,
+    pub lt_alock_set: u8,
+    pub lt_alock_pct: f32,
+    /// 0 = no ID beacon, 1 = use `id_interval_secs` + `id_callsign`.
+    pub id_beacon_set: u8,
+    pub id_interval_secs: u64,
+    /// Pointer to the callsign bytes (UTF-8 expected, but raw bytes are
+    /// accepted). May be NULL when `id_beacon_set == 0`.
+    pub id_callsign: *const u8,
+    pub id_callsign_len: u32,
+}
+
+/// C-ABI snapshot of RNode telemetry returned by [`rns_rnode_iface_get_stats`].
+///
+/// `*_set` flags indicate whether the matching field has been populated by
+/// the read loop yet. Numeric fields with no `_set` flag (like
+/// `airtime_short`) are always populated with the latest value (initially 0).
+#[repr(C)]
+pub struct RnsRNodeStats {
+    pub online: u8,
+    pub detected: u8,
+    pub frequency_set: u8,
+    pub frequency: u64,
+    pub bandwidth_set: u8,
+    pub bandwidth: u32,
+    pub txpower_set: u8,
+    pub txpower: u8,
+    pub sf_set: u8,
+    pub sf: u8,
+    pub cr_set: u8,
+    pub cr: u8,
+    pub rssi_set: u8,
+    pub rssi: i16,
+    pub snr_set: u8,
+    pub snr: f32,
+    pub q_set: u8,
+    pub q: f32,
+    pub rx_packets_set: u8,
+    pub rx_packets: u32,
+    pub tx_packets_set: u8,
+    pub tx_packets: u32,
+    pub airtime_short: f32,
+    pub airtime_long: f32,
+    pub channel_load_short: f32,
+    pub channel_load_long: f32,
+    /// Battery state (see [`crate::interfaces::rnode_interface::BatteryState`]).
+    pub battery_state: u8,
+    pub battery_percent: u8,
+    pub temperature_set: u8,
+    pub temperature: i8,
+    pub firmware_maj: u8,
+    pub firmware_min: u8,
+}
+
+/// TX callback signature: invoked from Rust when KISS-framed bytes are ready
+/// to be written to the radio. The bridge is responsible for any link-MTU
+/// chunking (e.g. 20-byte BLE writes). Return non-zero on success.
+pub type RnsRNodeSendFn =
+    unsafe extern "C" fn(user_data: *mut std::ffi::c_void, data: *const u8, len: u32) -> i32;
+
+/// Register an RNode callback interface. Spawns the read loop and runs the
+/// DETECT/init handshake synchronously (~3s while bytes are fed in).
+///
+/// `name`      – interface name (also used as the Transport routing key).
+/// `send_fn`   – TX callback (see [`RnsRNodeSendFn`]).
+/// `user_data` – opaque pointer passed back to `send_fn` on every call.
+/// `cfg`       – radio parameters.
+///
+/// Returns a handle (>0) or 0 on error (check [`rns_last_error`]).
+///
+/// # Safety
+/// `name` must be a NUL-terminated UTF-8 string. `cfg` must point to a valid
+/// `RnsRNodeRadioConfig` and remain valid for the duration of this call. If
+/// `cfg.id_beacon_set != 0`, `cfg.id_callsign` must point to at least
+/// `cfg.id_callsign_len` valid bytes.
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub unsafe extern "C" fn rns_rnode_iface_register(
+    name: *const c_char,
+    send_fn: RnsRNodeSendFn,
+    user_data: *mut std::ffi::c_void,
+    cfg: *const RnsRNodeRadioConfig,
+) -> u64 {
+    if cfg.is_null() {
+        set_error("cfg is null".into());
+        return 0;
+    }
+    let name_s = cstr_to_string(name);
+    let c = &*cfg;
+
+    let id_callsign: Option<Vec<u8>> = if c.id_beacon_set != 0 && !c.id_callsign.is_null() && c.id_callsign_len > 0 {
+        Some(slice_from_raw(c.id_callsign, c.id_callsign_len))
+    } else {
+        None
+    };
+    let id_interval = if c.id_beacon_set != 0 {
+        Some(std::time::Duration::from_secs(c.id_interval_secs))
+    } else {
+        None
+    };
+
+    let config = crate::interfaces::rnode_interface::RNodeRadioConfig {
+        frequency: c.frequency,
+        bandwidth: c.bandwidth,
+        txpower: c.txpower,
+        sf: c.sf,
+        cr: c.cr,
+        flow_control: c.flow_control != 0,
+        st_alock: if c.st_alock_set != 0 { Some(c.st_alock_pct) } else { None },
+        lt_alock: if c.lt_alock_set != 0 { Some(c.lt_alock_pct) } else { None },
+        id_interval,
+        id_callsign,
+    };
+
+    // Adapter: wrap the C function pointer + user_data into a Rust closure.
+    // SAFETY: `user_data` is treated as an opaque pointer; we never deref it.
+    // The bridge must keep whatever it points at alive until the matching
+    // `rns_rnode_iface_deregister` call.
+    let user_data_addr = user_data as usize;
+    let send_arc: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(move |data: &[u8]| -> bool {
+        let ud = user_data_addr as *mut std::ffi::c_void;
+        let rc = unsafe { send_fn(ud, data.as_ptr(), data.len() as u32) };
+        rc != 0
+    });
+
+    match crate::ffi::rnode_iface_register(&name_s, send_arc, config) {
+        Ok(h) => h,
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+/// Build the RNode interface and spawn its read loop, but do NOT run the
+/// DETECT/init handshake. The native bridge can call this synchronously,
+/// store the returned handle, then start feeding RX bytes via
+/// [`rns_rnode_iface_feed`] before calling [`rns_rnode_iface_configure`]
+/// on a background thread.
+///
+/// Returns a handle (>0) or 0 on error (check [`rns_last_error`]).
+///
+/// # Safety
+/// Same as [`rns_rnode_iface_register`].
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub unsafe extern "C" fn rns_rnode_iface_create(
+    name: *const c_char,
+    send_fn: RnsRNodeSendFn,
+    user_data: *mut std::ffi::c_void,
+    cfg: *const RnsRNodeRadioConfig,
+) -> u64 {
+    if cfg.is_null() {
+        set_error("cfg is null".into());
+        return 0;
+    }
+    let name_s = cstr_to_string(name);
+    let c = &*cfg;
+
+    let id_callsign: Option<Vec<u8>> = if c.id_beacon_set != 0 && !c.id_callsign.is_null() && c.id_callsign_len > 0 {
+        Some(slice_from_raw(c.id_callsign, c.id_callsign_len))
+    } else {
+        None
+    };
+    let id_interval = if c.id_beacon_set != 0 {
+        Some(std::time::Duration::from_secs(c.id_interval_secs))
+    } else {
+        None
+    };
+
+    let config = crate::interfaces::rnode_interface::RNodeRadioConfig {
+        frequency: c.frequency,
+        bandwidth: c.bandwidth,
+        txpower: c.txpower,
+        sf: c.sf,
+        cr: c.cr,
+        flow_control: c.flow_control != 0,
+        st_alock: if c.st_alock_set != 0 { Some(c.st_alock_pct) } else { None },
+        lt_alock: if c.lt_alock_set != 0 { Some(c.lt_alock_pct) } else { None },
+        id_interval,
+        id_callsign,
+    };
+
+    let user_data_addr = user_data as usize;
+    let send_arc: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(move |data: &[u8]| -> bool {
+        let ud = user_data_addr as *mut std::ffi::c_void;
+        let rc = unsafe { send_fn(ud, data.as_ptr(), data.len() as u32) };
+        rc != 0
+    });
+
+    match crate::ffi::rnode_iface_create(&name_s, send_arc, config) {
+        Ok(h) => h,
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+/// Run the DETECT/init handshake on a previously-created RNode handle and
+/// wire it into the Transport. Blocks for ~2-4 seconds.
+///
+/// Returns 0 on success, -1 on error (check [`rns_last_error`]).
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub unsafe extern "C" fn rns_rnode_iface_configure(handle: u64) -> i32 {
+    match crate::ffi::rnode_iface_configure(handle) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Push RX bytes (received from the radio over BLE/USB) into the RNode
+/// interface's read loop.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `data` must point to at least `len` valid bytes.
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub unsafe extern "C" fn rns_rnode_iface_feed(
+    handle: u64,
+    data: *const u8,
+    len: u32,
+) -> i32 {
+    if data.is_null() || len == 0 {
+        return 0;
+    }
+    let bytes = std::slice::from_raw_parts(data, len as usize);
+    match crate::ffi::rnode_iface_feed(handle, bytes) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Fetch the latest device telemetry into `out`.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `out` must point to a valid, writable [`RnsRNodeStats`].
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub unsafe extern "C" fn rns_rnode_iface_get_stats(
+    handle: u64,
+    out: *mut RnsRNodeStats,
+) -> i32 {
+    if out.is_null() {
+        set_error("out is null".into());
+        return -1;
+    }
+    let snap = match crate::ffi::rnode_iface_get_stats(handle) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return -1;
+        }
+    };
+    *out = RnsRNodeStats {
+        online: if snap.online { 1 } else { 0 },
+        detected: if snap.detected { 1 } else { 0 },
+        frequency_set: if snap.frequency.is_some() { 1 } else { 0 },
+        frequency: snap.frequency.unwrap_or(0),
+        bandwidth_set: if snap.bandwidth.is_some() { 1 } else { 0 },
+        bandwidth: snap.bandwidth.unwrap_or(0),
+        txpower_set: if snap.txpower.is_some() { 1 } else { 0 },
+        txpower: snap.txpower.unwrap_or(0),
+        sf_set: if snap.sf.is_some() { 1 } else { 0 },
+        sf: snap.sf.unwrap_or(0),
+        cr_set: if snap.cr.is_some() { 1 } else { 0 },
+        cr: snap.cr.unwrap_or(0),
+        rssi_set: if snap.rssi.is_some() { 1 } else { 0 },
+        rssi: snap.rssi.unwrap_or(0),
+        snr_set: if snap.snr.is_some() { 1 } else { 0 },
+        snr: snap.snr.unwrap_or(0.0),
+        q_set: if snap.q.is_some() { 1 } else { 0 },
+        q: snap.q.unwrap_or(0.0),
+        rx_packets_set: if snap.rx_packets.is_some() { 1 } else { 0 },
+        rx_packets: snap.rx_packets.unwrap_or(0),
+        tx_packets_set: if snap.tx_packets.is_some() { 1 } else { 0 },
+        tx_packets: snap.tx_packets.unwrap_or(0),
+        airtime_short: snap.airtime_short,
+        airtime_long: snap.airtime_long,
+        channel_load_short: snap.channel_load_short,
+        channel_load_long: snap.channel_load_long,
+        battery_state: snap.battery_state as u8,
+        battery_percent: snap.battery_percent,
+        temperature_set: if snap.temperature.is_some() { 1 } else { 0 },
+        temperature: snap.temperature.unwrap_or(0),
+        firmware_maj: snap.firmware_maj,
+        firmware_min: snap.firmware_min,
+    };
+    0
+}
+
+/// Send the configured ID-beacon callsign immediately.
+/// Returns 0 on success, -1 on error.
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub extern "C" fn rns_rnode_iface_id_beacon_now(handle: u64) -> i32 {
+    match crate::ffi::rnode_iface_id_beacon_now(handle) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Deregister an RNode callback interface and tear down the Transport
+/// binding. The bridge must stop calling [`rns_rnode_iface_feed`] before
+/// invoking this.
+/// Returns 0 on success, -1 on error.
+#[cfg(feature = "serial")]
+#[no_mangle]
+pub extern "C" fn rns_rnode_iface_deregister(handle: u64) -> i32 {
+    match crate::ffi::rnode_iface_deregister(handle) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
 }

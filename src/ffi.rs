@@ -293,6 +293,47 @@ pub fn interface_online(name: &str) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Published destinations (Transport-managed announce daemon)
+// ---------------------------------------------------------------------------
+
+/// Opt a locally-registered IN/SINGLE destination into the Transport
+/// announce daemon.
+///
+/// * `destination_hash`  16-byte truncated RNS hash of the destination.
+/// * `refresh_secs`      Periodic refresh interval in seconds. `0.0` means
+///                       no periodic announce; the destination is only
+///                       re-announced on interface up-edges.
+/// * `app_data`          Optional app_data attached to each announce.
+///                       Pass `None` to use the destination's configured
+///                       app_data.
+pub fn transport_publish_destination(
+    destination_hash: &[u8],
+    refresh_secs: f64,
+    app_data: Option<&[u8]>,
+) {
+    let refresh = if refresh_secs > 0.0 {
+        Some(std::time::Duration::from_secs_f64(refresh_secs))
+    } else {
+        None
+    };
+    Transport::publish_destination(
+        destination_hash.to_vec(),
+        refresh,
+        app_data.map(|d| d.to_vec()),
+    );
+}
+
+/// Remove a destination from the announce daemon's published set.
+pub fn transport_unpublish_destination(destination_hash: &[u8]) {
+    Transport::unpublish_destination(destination_hash);
+}
+
+/// Return whether a destination is currently in the published set.
+pub fn transport_is_published(destination_hash: &[u8]) -> bool {
+    Transport::is_published(destination_hash)
+}
+
+// ---------------------------------------------------------------------------
 // Announce filtering
 // ---------------------------------------------------------------------------
 
@@ -404,6 +445,194 @@ pub fn callback_interface_set_stats(
     } else {
         Err(format!("interface '{}' not found", name))
     }
+}
+
+// ---------------------------------------------------------------------------
+// RNode callback interface (KISS framing + radio config in Rust, raw bytes
+// shuttled by a native bridge — e.g. CoreBluetooth on iOS)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serial")]
+pub use crate::interfaces::rnode_interface::{RNodeRadioConfig, RNodeStats};
+
+/// Internal handle payload for a registered RNode callback interface.
+#[cfg(feature = "serial")]
+#[derive(Clone)]
+struct RNodeCallbackHandle {
+    name: String,
+    interface: Arc<Mutex<crate::interfaces::rnode_interface::RNodeInterface>>,
+    feed: std::sync::mpsc::Sender<u8>,
+}
+
+/// Register an RNode interface that talks to the radio over a caller-owned
+/// byte stream.
+///
+/// `name`     – human-readable name (e.g. "RNodeBLE").
+/// `send_fn`  – called when Reticulum wants to send raw KISS-framed bytes to
+///              the radio. The bridge is responsible for any link-MTU
+///              chunking (e.g. 20-byte BLE writes).
+/// `config`   – radio parameters (frequency, BW, SF, CR, TX power, …).
+///
+/// Returns an opaque interface handle. Use it with [`rnode_iface_feed`] to
+/// push RX bytes from the radio into Reticulum, [`rnode_iface_get_stats`]
+/// for telemetry, and [`rnode_iface_deregister`] to tear it down.
+///
+/// Internally this:
+///   1. Builds an `RNodeInterface` with a callback transport.
+///   2. Spawns the read loop (KISS deframer + RNode command codec).
+///   3. Runs the DETECT/init handshake.
+///   4. Registers a Transport interface stub + outbound handler so packets
+///      routed to `name` go through `process_outgoing`.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_register(
+    name: &str,
+    send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    config: RNodeRadioConfig,
+) -> Result<u64, String> {
+    let handle = rnode_iface_create(name, send_fn, config)?;
+    match rnode_iface_configure(handle) {
+        Ok(()) => Ok(handle),
+        Err(e) => {
+            // Roll back: deregister so the caller doesn't end up with a
+            // half-initialised interface handle leak.
+            let _ = rnode_iface_deregister(handle);
+            Err(e)
+        }
+    }
+}
+
+/// Build the RNode interface and spawn its read loop, but do NOT run the
+/// DETECT/init handshake. This lets the native bridge obtain the handle
+/// (and therefore start feeding RX bytes via [`rnode_iface_feed`]) BEFORE
+/// blocking inside the handshake. Call [`rnode_iface_configure`] next.
+///
+/// Returns the handle on success.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_create(
+    name: &str,
+    send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    config: RNodeRadioConfig,
+) -> Result<u64, String> {
+    use crate::interfaces::rnode_interface::RNodeInterface;
+
+    let (iface, feed) = RNodeInterface::new_with_callback(name, send_fn, config)
+        .map_err(|e| format!("RNode interface construction failed: {}", e))?;
+    let interface = Arc::new(Mutex::new(iface));
+
+    // Read loop must be running before any bytes are fed in.
+    RNodeInterface::start_read_loop(
+        Arc::clone(&interface),
+        Arc::new(Mutex::new(crate::transport::Transport)),
+    );
+
+    Ok(store_handle(RNodeCallbackHandle {
+        name: name.to_string(),
+        interface,
+        feed,
+    }))
+}
+
+/// Run the DETECT/init handshake on a previously [`rnode_iface_create`]'d
+/// handle and wire the interface into the global Transport. Blocks for
+/// roughly 2-4 seconds while the radio is probed and configured. RX bytes
+/// must be fed in via [`rnode_iface_feed`] for this to succeed.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_configure(iface_handle: u64) -> Result<(), String> {
+    use crate::interfaces::rnode_interface::RNodeInterface;
+    use crate::transport::{InterfaceStub, InterfaceStubConfig};
+
+    let h: RNodeCallbackHandle = get_handle(iface_handle)
+        .ok_or_else(|| "invalid RNode handle".to_string())?;
+
+    RNodeInterface::configure_device_shared(&h.interface)
+        .map_err(|e| format!("RNode configure failed: {}", e))?;
+
+    let mut stub_cfg = InterfaceStubConfig::default();
+    stub_cfg.name = h.name.clone();
+    stub_cfg.mode = InterfaceStub::MODE_FULL;
+    stub_cfg.out = true;
+    // Mark the stub online — the device handshake just succeeded and we have
+    // a live callback transport to it. Without this, Transport sees the
+    // interface as offline (default), which both gates outbound traffic and
+    // makes `interface_online()` lie to UI status indicators.
+    stub_cfg.online = Some(true);
+    let bitrate = h.interface.lock().unwrap().bitrate;
+    stub_cfg.bitrate = if bitrate > 0 { Some(bitrate) } else { None };
+    stub_cfg.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
+    Transport::register_interface_stub_config(stub_cfg);
+    // Belt-and-braces: if the stub already existed (e.g. previous run that
+    // didn't clean up), the register call above is a no-op. Force online.
+    Transport::set_interface_online(&h.name, true);
+
+    let handler_iface = Arc::clone(&h.interface);
+    let name = h.name.clone();
+    Transport::register_outbound_handler(
+        &name,
+        Arc::new(move |raw| {
+            let iface = handler_iface.lock().unwrap();
+            iface.process_outgoing(raw.to_vec()).is_ok()
+        }),
+    );
+
+    Ok(())
+}
+
+/// Push RX bytes (received over BLE/USB) into the RNode interface's read
+/// loop. Bytes are KISS-deframed and routed through the RNode command
+/// codec; CMD_DATA frames are forwarded to `Transport::inbound`.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_feed(iface_handle: u64, data: &[u8]) -> Result<(), String> {
+    let h: RNodeCallbackHandle =
+        get_handle(iface_handle).ok_or_else(|| "invalid RNode handle".to_string())?;
+    for &b in data {
+        h.feed
+            .send(b)
+            .map_err(|_| "RNode read channel closed".to_string())?;
+    }
+    Ok(())
+}
+
+/// Snapshot of all telemetry the read loop currently knows about (RSSI,
+/// SNR, airtime, battery, temperature, firmware version, …).
+#[cfg(feature = "serial")]
+pub fn rnode_iface_get_stats(iface_handle: u64) -> Result<RNodeStats, String> {
+    let h: RNodeCallbackHandle =
+        get_handle(iface_handle).ok_or_else(|| "invalid RNode handle".to_string())?;
+    let snap = h.interface.lock().unwrap().stats_snapshot();
+    Ok(snap)
+}
+
+/// Send the configured ID-beacon (callsign) immediately, bypassing the
+/// scheduled interval.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_id_beacon_now(iface_handle: u64) -> Result<(), String> {
+    let h: RNodeCallbackHandle =
+        get_handle(iface_handle).ok_or_else(|| "invalid RNode handle".to_string())?;
+    let callsign = h.interface.lock().unwrap().id_callsign_bytes();
+    match callsign {
+        Some(cs) => h
+            .interface
+            .lock()
+            .unwrap()
+            .process_outgoing(cs)
+            .map_err(|e| format!("ID beacon send failed: {}", e)),
+        None => Err("no id_callsign configured".to_string()),
+    }
+}
+
+/// Deregister the RNode interface and tear down the Transport binding.
+/// The native bridge should drop its TX callback and stop feeding bytes
+/// before calling this.
+#[cfg(feature = "serial")]
+pub fn rnode_iface_deregister(iface_handle: u64) -> Result<(), String> {
+    let h: RNodeCallbackHandle =
+        take_handle(iface_handle).ok_or_else(|| "invalid RNode handle".to_string())?;
+    Transport::unregister_outbound_handler(&h.name);
+    Transport::deregister_interface_stub(&h.name);
+    // Closing the connection causes the read loop to exit; the callback-mode
+    // guard in read_loop_impl skips reconnect_port for callback connections.
+    h.interface.lock().unwrap().shutdown();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -588,8 +817,11 @@ pub fn link_request(
         link_handle.initiate()?;
     }
 
-    // Register with the real link_id (set by initiate).
-    crate::link::register_runtime_link_handle(link_handle.clone());
+    // Note: the link actor registers the runtime handle itself once the
+    // real link_id is derived inside `initiate_prepare()`. Pre-2026-04-29
+    // this site also called `register_runtime_link_handle(...)`, which
+    // produced spurious "(replaced existing entry)" log lines on every
+    // outbound link. The actor's registration is sufficient.
 
     // Wait for link establishment, bounded by the caller's timeout.
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);

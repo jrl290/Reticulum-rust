@@ -184,7 +184,7 @@ impl KissInterface {
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(2));
 
-            let configured = {
+            let (configured, iface_name) = {
                 let mut iface_guard = iface.lock().unwrap();
                 iface_guard.online = true;
                 iface_guard.base.online = true;
@@ -195,7 +195,7 @@ impl KissInterface {
                     false,
                 );
                 log("Configuring KISS interface parameters...", crate::LOG_VERBOSE, false, false);
-                match iface_guard.configure_device() {
+                let ok = match iface_guard.configure_device() {
                     Ok(()) => {
                         iface_guard.interface_ready = true;
                         log("KISS interface configured", crate::LOG_VERBOSE, false, false);
@@ -210,12 +210,21 @@ impl KissInterface {
                         );
                         false
                     }
-                }
+                };
+                (ok, iface_guard.base.name.clone())
             };
 
             if !configured {
                 Self::handle_error_and_reconnect(iface);
                 return;
+            }
+
+            // Notify Transport so the false→true transition triggers an
+            // automatic re-announce of all locally registered destinations on
+            // this interface (covers initial open and any later re-open
+            // after a reconnect).
+            if let Some(name) = iface_name {
+                RnsTransport::set_interface_online(&name, true);
             }
 
             let mut in_frame = false;

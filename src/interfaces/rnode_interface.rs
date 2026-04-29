@@ -544,11 +544,86 @@ fn to_io_err<E: std::error::Error>(err: E) -> io::Error {
 	io::Error::new(io::ErrorKind::Other, err.to_string())
 }
 
+/// Byte-stream connection driven by an externally-supplied TX callback (e.g.
+/// a CoreBluetooth/JNI bridge that owns the actual radio link).
+///
+/// RX bytes are pushed into [`feed_sender`] from the FFI layer; the read loop
+/// drains them through `read_rx`. TX bytes are forwarded synchronously to the
+/// caller-supplied `send_fn`, which is responsible for chunking to the radio's
+/// MTU (e.g. 20-byte BLE writes).
+pub(crate) struct CallbackConnection {
+	send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+	read_rx: Receiver<u8>,
+	read_tx: Sender<u8>,
+	connected: Arc<Mutex<bool>>,
+}
+
+impl CallbackConnection {
+	fn new(send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>) -> Self {
+		let (read_tx, read_rx) = mpsc::channel();
+		Self {
+			send_fn,
+			read_rx,
+			read_tx,
+			connected: Arc::new(Mutex::new(true)),
+		}
+	}
+
+	/// Clone the byte sender so external code (FFI) can feed RX bytes into the
+	/// read loop.
+	fn feed_sender(&self) -> Sender<u8> {
+		self.read_tx.clone()
+	}
+
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		match self.read_rx.recv_timeout(Duration::from_millis(100)) {
+			Ok(byte) => {
+				buf[0] = byte;
+				Ok(1)
+			}
+			Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"callback read timeout",
+			)),
+			Err(_) => Err(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"callback read channel closed",
+			)),
+		}
+	}
+
+	fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+		if !*self.connected.lock().unwrap() {
+			return Err(io::Error::new(
+				io::ErrorKind::NotConnected,
+				"callback connection closed",
+			));
+		}
+		if (self.send_fn)(data) {
+			Ok(())
+		} else {
+			Err(io::Error::new(
+				io::ErrorKind::BrokenPipe,
+				"callback send_fn returned false",
+			))
+		}
+	}
+
+	fn close(&self) {
+		*self.connected.lock().unwrap() = false;
+	}
+
+	fn connected(&self) -> bool {
+		*self.connected.lock().unwrap()
+	}
+}
+
 /// Connection type for RNode
 enum ConnectionType {
 	Serial(Box<dyn SerialPort>),
 	Ble(BLEConnection),
 	Tcp(TCPConnection),
+	Callback(CallbackConnection),
 }
 
 impl ConnectionType {
@@ -557,6 +632,7 @@ impl ConnectionType {
 			ConnectionType::Serial(port) => port.read(buf),
 			ConnectionType::Ble(conn) => conn.read(buf),
 			ConnectionType::Tcp(conn) => conn.read(buf),
+			ConnectionType::Callback(conn) => conn.read(buf),
 		}
 	}
 
@@ -565,6 +641,7 @@ impl ConnectionType {
 			ConnectionType::Serial(port) => port.write_all(data),
 			ConnectionType::Ble(conn) => conn.write_all(data),
 			ConnectionType::Tcp(conn) => conn.write_all(data),
+			ConnectionType::Callback(conn) => conn.write_all(data),
 		}
 	}
 
@@ -574,6 +651,11 @@ impl ConnectionType {
 
 	fn is_ble(&self) -> bool {
 		matches!(self, ConnectionType::Ble(_))
+	}
+
+	#[allow(dead_code)]
+	fn is_callback(&self) -> bool {
+		matches!(self, ConnectionType::Callback(_))
 	}
 
 	fn tcp_last_activity(&self) -> Option<Instant> {
@@ -616,6 +698,7 @@ impl ConnectionType {
 			ConnectionType::Serial(_) => {}
 			ConnectionType::Ble(conn) => conn.close(),
 			ConnectionType::Tcp(conn) => conn.close(),
+			ConnectionType::Callback(conn) => conn.close(),
 		}
 	}
 }
@@ -1195,6 +1278,7 @@ impl RNodeInterface {
 				ConnectionType::Ble(_) => Duration::from_secs_f32(1.0),
 				ConnectionType::Tcp(_) => Duration::from_secs_f32(1.5),
 				ConnectionType::Serial(_) => Duration::from_millis(250),
+				ConnectionType::Callback(_) => Duration::from_secs_f32(1.0),
 			}
 		};
 		thread::sleep(delay);
@@ -1212,6 +1296,10 @@ impl RNodeInterface {
 			inner.online = true;
 		}
 		println!("RNodeInterface[{}] is configured and powered up", self.name);
+		// Notify Transport so the false→true online transition triggers an
+		// automatic re-announce of all locally registered destinations on
+		// this interface (covers post-handshake and post-reconnect).
+		crate::transport::Transport::set_interface_online(&self.name, true);
 		Ok(())
 	}
 
@@ -1286,11 +1374,12 @@ impl RNodeInterface {
 				ConnectionType::Ble(_) => Duration::from_secs_f32(1.0),
 				ConnectionType::Tcp(_) => Duration::from_secs_f32(1.5),
 				ConnectionType::Serial(_) => Duration::from_millis(250),
+				ConnectionType::Callback(_) => Duration::from_secs_f32(1.0),
 			}
 		};
 		thread::sleep(delay);
 
-		{
+		let iface_name = {
 			let iface = interface.lock().unwrap();
 			if !iface.validate_radio_state() {
 				return Err(io::Error::new(
@@ -1306,7 +1395,13 @@ impl RNodeInterface {
 				"RNodeInterface[{}] is configured and powered up",
 				iface.name
 			);
-		}
+			iface.name.clone()
+		};
+
+		// Notify Transport so the false→true online transition triggers an
+		// automatic re-announce of all locally registered destinations on
+		// this interface (covers post-handshake and post-reconnect).
+		crate::transport::Transport::set_interface_online(&iface_name, true);
 
 		Ok(())
 	}
@@ -1726,7 +1821,11 @@ impl RNodeInterface {
 
 		let iface = interface.lock().unwrap();
 		let mut inner = iface.inner.lock().unwrap();
-		if !inner.detached && !inner.reconnecting {
+		// Callback-driven connections are reconnected by the native bridge
+		// (e.g. CoreBluetooth), not by us. Just exit the read loop and let
+		// the bridge deregister + re-register the interface as needed.
+		let is_callback = matches!(inner.connection, ConnectionType::Callback(_));
+		if !inner.detached && !inner.reconnecting && !is_callback {
 			inner.reconnecting = true;
 			drop(inner);
 			drop(iface);
@@ -2223,4 +2322,235 @@ impl RNodeInterface {
 	pub fn clear_last_error(&self) {
 		self.inner.lock().unwrap().last_error = None;
 	}
+
+	// -------------------------------------------------------------------
+	// Callback-transport constructor (for FFI bridges that own the BLE/USB
+	// link natively, e.g. CoreBluetooth on iOS).
+	// -------------------------------------------------------------------
+
+	/// Construct an RNodeInterface that delegates raw byte I/O to a caller-
+	/// supplied `send_fn` (TX) and an externally-fed RX channel.
+	///
+	/// Returns `(interface, feed_sender)`. The caller must:
+	///   1. Wrap `interface` in an `Arc<Mutex<_>>` and call
+	///      `start_read_loop(...)`.
+	///   2. Call `configure_device_shared(...)` to run the DETECT/init
+	///      handshake (the read loop processes responses while it sleeps).
+	///   3. Push every RX byte from the radio into `feed_sender` (one byte
+	///      per `send`). The read loop drains it through KISS deframing.
+	///   4. Register `process_outgoing` with Transport's outbound handler.
+	///
+	/// `send_fn` is invoked synchronously from `process_outgoing` with a
+	/// fully-framed KISS payload. The bridge is responsible for any radio-
+	/// link chunking (e.g. 20-byte BLE writes).
+	pub fn new_with_callback(
+		name: &str,
+		send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+		config: RNodeRadioConfig,
+	) -> io::Result<(Self, Sender<u8>)> {
+		Self::validate_config(
+			config.frequency,
+			config.bandwidth,
+			config.txpower,
+			config.sf,
+			config.cr,
+			config.st_alock,
+			config.lt_alock,
+			&config.id_callsign,
+		)?;
+
+		let cb = CallbackConnection::new(send_fn);
+		let feed = cb.feed_sender();
+		let connection = ConnectionType::Callback(cb);
+
+		// "callback://<name>" is a synthetic identifier kept only for log
+		// messages and the (unused) reconnect path.
+		let port_name = format!("callback://{}", name);
+		let connection_info = ConnectionInfo::Serial(port_name.clone());
+
+		let inner = RNodeInner {
+			connection,
+			online: false,
+			detected: false,
+			detached: false,
+			reconnecting: false,
+			interface_ready: false,
+			flow_control: config.flow_control,
+			frequency: config.frequency,
+			bandwidth: config.bandwidth,
+			txpower: config.txpower,
+			sf: config.sf,
+			cr: config.cr,
+			state: RADIO_STATE_ON,
+			st_alock: config.st_alock,
+			lt_alock: config.lt_alock,
+			r_frequency: None,
+			r_bandwidth: None,
+			r_txpower: None,
+			r_sf: None,
+			r_cr: None,
+			r_state: None,
+			r_lock: None,
+			r_st_alock: None,
+			r_lt_alock: None,
+			r_stat_rx: None,
+			r_stat_tx: None,
+			r_stat_rssi: None,
+			r_stat_snr: None,
+			r_stat_q: None,
+			r_random: None,
+			r_airtime_short: 0.0,
+			r_airtime_long: 0.0,
+			r_channel_load_short: 0.0,
+			r_channel_load_long: 0.0,
+			r_symbol_time_ms: None,
+			r_symbol_rate: None,
+			r_preamble_symbols: None,
+			r_preamble_time_ms: None,
+			r_csma_slot_time_ms: None,
+			r_csma_difs_ms: None,
+			r_csma_cw_band: None,
+			r_csma_cw_min: None,
+			r_csma_cw_max: None,
+			r_current_rssi: None,
+			r_noise_floor: None,
+			r_interference: None,
+			r_interference_l: None,
+			r_battery_state: BatteryState::Unknown,
+			r_battery_percent: 0,
+			r_temperature: None,
+			cpu_temp: None,
+			r_framebuffer: vec![0; 512],
+			r_framebuffer_readtime: Instant::now(),
+			r_framebuffer_latency: Duration::ZERO,
+			r_disp: vec![0; 1024],
+			r_disp_readtime: Instant::now(),
+			r_disp_latency: Duration::ZERO,
+			should_read_display: false,
+			read_display_interval: DISPLAY_READ_INTERVAL,
+			platform: None,
+			mcu: None,
+			display: None,
+			maj_version: 0,
+			min_version: 0,
+			firmware_ok: false,
+			id_callsign: config.id_callsign,
+			id_interval: config.id_interval,
+			_last_id: Instant::now(),
+			first_tx: None,
+			last_detect: Instant::now(),
+			packet_queue: VecDeque::new(),
+			hw_errors: Vec::new(),
+			last_error: None,
+			fatal_error: false,
+		};
+
+		Ok((
+			RNodeInterface {
+				name: name.to_string(),
+				hw_mtu: 508,
+				mode: InterfaceMode::Full,
+				bitrate: 0,
+				supports_discovery: true,
+				_force_bitrate: false,
+				rxb: Arc::new(Mutex::new(0)),
+				txb: Arc::new(Mutex::new(0)),
+				inner: Arc::new(Mutex::new(inner)),
+				_port_name: port_name,
+				connection_info,
+			},
+			feed,
+		))
+	}
+
+	/// Snapshot of all device telemetry the read loop currently knows about.
+	pub fn stats_snapshot(&self) -> RNodeStats {
+		let inner = self.inner.lock().unwrap();
+		RNodeStats {
+			online: inner.online,
+			detected: inner.detected,
+			frequency: inner.r_frequency,
+			bandwidth: inner.r_bandwidth,
+			txpower: inner.r_txpower,
+			sf: inner.r_sf,
+			cr: inner.r_cr,
+			rssi: inner.r_stat_rssi,
+			snr: inner.r_stat_snr,
+			q: inner.r_stat_q,
+			rx_packets: inner.r_stat_rx,
+			tx_packets: inner.r_stat_tx,
+			airtime_short: inner.r_airtime_short,
+			airtime_long: inner.r_airtime_long,
+			channel_load_short: inner.r_channel_load_short,
+			channel_load_long: inner.r_channel_load_long,
+			battery_state: inner.r_battery_state,
+			battery_percent: inner.r_battery_percent,
+			temperature: inner.r_temperature,
+			firmware_maj: inner.maj_version,
+			firmware_min: inner.min_version,
+		}
+	}
+
+	/// Mark detached and close the connection without issuing any radio
+	/// commands. Used by FFI deregister paths where the underlying link
+	/// (BLE/USB) may already be torn down.
+	pub fn shutdown(&self) {
+		let mut inner = self.inner.lock().unwrap();
+		inner.detached = true;
+		inner.online = false;
+		inner.connection.close();
+	}
+
+	/// Return the configured ID-callsign bytes (if any).
+	pub fn id_callsign_bytes(&self) -> Option<Vec<u8>> {
+		self.inner.lock().unwrap().id_callsign.clone()
+	}
+}
+
+// =====================================================================
+// Public configuration & telemetry types (used by FFI)
+// =====================================================================
+
+/// All radio parameters needed to bring an RNode online.
+///
+/// Mirrors the positional arguments of [`RNodeInterface::new`] but in a form
+/// that is easy to (de)serialise across an FFI boundary.
+#[derive(Debug, Clone)]
+pub struct RNodeRadioConfig {
+	pub frequency: u64,
+	pub bandwidth: u32,
+	pub txpower: u8,
+	pub sf: u8,
+	pub cr: u8,
+	pub flow_control: bool,
+	pub st_alock: Option<f32>,
+	pub lt_alock: Option<f32>,
+	pub id_interval: Option<Duration>,
+	pub id_callsign: Option<Vec<u8>>,
+}
+
+/// Snapshot of RNode runtime telemetry.
+#[derive(Debug, Clone)]
+pub struct RNodeStats {
+	pub online: bool,
+	pub detected: bool,
+	pub frequency: Option<u64>,
+	pub bandwidth: Option<u32>,
+	pub txpower: Option<u8>,
+	pub sf: Option<u8>,
+	pub cr: Option<u8>,
+	pub rssi: Option<i16>,
+	pub snr: Option<f32>,
+	pub q: Option<f32>,
+	pub rx_packets: Option<u32>,
+	pub tx_packets: Option<u32>,
+	pub airtime_short: f32,
+	pub airtime_long: f32,
+	pub channel_load_short: f32,
+	pub channel_load_long: f32,
+	pub battery_state: BatteryState,
+	pub battery_percent: u8,
+	pub temperature: Option<i8>,
+	pub firmware_maj: u8,
+	pub firmware_min: u8,
 }
