@@ -372,6 +372,14 @@ pub struct TransportState {
     pub client_announce_last_sent: HashMap<String, f64>,
     /// Announces deferred until their pacing window opens: (dispatch_at, iface_name, raw_bytes).
     pub pending_local_announces: Vec<(f64, String, Vec<u8>)>,
+    /// App-opted-in destinations managed by Transport's announce daemon.
+    /// Keyed by destination hash. See `PublishedDestination` and
+    /// `Transport::publish_destination`.
+    pub published_destinations: HashMap<Vec<u8>, PublishedDestination>,
+    /// Wall-clock of the last `published_destinations` refresh sweep.
+    pub published_last_checked: f64,
+    /// How often jobs() examines the published set for due refreshes.
+    pub published_check_interval: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -450,6 +458,33 @@ pub struct BlackholeEntry {
 
 pub type AnnounceCallback = Arc<dyn Fn(&[u8], &Identity, &[u8], Option<Vec<u8>>, bool) + Send + Sync>;
 
+/// Library-managed publication record for a local destination.
+///
+/// A *published* destination is a locally-registered IN/SINGLE destination
+/// that the application has opted in to having Transport announce
+/// automatically:
+///
+///   * once on every false→true `online` transition of any interface
+///     (so re-announces fire automatically when an interface comes back
+///     up after a reconnect / handshake), and
+///   * periodically at `refresh_interval`, replacing the per-app
+///     "announce timer" pattern.
+///
+/// See `Transport::publish_destination` for usage.
+#[derive(Clone, Debug)]
+pub struct PublishedDestination {
+    /// Refresh interval in seconds. `None` = no periodic announce; only
+    /// re-announce on interface up-edge.
+    pub refresh_interval: Option<f64>,
+    /// Wall-clock (seconds since UNIX epoch) of the last announce dispatch.
+    /// `0.0` means "never announced yet" — the next jobs() tick will
+    /// announce immediately.
+    pub last_announced_at: f64,
+    /// Optional app_data attached to each announce. When `None`, the
+    /// destination's currently-configured app_data is used.
+    pub app_data: Option<Vec<u8>>,
+}
+
 #[derive(Clone)]
 pub struct AnnounceHandler {
     pub aspect_filter: Option<String>,
@@ -483,6 +518,47 @@ pub struct CachedPacketEntry {
     pub interface_name: Option<String>,
 }
 
+/// Type alias for a transport-task closure dispatched onto the dedicated
+/// transport worker thread.  Used by `request_path` (and any other call
+/// site that needs to fire-and-forget potentially-blocking transport work
+/// without holding up its caller).
+type TransportTask = Box<dyn FnOnce() + Send + 'static>;
+
+/// Dedicated transport-task worker.  A single OS thread drains the queue
+/// and runs each task sequentially.  This bounds the resource cost of
+/// fire-and-forget transport calls (e.g. when `Transport::jobs()` flushes
+/// many deferred path-requests in one tick) and avoids unbounded
+/// `std::thread::spawn` from latency-sensitive callers.
+///
+/// Tasks are themselves allowed to block on `TRANSPORT.lock()` and on
+/// `Transport::outbound`'s jobs_running wait — the worker is never on a
+/// UI thread.  The queue is unbounded so producers never block; if backlog
+/// pressure ever becomes a concern, this should be revisited.
+static TRANSPORT_TASK_TX: Lazy<Mutex<std::sync::mpsc::Sender<TransportTask>>> = Lazy::new(|| {
+    let (tx, rx) = std::sync::mpsc::channel::<TransportTask>();
+    std::thread::Builder::new()
+        .name("rns-transport-tasks".to_string())
+        .spawn(move || {
+            // Single-consumer drain loop.  Panics in tasks are caught so
+            // one bad task doesn't kill the worker.
+            while let Ok(task) = rx.recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            }
+        })
+        .expect("failed to spawn rns-transport-tasks worker");
+    Mutex::new(tx)
+});
+
+/// Submit a task to the transport-task worker.  Returns immediately.
+pub(crate) fn spawn_transport_task<F>(task: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Ok(tx) = TRANSPORT_TASK_TX.lock() {
+        let _ = tx.send(Box::new(task));
+    }
+}
+
 pub(crate) static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::new(TransportState {
     max_pr_tags: 32000,
     hashlist_maxsize: 1_000_000,
@@ -496,6 +572,7 @@ pub(crate) static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::n
     interface_jobs_interval: 5.0,
     mgmt_announce_interval: 2.0 * 60.0 * 60.0,
     blackhole_check_interval: 60.0,
+    published_check_interval: 30.0,
     ..TransportState::default()
 }));
 
@@ -862,22 +939,104 @@ impl Transport {
     /// transport node learns about all local destinations immediately, without
     /// waiting for the periodic announce cycle.
     pub fn announce_all_destinations(interface_name: &str) {
-        let destinations = {
+        // If the application has opted in to library-managed publication,
+        // only re-announce the published set on interface up-edges.  This
+        // avoids leaking ephemeral / request-only IN destinations onto the
+        // network on every reconnect.  When the published set is empty
+        // (legacy callers), fall back to the historical "all IN/SINGLE"
+        // behaviour for backwards compatibility.
+        let (destinations, published_filter) = {
             let state = TRANSPORT.lock().unwrap();
-            state.destinations.clone()
+            let filter: Option<HashSet<Vec<u8>>> = if state.published_destinations.is_empty() {
+                None
+            } else {
+                Some(state.published_destinations.keys().cloned().collect())
+            };
+            (state.destinations.clone(), filter)
         };
         let iface = interface_name.to_string();
+        let mut announced: Vec<Vec<u8>> = Vec::new();
         for mut dest in destinations {
-            if dest.direction == crate::destination::Direction::IN
-                && dest.dest_type == crate::destination::DestinationType::Single
-            {
-                log(
-                    &format!("Re-announcing {} to new interface {}", crate::hexrep(&dest.hash, true), iface),
-                    LOG_DEBUG, false, false,
-                );
-                let _ = dest.announce(None, false, Some(iface.clone()), None, true);
+            if dest.direction != crate::destination::Direction::IN { continue; }
+            if dest.dest_type != crate::destination::DestinationType::Single { continue; }
+            if let Some(ref allowed) = published_filter {
+                if !allowed.contains(&dest.hash) { continue; }
+            }
+            log(
+                &format!("Re-announcing {} to interface {}", crate::hexrep(&dest.hash, true), iface),
+                LOG_DEBUG, false, false,
+            );
+            if dest.announce(None, false, Some(iface.clone()), None, true).is_ok() {
+                announced.push(dest.hash.clone());
             }
         }
+        // Bump last_announced_at for any published entries we just
+        // announced — piggy-backing the up-edge announce against the
+        // periodic-refresh schedule prevents an immediate double-announce
+        // if the refresh timer was about to fire anyway.
+        if !announced.is_empty() {
+            let now_ts = now();
+            let mut state = TRANSPORT.lock().unwrap();
+            for hash in &announced {
+                if let Some(entry) = state.published_destinations.get_mut(hash) {
+                    entry.last_announced_at = now_ts;
+                }
+            }
+        }
+    }
+
+    /// Opt a locally-registered IN/SINGLE destination into Transport's
+    /// announce daemon.
+    ///
+    /// Once published, the destination is automatically announced:
+    ///   * once on every false→true `online` transition of any
+    ///     interface (covers reconnects and post-handshake events), and
+    ///   * every `refresh_interval` if `Some(...)` is supplied.
+    ///
+    /// Calling `publish_destination` with the same hash a second time
+    /// updates the existing entry (e.g. to change the refresh interval
+    /// or app_data) without re-announcing.
+    ///
+    /// The destination must already be registered (i.e. present in
+    /// `state.destinations`) before publishing — this call only records
+    /// the publication policy; it does not register the destination.
+    pub fn publish_destination(
+        destination_hash: Vec<u8>,
+        refresh_interval: Option<Duration>,
+        app_data: Option<Vec<u8>>,
+    ) {
+        let mut state = TRANSPORT.lock().unwrap();
+        let refresh_secs = refresh_interval.map(|d| d.as_secs_f64());
+        let last = state.published_destinations.get(&destination_hash)
+            .map(|e| e.last_announced_at)
+            .unwrap_or(0.0);
+        state.published_destinations.insert(destination_hash, PublishedDestination {
+            refresh_interval: refresh_secs,
+            last_announced_at: last,
+            app_data,
+        });
+    }
+
+    /// Remove a destination from the announce daemon's published set.
+    /// Does not send a "goodbye" announce; the destination simply stops
+    /// being auto-announced.
+    pub fn unpublish_destination(destination_hash: &[u8]) {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.published_destinations.remove(destination_hash);
+    }
+
+    /// Return a snapshot of currently-published destinations.
+    pub fn published_destinations() -> Vec<(Vec<u8>, PublishedDestination)> {
+        let state = TRANSPORT.lock().unwrap();
+        state.published_destinations.iter()
+            .map(|(h, p)| (h.clone(), p.clone()))
+            .collect()
+    }
+
+    /// True if `destination_hash` is currently in the published set.
+    pub fn is_published(destination_hash: &[u8]) -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        state.published_destinations.contains_key(destination_hash)
     }
 
     /// `interface_repr` is the full string representation matching
@@ -1105,12 +1264,31 @@ impl Transport {
     }
 
     pub fn set_interface_online(name: &str, online: bool) {
-        let mut state = TRANSPORT.lock().unwrap();
-        if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == name) {
-            iface.online = online;
+        let mut transitioned_up = false;
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == name) {
+                if online && !iface.online { transitioned_up = true; }
+                iface.online = online;
+            }
+            if let Some(iface) = state.local_client_interfaces.iter_mut().find(|i| i.name == name) {
+                if online && !iface.online { transitioned_up = true; }
+                iface.online = online;
+            }
         }
-        if let Some(iface) = state.local_client_interfaces.iter_mut().find(|i| i.name == name) {
-            iface.online = online;
+        // On false→true transition, re-announce locally-registered
+        // destinations on this interface so any announces attempted while it
+        // was offline are delivered now that the link is up. When the
+        // application has opted in via `publish_destination`, only the
+        // published set is re-announced; otherwise (legacy callers) all
+        // IN/SINGLE destinations are re-announced.  See
+        // `announce_all_destinations` for filter logic.
+        if transitioned_up {
+            log(
+                &format!("Interface {} transitioned online — re-announcing local destinations", name),
+                LOG_DEBUG, false, false,
+            );
+            Self::announce_all_destinations(name);
         }
     }
 
@@ -2075,6 +2253,105 @@ impl Transport {
             }
         }
 
+        // Published-destination refresh sweep.
+        //
+        // For every destination opted in via `publish_destination` with a
+        // non-None `refresh_interval`, re-announce it to all interfaces
+        // when the interval has elapsed since the last announce. Entries
+        // with `last_announced_at == 0.0` (never announced yet) fire on
+        // the first sweep, so applications get an immediate announce as
+        // soon as they call `publish_destination` without scheduling one
+        // themselves.
+        //
+        // CRITICAL — TWO independent re-entrant deadlocks must be avoided:
+        //
+        //   (1) `Transport::outbound` spinwait. If `d.announce(send=true)`
+        //       is called here, it dispatches `Packet::send` →
+        //       `Transport::outbound`, which spinwaits on `state.jobs_running`
+        //       — the same flag this jobs() call set to `true`. Spins forever.
+        //       Mitigation: build with `send=false` and defer to the
+        //       deferred-sends loop after `jobs_running = false`.
+        //
+        //   (2) `TRANSPORT` mutex re-lock. Even with `send=false`,
+        //       `Destination::announce` calls `generate_announce_data` →
+        //       `Identity::remember_ratchet` →
+        //       `Transport::is_connected_to_shared_instance`, which calls
+        //       `TRANSPORT.lock()`. std::sync::Mutex is NOT reentrant, so
+        //       this hangs the very thread that already holds the lock
+        //       (and thus all other threads waiting on it).
+        //       Mitigation: drop `state` BEFORE invoking `announce()`, do
+        //       the build outside the lock, then re-acquire `state` to
+        //       update bookkeeping.
+        let mut published_announce_packets: Vec<(Vec<u8>, Packet)> = Vec::new();
+        if !state.published_destinations.is_empty()
+            && now() > state.published_last_checked + state.published_check_interval
+        {
+            let now_ts = now();
+            let due: Vec<(Vec<u8>, Option<Vec<u8>>)> = state.published_destinations.iter()
+                .filter_map(|(h, p)| {
+                    let ri = p.refresh_interval?;
+                    if now_ts - p.last_announced_at >= ri {
+                        Some((h.clone(), p.app_data.clone()))
+                    } else { None }
+                })
+                .collect();
+            state.published_last_checked = now_ts;
+            if !due.is_empty() {
+                // Snapshot the matching destinations so we can release the
+                // lock before invoking announce() (see deadlock note above).
+                let candidates: Vec<(Vec<u8>, Option<Vec<u8>>, Destination)> = due.iter()
+                    .filter_map(|(hash, app_data)| {
+                        state.destinations.iter().find(|d|
+                            d.hash == *hash
+                            && d.direction == crate::destination::Direction::IN
+                            && d.dest_type == crate::destination::DestinationType::Single
+                        ).map(|orig| (hash.clone(), app_data.clone(), orig.clone()))
+                    })
+                    .collect();
+                let missing: Vec<Vec<u8>> = due.iter()
+                    .filter(|(hash, _)| !candidates.iter().any(|(h, _, _)| h == hash))
+                    .map(|(hash, _)| hash.clone())
+                    .collect();
+
+                // Drop the TRANSPORT lock before calling announce(), which
+                // re-enters TRANSPORT via remember_ratchet ->
+                // is_connected_to_shared_instance.
+                drop(state);
+
+                for hash in missing {
+                    log(
+                        &format!("Published-destination refresh: hash {} not registered — skipping", crate::hexrep(&hash, true)),
+                        LOG_DEBUG, false, false,
+                    );
+                }
+                for (hash, app_data, mut d) in candidates {
+                    match d.announce(app_data.as_deref(), false, None, None, false) {
+                        Ok(Some(packet)) => {
+                            published_announce_packets.push((hash, packet));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log(
+                                &format!("Published-destination refresh: announce build failed for {}: {}", crate::hexrep(&hash, true), e),
+                                LOG_WARNING, false, false,
+                            );
+                        }
+                    }
+                }
+
+                // Re-acquire the lock and optimistically mark
+                // `last_announced_at` so the next sweep doesn't re-emit
+                // before send() completes. Send failures are rare and
+                // self-correct on the next interval.
+                state = TRANSPORT.lock().unwrap();
+                for (hash, _) in &published_announce_packets {
+                    if let Some(entry) = state.published_destinations.get_mut(hash) {
+                        entry.last_announced_at = now_ts;
+                    }
+                }
+            }
+        }
+
         if state.packet_hashlist.len() > state.hashlist_maxsize / 2 {
             state.packet_hashlist_prev = state.packet_hashlist.clone();
             state.packet_hashlist.clear();
@@ -2393,16 +2670,30 @@ impl Transport {
         }
 
         // Collect management announce packets to send AFTER releasing the lock.
-        // destination.announce(..., send=true) calls packet.send() → Transport::outbound()
-        // → TRANSPORT.lock(), which deadlocks because jobs() already holds the lock.
+        // Must avoid TWO independent re-entrant deadlocks:
+        //   (1) destination.announce(send=true) → packet.send() → Transport::outbound()
+        //       which spinwaits on jobs_running. Use send=false.
+        //   (2) destination.announce(send=false) still calls remember_ratchet →
+        //       Transport::is_connected_to_shared_instance → TRANSPORT.lock(),
+        //       which is non-reentrant. Drop `state` before announce(), then
+        //       re-acquire to write back the (mutated-by-announce) destinations.
         let mut mgmt_announce_packets: Vec<Packet> = Vec::new();
-        if now() > state.last_mgmt_announce + state.mgmt_announce_interval {
+        if now() > state.last_mgmt_announce + state.mgmt_announce_interval
+            && !state.mgmt_destinations.is_empty()
+        {
             state.last_mgmt_announce = now();
-            for destination in &mut state.mgmt_destinations {
+            let mut mgmt_dests: Vec<Destination> = std::mem::take(&mut state.mgmt_destinations);
+            drop(state);
+            for destination in mgmt_dests.iter_mut() {
                 if let Ok(Some(packet)) = destination.announce(None, false, None, None, false) {
                     mgmt_announce_packets.push(packet);
                 }
             }
+            state = TRANSPORT.lock().unwrap();
+            // Restore (possibly-mutated) mgmt destinations.
+            state.mgmt_destinations = mgmt_dests;
+        } else if now() > state.last_mgmt_announce + state.mgmt_announce_interval {
+            state.last_mgmt_announce = now();
         }
 
         if now() > state.blackhole_last_checked + state.blackhole_check_interval {
@@ -2438,6 +2729,22 @@ impl Transport {
         // packet.send() → Transport::outbound() → TRANSPORT.lock() re-entrant deadlock).
         for mut packet in mgmt_announce_packets {
             let _ = packet.send();
+        }
+
+        // Send published-destination refresh announces (also deferred — see
+        // the published-destination refresh sweep above for the full
+        // re-entrant deadlock rationale).
+        for (hash, mut packet) in published_announce_packets {
+            match packet.send() {
+                Ok(_) => log(
+                    &format!("Published-destination refresh: announced {}", crate::hexrep(&hash, true)),
+                    LOG_DEBUG, false, false,
+                ),
+                Err(e) => log(
+                    &format!("Published-destination refresh: announce send failed for {}: {}", crate::hexrep(&hash, true), e),
+                    LOG_WARNING, false, false,
+                ),
+            }
         }
 
         for mut packet in outgoing {
@@ -4471,44 +4778,72 @@ impl Transport {
         requestor_transport_id: Option<Vec<u8>>,
         tag: Option<Vec<u8>>,
     ) {
-        let request_tag = request_tag.or(tag).unwrap_or_else(|| Identity::get_random_hash());
-        let path_request_data = {
-            let state = TRANSPORT.lock().unwrap();
-            let mut data = destination_hash.to_vec();
-            if state.transport_enabled {
-                if let Some(identity) = &state.identity {
-                    if let Some(hash) = identity.hash.as_ref() {
-                        data.extend_from_slice(hash);
+        // Durable non-blocking implementation: callers (FFI bridges, the
+        // LXMRouter, the iOS/Android main thread, Transport::jobs() itself)
+        // must never block on Transport::outbound's jobs_running wait, the
+        // announce-pacing sleep, or per-interface dispatch.
+        //
+        // Two important invariants:
+        //   1. The `path_requests` dedup map is updated *immediately*, BEFORE
+        //      the work is queued, so back-to-back callers don't both schedule
+        //      duplicate path-request packets.  (Previously the insert ran on
+        //      the worker AFTER packet.send() returned, defeating dedup under
+        //      contention.)
+        //   2. Work is dispatched onto a single dedicated transport-task
+        //      worker thread (see `transport_task_sender`) instead of
+        //      spawning a fresh OS thread per call.  This bounds resource
+        //      use even when jobs() flushes many deferred path-requests in
+        //      a single tick.
+        let destination_hash_owned = destination_hash.to_vec();
+        let request_tag = request_tag.or(tag);
+        let _ = requestor_transport_id;
+
+        // Record dedup timestamp synchronously, before queueing.
+        if let Ok(mut state) = TRANSPORT.lock() {
+            state
+                .path_requests
+                .insert(destination_hash_owned.clone(), now());
+        }
+
+        let dest_for_job = destination_hash_owned;
+        spawn_transport_task(move || {
+            let request_tag = request_tag.unwrap_or_else(|| Identity::get_random_hash());
+            let path_request_data = {
+                let state = TRANSPORT.lock().unwrap();
+                let mut data = dest_for_job.clone();
+                if state.transport_enabled {
+                    if let Some(identity) = &state.identity {
+                        if let Some(hash) = identity.hash.as_ref() {
+                            data.extend_from_slice(hash);
+                        }
                     }
                 }
-            }
-            data.extend_from_slice(&request_tag);
-            data
-        };
+                data.extend_from_slice(&request_tag);
+                data
+            };
 
-        let path_request_destination = Destination::new_outbound(
-            None,
-            DestinationType::Plain,
-            APP_NAME.to_string(),
-            vec!["path".to_string(), "request".to_string()],
-        )
-        .ok();
+            let path_request_destination = Destination::new_outbound(
+                None,
+                DestinationType::Plain,
+                APP_NAME.to_string(),
+                vec!["path".to_string(), "request".to_string()],
+            )
+            .ok();
 
-        let mut packet = Packet::new(
-            path_request_destination,
-            path_request_data,
-            DATA,
-            crate::packet::NONE,
-            BROADCAST,
-            crate::packet::HEADER_1,
-            None,
-            attached_interface,
-            false,
-            0,
-        );
-        let _ = packet.send();
-        TRANSPORT.lock().unwrap().path_requests.insert(destination_hash.to_vec(), now());
-        let _ = requestor_transport_id;
+            let mut packet = Packet::new(
+                path_request_destination,
+                path_request_data,
+                DATA,
+                crate::packet::NONE,
+                BROADCAST,
+                crate::packet::HEADER_1,
+                None,
+                attached_interface,
+                false,
+                0,
+            );
+            let _ = packet.send();
+        });
     }
 
     pub fn packet_filter(packet: &Packet) -> bool {
@@ -5575,5 +5910,194 @@ mod tests {
             state.path_table.remove(&dest_hash);
             state.interfaces.retain(|i| i.name != outbound_iface_name && i.name != receiving_iface_name);
         }
+    }
+
+    /// Regression test for the re-entrant outbound deadlock:
+    ///
+    /// `Transport::jobs()` sets `state.jobs_running = true` at entry and
+    /// only clears it after the entire body runs. Previously the
+    /// published-destination refresh sweep called
+    /// `destination.announce(send=true)` from inside that critical
+    /// section, which calls `Packet::send` → `Transport::outbound`, which
+    /// spinwaits on `state.jobs_running`. Because the same thread that
+    /// set the flag is now spinwaiting on it, the spin never terminates
+    /// — and every other thread that subsequently calls outbound also
+    /// spins forever waiting on the same flag (link actor, request_path
+    /// worker, main-thread `packet_send`, synthesize_tunnel, etc.).
+    ///
+    /// The fix defers published-destination announce sends to after
+    /// `jobs_running = false` (mirroring `mgmt_announce_packets`).
+    ///
+    /// This test reproduces the original hang within a 3-second budget:
+    /// it registers a published destination with `refresh_interval = 0`
+    /// and forces `published_last_checked = 0`, then runs `jobs()` on a
+    /// background thread. Without the fix, the thread spins forever.
+    /// With the fix, `jobs()` returns within milliseconds.
+    #[test]
+    fn jobs_does_not_deadlock_with_published_destination_refresh() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        // Reset relevant state so prior tests don't influence this one.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.jobs_running = false;
+            state.jobs_locked = false;
+            state.published_destinations.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
+        }
+
+        // Build an inbound SINGLE destination and register it.
+        let identity = Identity::new(true);
+        let mut destination = Destination::new_inbound(
+            Some(identity),
+            DestinationType::Single,
+            "deadlock_test".to_string(),
+            vec!["regression".to_string()],
+        )
+        .expect("inbound destination");
+        // Enable ratchets so generate_announce_data invokes
+        // Identity::remember_ratchet → Transport::is_connected_to_shared_instance
+        // → TRANSPORT.lock(), reproducing the iOS scenario.
+        let ratchet_path = std::env::temp_dir()
+            .join(format!("rns_test_ratchets_{}.bin", crate::hexrep(&destination.hash, false)))
+            .to_string_lossy()
+            .to_string();
+        destination.enable_ratchets(ratchet_path.clone()).expect("enable_ratchets");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+
+        // Publish with refresh_interval = 0 so the sweep fires immediately,
+        // and force the check window open by zeroing published_last_checked.
+        Transport::publish_destination(
+            dest_hash.clone(),
+            Some(Duration::from_secs(0)),
+            None,
+        );
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+        }
+
+        // Run jobs() on a background thread with a generous timeout. If the
+        // re-entrant deadlock is present, the thread will spin forever and
+        // recv_timeout returns Err — the test fails loudly. With the fix,
+        // jobs() should complete in well under 100ms.
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            Transport::jobs();
+            let _ = tx.send(());
+        });
+
+        let outcome = rx.recv_timeout(Duration::from_secs(3));
+        // Cleanup before assertion so a failure doesn't leave shared state
+        // in a bad shape for follow-on tests.
+        Transport::unpublish_destination(&dest_hash);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest_hash);
+            // If jobs() is still spinning we cannot join the thread — leak it
+            // and force-clear the spinwait flag so subsequent tests don't
+            // inherit our deadlock.
+            state.jobs_running = false;
+            state.jobs_locked = false;
+        }
+        assert!(
+            outcome.is_ok(),
+            "Transport::jobs() deadlocked while refreshing a published destination — re-entrant outbound bug regressed"
+        );
+        // Drain the join handle if jobs returned cleanly.
+        let _ = handle.join();
+    }
+
+    /// Companion to the test above. Verifies that calling
+    /// `Transport::outbound` from a separate thread *while* `jobs()` is
+    /// running does not block indefinitely. Before the fix, both threads
+    /// would be stuck inside the spinwait. After the fix, the
+    /// published-destination refresh no longer leaves `jobs_running`
+    /// stuck high, so the concurrent outbound call returns quickly.
+    #[test]
+    fn outbound_from_other_thread_does_not_deadlock_during_jobs_published_refresh() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.jobs_running = false;
+            state.jobs_locked = false;
+            state.published_destinations.clear();
+            state.last_mgmt_announce = now() + 60.0;
+        }
+
+        let identity = Identity::new(true);
+        let destination = Destination::new_inbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "deadlock_test_b".to_string(),
+            vec!["regression".to_string()],
+        )
+        .expect("inbound destination");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        Transport::publish_destination(
+            dest_hash.clone(),
+            Some(Duration::from_secs(0)),
+            None,
+        );
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+        }
+
+        // Build a tiny outbound packet to fire concurrently with jobs().
+        let outbound_dest = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "deadlock_test_b".to_string(),
+            vec!["sender".to_string()],
+        )
+        .expect("outbound destination");
+        let mut packet = Packet::new(
+            Some(outbound_dest),
+            vec![1, 2, 3, 4],
+            DATA,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        packet.pack().expect("pack outbound packet");
+
+        let (jobs_tx, jobs_rx) = mpsc::channel();
+        let jobs_handle = std::thread::spawn(move || {
+            Transport::jobs();
+            let _ = jobs_tx.send(());
+        });
+
+        let (out_tx, out_rx) = mpsc::channel();
+        let out_handle = std::thread::spawn(move || {
+            // Yield briefly so jobs() has a chance to be in flight when we hit outbound.
+            std::thread::sleep(Duration::from_millis(5));
+            Transport::outbound(&mut packet);
+            let _ = out_tx.send(());
+        });
+
+        let jobs_outcome = jobs_rx.recv_timeout(Duration::from_secs(3));
+        let out_outcome = out_rx.recv_timeout(Duration::from_secs(3));
+
+        Transport::unpublish_destination(&dest_hash);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest_hash);
+            state.jobs_running = false;
+            state.jobs_locked = false;
+        }
+        assert!(jobs_outcome.is_ok(), "Transport::jobs() deadlocked");
+        assert!(out_outcome.is_ok(), "concurrent Transport::outbound deadlocked");
+        let _ = jobs_handle.join();
+        let _ = out_handle.join();
     }
 }

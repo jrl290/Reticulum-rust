@@ -117,6 +117,17 @@ pub fn flush_if_due() {
     }
 
     let interval = now.saturating_sub(last);
+    // Counter relationships (so the line is interpretable at a glance):
+    //   inbound  = every announce that entered Transport::inbound
+    //   valid    = announces whose Ed25519 signature passed (or was
+    //              short-circuited because we'd already verified the same
+    //              packet_hash earlier — see `dedup_skipped`)
+    //   invalid  = announces whose Ed25519 signature failed
+    //   dedup_skipped ⊆ valid  (fast-path verify-skips counted here AND in valid)
+    //   paths_added ≤ valid    (only fires when path table was actually mutated;
+    //                           drops own-destination echoes and no-improvement updates)
+    // So `inbound - (valid + invalid)` represents announces dropped before
+    // signature check (e.g. data shorter than a public key).
     crate::log(
         format!(
             "[ANNOUNCE-SUMMARY] window={}s inbound={} valid={} invalid={} dedup_skipped={} paths_added={} ({:.1}/s)",
