@@ -23,7 +23,7 @@
 //! attached / detached for an app-link destination.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
@@ -32,6 +32,25 @@ use crate::destination::Destination;
 use crate::link::{Link, LinkHandle, MODE_AES256_CBC, STATE_ACTIVE, STATE_HANDSHAKE, STATE_PENDING};
 use crate::transport::{AnnounceCallback, AnnounceHandler, Transport};
 use crate::{hexrep, log, LOG_ERROR, LOG_NOTICE};
+
+/// Maximum number of in-flight outbound LRs we'll race per app-link
+/// destination. Set to 2 to bound the cost: with this cap we trade exactly
+/// one extra LR (and one extra inbound `Link` on the daemon, torn down
+/// immediately on win) per cold-start in exchange for not waiting on the
+/// per-hop establishment timeout when a fresher path arrives mid-LR.
+///
+/// Why not 3+? Each racer is one full ECDH handshake the daemon has to
+/// process plus a ~6 s × hops watchdog if we forget to teardown. Two
+/// racers cover the only scenarios that matter today (cached/incumbent vs
+/// announce-supplied better path; or first-trigger-no-path, request_path,
+/// then pre-ACTIVE arrival of an improved announce). Any deeper racing is
+/// CPU/wire overhead with diminishing returns.
+const MAX_RACERS_PER_DEST: usize = 2;
+
+/// Monotonic per-process racer ID. Each racer LinkHandle gets a unique ID
+/// so its callbacks can identify themselves in the `racers` table without
+/// relying on `LinkHandle` equality (which isn't defined).
+static NEXT_RACER_ID: AtomicU64 = AtomicU64::new(1);
 
 // ─── Public status constants ────────────────────────────────────────────
 pub const APP_LINK_NONE: u8 = 0x00;
@@ -106,10 +125,18 @@ impl AppLinkSpec {
 
 struct Registry {
 	specs: HashMap<Vec<u8>, AppLinkSpec>,
-	/// LinkHandle currently tracked for an app-link destination.  This is
-	/// the outbound link the registry created — peer-initiated inbound
-	/// links live in the host (e.g. LXMF's `backchannel_links`).
+	/// LinkHandle currently tracked as the *winner* for an app-link
+	/// destination — populated only when an outbound LR for this dest has
+	/// reached `STATE_ACTIVE`. Until then the handle (or handles, plural,
+	/// when racing) live in `racers`. Inbound peer-initiated links live in
+	/// the host (e.g. LXMF's `backchannel_links`), not here.
 	links: HashMap<Vec<u8>, LinkHandle>,
+	/// In-flight outbound LRs per destination, capped by
+	/// [`MAX_RACERS_PER_DEST`]. The first racer's `link_established`
+	/// callback to fire wins, gets promoted into `links`, and the
+	/// remaining racers are torn down. Pre-ACTIVE close of an individual
+	/// racer just removes it from this list without disturbing siblings.
+	racers: HashMap<Vec<u8>, Vec<Racer>>,
 	status_callbacks: Vec<AppLinkStatusCallback>,
 	/// Set once the announce handler has been registered with `Transport`.
 	announce_handler_installed: bool,
@@ -123,11 +150,28 @@ impl Registry {
 		Self {
 			specs: HashMap::new(),
 			links: HashMap::new(),
+			racers: HashMap::new(),
 			status_callbacks: Vec::new(),
 			announce_handler_installed: false,
 			policy: LinkPolicy::Foreground,
 		}
 	}
+}
+
+/// One in-flight LR being raced toward a destination.
+///
+/// `id` is unique within the process and is the only stable identity for
+/// a `LinkHandle` available to closures (LinkHandle has no `Eq`).
+/// `hops` records the path hop-count *at the time the racer was
+/// spawned* — used by `establish()` to gate spawning new racers: a fresh
+/// announce only spawns a 2nd racer if its current path is strictly
+/// shorter than every existing racer's. Without this gate, two announces
+/// arriving over the same path waste one of the two racer slots on a
+/// duplicate LR (observed in retichat.log 2026-04-30 17:42:46/48).
+struct Racer {
+	id: u64,
+	handle: LinkHandle,
+	hops: u8,
 }
 
 static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::new()));
@@ -313,16 +357,23 @@ impl AppLinks {
 	}
 
 	/// Close an app link.  Removes the destination from the registry, tears
-	/// down the tracked link (if any), and fires a `NONE` status callback.
+	/// down the winner link AND any in-flight racers, and fires a `NONE`
+	/// status callback.
 	pub fn close(dest_hash: &[u8]) {
 		{
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			reg.specs.remove(dest_hash);
 		}
+		Self::teardown_all_racers(dest_hash);
 		Self::detach_link(dest_hash, /*notify*/ true);
 	}
 
 	/// Snapshot status for `dest_hash`.  See `APP_LINK_*` constants.
+	///
+	/// Racing-aware: if the winner slot (`links`) holds an ACTIVE handle
+	/// we report ACTIVE; otherwise if there are any in-flight racers we
+	/// report ESTABLISHING; otherwise we fall back to the path-availability
+	/// classification.
 	pub fn status(dest_hash: &[u8]) -> u8 {
 		let reg = match REGISTRY.lock() {
 			Ok(g) => g,
@@ -331,24 +382,25 @@ impl AppLinks {
 		if !reg.specs.contains_key(dest_hash) {
 			return APP_LINK_NONE;
 		}
-		match reg.links.get(dest_hash) {
-			Some(arc) => {
-				let s = arc.status();
-				if s == STATE_ACTIVE {
-					APP_LINK_ACTIVE
-				} else if s == STATE_PENDING || s == STATE_HANDSHAKE {
-					APP_LINK_ESTABLISHING
-				} else {
-					APP_LINK_DISCONNECTED
-				}
+		if let Some(arc) = reg.links.get(dest_hash) {
+			let s = arc.status();
+			if s == STATE_ACTIVE {
+				return APP_LINK_ACTIVE;
 			}
-			None => {
-				if Transport::has_path(dest_hash) {
-					APP_LINK_DISCONNECTED
-				} else {
-					APP_LINK_PATH_REQUESTED
-				}
+			if s == STATE_PENDING || s == STATE_HANDSHAKE {
+				return APP_LINK_ESTABLISHING;
 			}
+			// Winner slot holds a CLOSED handle (rare race window between
+			// closed-callback fire and registry cleanup). Fall through to
+			// the racers / path check below.
+		}
+		if reg.racers.get(dest_hash).map(|v| !v.is_empty()).unwrap_or(false) {
+			return APP_LINK_ESTABLISHING;
+		}
+		if Transport::has_path(dest_hash) {
+			APP_LINK_DISCONNECTED
+		} else {
+			APP_LINK_PATH_REQUESTED
 		}
 	}
 
@@ -361,7 +413,13 @@ impl AppLinks {
 
 	/// Trigger one fresh app-link attempt for `dest_hash` on the strength
 	/// of a fresh announce.  No-op if no entry exists, link is already
-	/// active/establishing, or an attempt is already in flight.
+	/// active, or the racer cap is full.
+	///
+	/// Note: ESTABLISHING is NOT a bail condition with bounded racing.
+	/// When a fresh announce arrives mid-LR, we want to spawn a 2nd racer
+	/// down the new path (subject to [`MAX_RACERS_PER_DEST`]) so the path
+	/// improvement isn't gated on the in-flight LR completing first. The
+	/// cap check inside [`establish`] enforces the bound.
 	pub fn announce_received(dest_hash: &[u8]) {
 		if !Self::contains(dest_hash) {
 			return;
@@ -369,9 +427,8 @@ impl AppLinks {
 		if Self::policy() == LinkPolicy::Suspended {
 			return;
 		}
-		match Self::status(dest_hash) {
-			APP_LINK_ACTIVE | APP_LINK_ESTABLISHING => return,
-			_ => {}
+		if Self::status(dest_hash) == APP_LINK_ACTIVE {
+			return;
 		}
 		// NOTE: do NOT log "announce trigger" here. Two separate Transport
 		// announce handlers (the global app_links one + a per-aspect LXMF
@@ -422,9 +479,12 @@ impl AppLinks {
 
 	// ─── Internals ──────────────────────────────────────────────────────
 
-	/// Tear down (if present) and remove the tracked LinkHandle for
+	/// Tear down (if present) and remove the winner LinkHandle for
 	/// `dest_hash`.  When `notify` is true, fires a status callback so
 	/// hosts can drop their mirror entries.
+	///
+	/// Does NOT touch racers — callers that need a full wipe (e.g.
+	/// [`close`]) must call [`teardown_all_racers`] first.
 	fn detach_link(dest_hash: &[u8], notify: bool) {
 		let removed = {
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
@@ -444,6 +504,88 @@ impl AppLinks {
 				cb(dest_hash, APP_LINK_NONE, None);
 			}
 		}
+	}
+
+	/// Tear down every in-flight racer for `dest_hash` and clear the
+	/// `racers` slot. Used by [`close`].
+	///
+	/// Callbacks are detached BEFORE `teardown()` so the loser's
+	/// `link_closed` doesn't re-enter the registry mutating logic. We
+	/// have already removed them from `racers` under the lock so even if
+	/// a stray callback fires it will find nothing to remove.
+	fn teardown_all_racers(dest_hash: &[u8]) {
+		let drained: Vec<Racer> = {
+			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+			reg.racers.remove(dest_hash).unwrap_or_default()
+		};
+		for racer in drained {
+			racer.handle.set_link_closed_callback(None);
+			racer.handle.set_link_established_callback(None);
+			racer.handle.teardown();
+		}
+	}
+
+	/// Tear down every racer for `dest_hash` EXCEPT the one identified by
+	/// `winner_id`. Used by the winner-promotion path in the
+	/// link-established callback.
+	fn teardown_losing_racers(dest_hash: &[u8], winner_id: u64) {
+		let losers: Vec<Racer> = {
+			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+			match reg.racers.get_mut(dest_hash) {
+				Some(v) => {
+					let (winners, losers): (Vec<_>, Vec<_>) =
+						v.drain(..).partition(|r| r.id == winner_id);
+					// Re-insert the winner so callers (e.g. status())
+					// continue to observe the in-flight set as non-empty
+					// until it's promoted into `links`.
+					for w in winners {
+						v.push(w);
+					}
+					losers
+				}
+				None => Vec::new(),
+			}
+		};
+		if !losers.is_empty() {
+			log(
+				&format!(
+					"[APP_LINK] tearing down {} losing racer(s) for {}",
+					losers.len(),
+					hexrep(dest_hash, false)
+				),
+				LOG_NOTICE, false, false,
+			);
+		}
+		for racer in losers {
+			racer.handle.set_link_closed_callback(None);
+			racer.handle.set_link_established_callback(None);
+			racer.handle.teardown();
+		}
+	}
+
+	/// Remove the racer with `id` from `racers[dest_hash]` if present.
+	/// Returns true if the entry was found and removed.
+	fn remove_racer(dest_hash: &[u8], id: u64) -> bool {
+		let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+		if let Some(v) = reg.racers.get_mut(dest_hash) {
+			let before = v.len();
+			v.retain(|r| r.id != id);
+			let removed = v.len() < before;
+			if v.is_empty() {
+				reg.racers.remove(dest_hash);
+			}
+			return removed;
+		}
+		false
+	}
+
+	/// Number of in-flight racers for `dest_hash`.
+	fn racer_count(dest_hash: &[u8]) -> usize {
+		REGISTRY
+			.lock()
+			.ok()
+			.and_then(|r| r.racers.get(dest_hash).map(|v| v.len()))
+			.unwrap_or(0)
 	}
 
 	/// Single-use install of the global announce handler.  Idempotent.
@@ -485,12 +627,48 @@ impl AppLinks {
 	/// Create and initiate a link for an already-registered destination.
 	///
 	/// Caller is responsible for having ensured the destination is in
-	/// `specs`.  Single-attempt policy: skips if `attempt_in_flight` is set.
+	/// `specs`.
+	///
+	/// Bounded LR racing
+	/// =================
+	///
+	/// We allow up to [`MAX_RACERS_PER_DEST`] in-flight outbound LRs per
+	/// destination. The first racer to reach `STATE_ACTIVE` wins and is
+	/// promoted into `Registry.links`; the losers are torn down by the
+	/// winner's `link_established` callback via [`teardown_losing_racers`].
+	///
+	/// Why race at all?
+	/// - Cold start often commits to a stale long-hop path the first
+	///   announce supplied; a fresher (shorter) announce arriving mid-LR
+	///   used to be either ignored (we'd wait the per-hop timeout) or
+	///   eagerly torn down by Transport (which stranded the destination
+	///   when the re-trigger raced the teardown — see retichat.log
+	///   2026-04-30 17:01:36). Racing keeps the in-flight LR as a
+	///   guaranteed fallback while a 2nd LR explores the better path.
+	///
+	/// Why cap at 2?
+	/// - Each racer is a full ECDH handshake the receiver must process;
+	///   the receiver does NOT dedup by initiator identity (every LR
+	///   produces a fresh inbound `Link` with `KEEPALIVE = 360 s`).
+	///   Letting losers linger would leave 6+ minute zombies on the daemon.
+	///   With cap=2 we trade one extra handshake (immediately torn down on
+	///   win) for path-improvement responsiveness; deeper racing is wire
+	///   overhead with diminishing returns.
+	///
+	/// `attempt_in_flight` semantics
+	/// =============================
+	///
+	/// `attempt_in_flight` collapses *concurrent* triggers from the same
+	/// announce (the global app_links handler + a per-aspect LXMF reconnect
+	/// handler can both fan in for a single packet). It is held only for
+	/// the duration of the spawn-and-register block here, then released
+	/// immediately. The bound on simultaneous racers is enforced by
+	/// [`MAX_RACERS_PER_DEST`], NOT by this flag — otherwise a 2nd
+	/// announce could never spawn a racer.
 	fn establish(dest_hash: &[u8]) {
 		if Self::policy() == LinkPolicy::Suspended {
 			return;
 		}
-		// Early bail: attempt already in flight?
 		let spec = match Self::spec(dest_hash) {
 			Some(s) => s,
 			None => {
@@ -501,43 +679,99 @@ impl AppLinks {
 				return;
 			}
 		};
-		// Atomically claim the in-flight slot.  A plain load+store would
-		// race when two announce-handler invocations (or an announce trigger
-		// concurrent with `open()`) both reach this gate before either has
-		// stored `true` — both then proceed and we issue duplicate LRs.
-		// `compare_exchange` collapses the read+write into a single
-		// uncontended hardware op.
+		// Atomically claim the in-flight slot. Two concurrent triggers
+		// for the same announce collapse here. `compare_exchange` is the
+		// single hardware op that makes it race-free.
 		if spec.attempt_in_flight
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 			.is_err()
 		{
-			// Silent: this is the dedup point. A previous trigger already
-			// claimed the slot; logging here would just be a duplicate.
+			// Silent: a sibling trigger is mid-spawn; it will spawn a
+			// racer if room (or skip if cap reached). Logging here would
+			// duplicate the line about to be emitted just below.
 			return;
 		}
-		log(
-			&format!("[APP_LINK] trigger → establishing {}", hexrep(dest_hash, false)),
-			LOG_NOTICE, false, false,
-		);
 
-		// If an existing tracked link is still alive, leave it alone.
+		// Decide eligibility:
+		//   1. Bail if we're already ACTIVE (winner exists).
+		//   2. Bail if the racer cap is full.
+		//   3. Bail if the current path is no better than every existing
+		//      racer's path. "Better" = strictly fewer hops. This stops the
+		//      common case where two consecutive announces arrive over the
+		//      same upstream interface with identical hop counts: the 2nd
+		//      announce would spawn a duplicate LR down the same path,
+		//      wasting our one extra racer slot. Reserve racer #2 for a
+		//      genuinely-better path.
+		//
+		// First-racer (no existing racers) ALWAYS allowed regardless of
+		// hops — that's the cold-start trigger.
+		let current_hops = Transport::path_hops(dest_hash);
 		{
 			let reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			if let Some(existing) = reg.links.get(dest_hash) {
-				let st = existing.status();
-				if st == STATE_ACTIVE || st == STATE_PENDING || st == STATE_HANDSHAKE {
-					// Release the slot we just claimed — the existing link is
-					// fine and the callbacks attached to it own the lifecycle.
+				if existing.status() == STATE_ACTIVE {
+					spec.attempt_in_flight.store(false, Ordering::Release);
+					return;
+				}
+				// Else `links` holds a CLOSED handle from a prior race
+				// in cleanup; fall through and replace it (detach below).
+			}
+			let existing_racers = reg.racers.get(dest_hash);
+			let n = existing_racers.map(|v| v.len()).unwrap_or(0);
+			if n >= MAX_RACERS_PER_DEST {
+				spec.attempt_in_flight.store(false, Ordering::Release);
+				return;
+			}
+			if n > 0 {
+				// Need a strictly-better path to be worth a new racer.
+				let best_existing = existing_racers
+					.and_then(|v| v.iter().map(|r| r.hops).min())
+					.unwrap_or(u8::MAX);
+				let improves = match current_hops {
+					Some(h) => h < best_existing,
+					None => false, // no path info → can't claim improvement
+				};
+				if !improves {
+					log(
+						&format!(
+							"[APP_LINK] skip racer for {} — path hops {:?} not better than existing racer (best={})",
+							hexrep(dest_hash, false),
+							current_hops,
+							best_existing,
+						),
+						LOG_NOTICE, false, false,
+					);
 					spec.attempt_in_flight.store(false, Ordering::Release);
 					return;
 				}
 			}
 		}
-		// Detach any dead link entry before creating a new one.
-		Self::detach_link(dest_hash, /*notify*/ false);
+		// `current_hops` may legitimately be None for a first racer when
+		// `establish()` is called before the path table has been populated
+		// (e.g. retry after expire_path). Use u8::MAX as a sentinel so any
+		// real future announce will improve on it.
+		let my_hops = current_hops.unwrap_or(u8::MAX);
+
+		// Detach any dead `links` entry (CLOSED handle) before adding a
+		// new racer. Does NOT touch `racers`.
+		{
+			let drop_dead = {
+				let reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+				reg.links.get(dest_hash).map(|h| h.status())
+					.map(|s| s != STATE_ACTIVE && s != STATE_PENDING && s != STATE_HANDSHAKE)
+					.unwrap_or(false)
+			};
+			if drop_dead {
+				Self::detach_link(dest_hash, /*notify*/ false);
+			}
+		}
 
 		log(
-			&format!("[APP_LINK] Establishing link to {}", hexrep(dest_hash, false)),
+			&format!("[APP_LINK] trigger → spawning LR (racer #{}/{}, hops={}) for {}",
+				Self::racer_count(dest_hash) + 1,
+				MAX_RACERS_PER_DEST,
+				my_hops,
+				hexrep(dest_hash, false)),
 			LOG_NOTICE, false, false,
 		);
 
@@ -564,103 +798,132 @@ impl AppLinks {
 			}
 		};
 		let link_handle = LinkHandle::spawn(link);
+		let my_racer_id = NEXT_RACER_ID.fetch_add(1, Ordering::Relaxed);
 
-		// `attempt_in_flight` was already claimed by compare_exchange above;
-		// it stays true until either callback fires.
-
-		// Track whether the link ever became ACTIVE so the closed callback
-		// can distinguish a clean teardown from a failed establishment.
+		// Per-handle latches.
+		// `was_established` is per-RACER (set by this racer's own
+		// link_established, regardless of win/lose). `is_winner` is set
+		// only by the racer that won the compare_exchange in the
+		// established callback. The closed callback uses both to choose
+		// among: pure-loser teardown (silent), winner post-ACTIVE retry,
+		// and pre-ACTIVE expire+request_path (only when no other racers
+		// are in flight).
 		let was_established = Arc::new(AtomicBool::new(false));
+		let is_winner = Arc::new(AtomicBool::new(false));
 		let was_established_closed = was_established.clone();
-		let in_flight_estab = spec.attempt_in_flight.clone();
-		let in_flight_closed = spec.attempt_in_flight.clone();
+		let is_winner_closed = is_winner.clone();
 		let ever_established_estab = spec.ever_established.clone();
 
-		// Defence-in-depth: Link::teardown() in Reticulum-rust is idempotent
-		// in *state* but NOT in callback firing — every call re-invokes
-		// link_closed() even when the link is already CLOSED.  This latch
-		// ensures the expire_path branch runs at most once per link
-		// lifetime regardless of how many times the layer fires it.
+		// Defence-in-depth: Link::teardown() in Reticulum-rust is
+		// idempotent in *state* but NOT in callback firing — every call
+		// re-invokes link_closed() even when the link is already CLOSED.
+		// This latch ensures the close-handling block runs at most once
+		// per racer regardless of how many times the layer fires it.
 		let closed_fired = Arc::new(AtomicBool::new(false));
 		let dest_for_estab = dest_hash.to_vec();
 		let dest_for_closed = dest_hash.to_vec();
 		let handle_for_estab = link_handle.clone();
 
 		link_handle.set_link_established_callback(Some(Arc::new(move |_| {
-			log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
 			was_established.store(true, Ordering::Relaxed);
-			ever_established_estab.store(true, Ordering::Relaxed);
-			in_flight_estab.store(false, Ordering::Relaxed);
 
-			// Fire status callback so the host can wake outbound, etc.
-			let cbs: Vec<AppLinkStatusCallback> = REGISTRY
-				.lock()
-				.map(|r| r.status_callbacks.clone())
-				.unwrap_or_default();
-			for cb in &cbs {
-				cb(&dest_for_estab, APP_LINK_ACTIVE, Some(handle_for_estab.clone()));
+			// Race promotion: the FIRST racer to reach ACTIVE wins.
+			// Subsequent ESTABLISHED firings (other racers we haven't yet
+			// torn down) lose — they silently teardown themselves; the
+			// winner's `teardown_losing_racers` will also catch them but
+			// either path is fine.
+			let won = {
+				let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+				if reg.links.contains_key(&dest_for_estab) {
+					// A peer racer already won. We're a loser.
+					false
+				} else {
+					// We won. Move our handle into `links`. We stay in
+					// `racers` for now; teardown_losing_racers below
+					// preserves us by id.
+					reg.links.insert(dest_for_estab.clone(), handle_for_estab.clone());
+					true
+				}
+			};
+
+			if won {
+				is_winner.store(true, Ordering::Relaxed);
+				ever_established_estab.store(true, Ordering::Relaxed);
+				log(
+					&format!("[APP_LINK] Direct link ESTABLISHED (winner racer={}) for {}",
+						my_racer_id, hexrep(&dest_for_estab, false)),
+					LOG_NOTICE, false, false,
+				);
+
+				// Fire status callback so the host can wake outbound, etc.
+				let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+					.lock()
+					.map(|r| r.status_callbacks.clone())
+					.unwrap_or_default();
+				for cb in &cbs {
+					cb(&dest_for_estab, APP_LINK_ACTIVE, Some(handle_for_estab.clone()));
+				}
+
+				// Tear down losers. They get their `link_closed`
+				// invoked but `is_winner=false` and `was_established`
+				// likely false → they take the silent-loser branch in
+				// the close callback below.
+				AppLinks::teardown_losing_racers(&dest_for_estab, my_racer_id);
+			} else {
+				log(
+					&format!("[APP_LINK] Racer {} reached ACTIVE after a sibling already won for {} — tearing down",
+						my_racer_id, hexrep(&dest_for_estab, false)),
+					LOG_NOTICE, false, false,
+				);
+				// Silent self-teardown. Detach our own callbacks first
+				// so the close path takes the silent branch (we already
+				// removed ourselves from racers conceptually — actually
+				// no, we're still there; let the close callback handle
+				// the racers cleanup).
+				handle_for_estab.teardown();
 			}
 		})));
 
-		link_handle.set_link_closed_callback(Some(Arc::new(move |closed_handle: LinkHandle| {
-			// Always release the in-flight flag so the next external trigger
-			// is allowed to attempt one new LR.
-			in_flight_closed.store(false, Ordering::Relaxed);
+		link_handle.set_link_closed_callback(Some(Arc::new(move |_closed_handle: LinkHandle| {
 			if closed_fired.swap(true, Ordering::Relaxed) {
 				return;
 			}
 
-			// Drop the registry entry for this destination so subsequent
-			// triggers can replace it.  Notify hosts so they drop mirrors.
-			{
-				let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-				reg.links.remove(&dest_for_closed);
-			}
-			let cbs: Vec<AppLinkStatusCallback> = REGISTRY
-				.lock()
-				.map(|r| r.status_callbacks.clone())
-				.unwrap_or_default();
-			for cb in &cbs {
-				cb(&dest_for_closed, APP_LINK_DISCONNECTED, None);
-			}
+			// Remove ourselves from `racers` (idempotent — no-op if
+			// already drained by teardown_losing_racers / close()).
+			let _ = AppLinks::remove_racer(&dest_for_closed, my_racer_id);
 
-			if !was_established_closed.load(Ordering::Relaxed) {
-				// If Transport tore us down because it just learned a better
-				// path, the path table already holds a fresher entry — do NOT
-				// expire it (would clobber the improvement) and do NOT issue a
-				// redundant request_path. The improved-path announce that
-				// triggered the cancellation has already invoked the
-				// announce-handler path which will re-attempt establishment
-				// via `announce_received()`.
-				if closed_handle.was_cancelled_for_better_path() {
-					log(
-						&format!("[APP_LINK] Pending link cancelled by better path for {} — keeping improved path",
-							hexrep(&dest_for_closed, false)),
-						LOG_NOTICE, false, false,
-					);
-					return;
+			let we_were_winner = is_winner_closed.load(Ordering::Relaxed);
+			let we_reached_active = was_established_closed.load(Ordering::Relaxed);
+
+			if we_were_winner {
+				// We were the active link. Remove from `links` and
+				// notify hosts.
+				{
+					let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+					reg.links.remove(&dest_for_closed);
 				}
-				log(
-					&format!("[APP_LINK] Link closed before ACTIVE — expiring stale path for {}",
-						hexrep(&dest_for_closed, false)),
-					LOG_NOTICE, false, false,
-				);
-				Transport::expire_path(&dest_for_closed);
-				Transport::request_path(&dest_for_closed, None, None, None, None);
-			} else {
+				let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+					.lock()
+					.map(|r| r.status_callbacks.clone())
+					.unwrap_or_default();
+				for cb in &cbs {
+					cb(&dest_for_closed, APP_LINK_DISCONNECTED, None);
+				}
+
 				// Post-ACTIVE auto-retry only fires in Foreground. In
-				// Background we keep what we have but don't burn battery on
-				// retries; in Suspended we're tearing down anyway.
+				// Background we keep what we have but don't burn battery
+				// on retries; in Suspended we're tearing down anyway.
 				if AppLinks::policy() != LinkPolicy::Foreground {
 					log(
-						&format!("[APP_LINK] Link torn down after ACTIVE for {} — retry suppressed by policy {:?}",
+						&format!("[APP_LINK] Winner link torn down post-ACTIVE for {} — retry suppressed by policy {:?}",
 							hexrep(&dest_for_closed, false), AppLinks::policy()),
 						LOG_NOTICE, false, false,
 					);
 					return;
 				}
 				log(
-					&format!("[APP_LINK] Link torn down after being ACTIVE for {} — single auto-retry",
+					&format!("[APP_LINK] Winner link torn down post-ACTIVE for {} — single auto-retry",
 						hexrep(&dest_for_closed, false)),
 					LOG_NOTICE, false, false,
 				);
@@ -668,15 +931,79 @@ impl AppLinks {
 				std::thread::spawn(move || {
 					AppLinks::establish(&dest_retry);
 				});
+				return;
 			}
+
+			// We're a non-winner racer.
+			//
+			// Case A: we reached ACTIVE but lost the race → we were torn
+			// down by the winner. Silent.
+			//
+			// Case B: we never reached ACTIVE → either we lost the LR
+			// (timeout, peer rejection) or we were torn down because a
+			// sibling racer won. Either way:
+			//   - if any other racers are still in flight, OR a winner
+			//     already exists in `links`, do NOTHING (don't expire
+			//     path, don't request_path — would clobber a path that
+			//     is actively working for another racer).
+			//   - if we were the LAST racer and there's no winner, the
+			//     destination is fully down: expire the path and request
+			//     a fresh one. This is the original cold-fail behaviour.
+			let any_others_alive = {
+				let reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+				let racers_left = reg.racers.get(&dest_for_closed)
+					.map(|v| !v.is_empty()).unwrap_or(false);
+				let winner_present = reg.links.contains_key(&dest_for_closed);
+				racers_left || winner_present
+			};
+
+			if any_others_alive {
+				if we_reached_active {
+					log(
+						&format!("[APP_LINK] Loser racer {} torn down post-ACTIVE for {} — silent (winner owns lifecycle)",
+							my_racer_id, hexrep(&dest_for_closed, false)),
+						LOG_NOTICE, false, false,
+					);
+				}
+				// No path expire, no retry — sibling keeps going.
+				return;
+			}
+
+			// Last racer down with no winner. This is the genuine cold
+			// fail. Expire stale path and request a fresh one so the
+			// next announce-trigger has a clean slate.
+			log(
+				&format!("[APP_LINK] Last racer {} closed pre-ACTIVE with no winner for {} — expiring stale path",
+					my_racer_id, hexrep(&dest_for_closed, false)),
+				LOG_NOTICE, false, false,
+			);
+			let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+				.lock()
+				.map(|r| r.status_callbacks.clone())
+				.unwrap_or_default();
+			for cb in &cbs {
+				cb(&dest_for_closed, APP_LINK_DISCONNECTED, None);
+			}
+			Transport::expire_path(&dest_for_closed);
+			Transport::request_path(&dest_for_closed, None, None, None, None);
 		})));
 
-		// Insert into the registry BEFORE spawning the initiate so that
-		// status() and get_handle() are immediately consistent.
+		// Insert into the racers list BEFORE spawning the initiate so
+		// status() and the racer-cap check are immediately consistent
+		// with the new in-flight LR.
 		{
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-			reg.links.insert(dest_hash.to_vec(), link_handle.clone());
+			reg.racers.entry(dest_hash.to_vec())
+				.or_insert_with(Vec::new)
+				.push(Racer { id: my_racer_id, handle: link_handle.clone(), hops: my_hops });
 		}
+
+		// Release the in-flight gate now — we've successfully claimed a
+		// racer slot. A subsequent trigger from an independent announce
+		// is allowed to claim again and spawn another racer (subject to
+		// the cap). Holding it until ESTABLISHED/CLOSED would defeat the
+		// whole point of bounded racing.
+		spec.attempt_in_flight.store(false, Ordering::Release);
 
 		// Notify hosts of the new establishing link so they can mirror it.
 		let cbs: Vec<AppLinkStatusCallback> = REGISTRY
@@ -689,11 +1016,12 @@ impl AppLinks {
 
 		// Initiate on a background thread so we don't hold callers'
 		// locks across the link-actor round-trip + Transport::outbound.
-		let in_flight_spawn = spec.attempt_in_flight.clone();
 		std::thread::spawn(move || {
 			if let Err(e) = link_handle.initiate() {
 				log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
-				in_flight_spawn.store(false, Ordering::Relaxed);
+				// initiate() failing means our LinkHandle never reaches
+				// HANDSHAKE/ACTIVE; the link actor will fire link_closed
+				// shortly which handles racer removal + cold-fail.
 			}
 		});
 	}

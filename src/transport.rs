@@ -3458,6 +3458,26 @@ impl Transport {
         }
     }
 
+    /// Hop count for the currently-cached path to `destination_hash`, or
+    /// `None` if no live path entry exists. Live = present in path_table
+    /// AND not soft-expired (timestamp != 0). Used by `app_links` to
+    /// decide whether a fresh announce is worth racing a new LR over the
+    /// already-in-flight racers (only spawn a racer if its path is
+    /// strictly shorter than every existing racer).
+    pub fn path_hops(destination_hash: &[u8]) -> Option<u8> {
+        let state = TRANSPORT.lock().unwrap();
+        let entry = state.path_table.get(destination_hash)?;
+        let live = match entry.get(IDX_PT_TIMESTAMP) {
+            Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => false,
+            _ => true,
+        };
+        if !live { return None; }
+        match entry.get(IDX_PT_HOPS) {
+            Some(PathEntryValue::Hops(h)) => Some(*h),
+            _ => None,
+        }
+    }
+
     pub fn add_packet_hash(packet_hash: Vec<u8>) {
         let mut state = TRANSPORT.lock().unwrap();
         if !state.is_connected_to_shared_instance {
@@ -4176,44 +4196,31 @@ impl Transport {
                         }
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
-                        // ── FIX: CANCEL PENDING LINK ON PATH IMPROVEMENT ──────────────────────
-                        // DO NOT REVERT.
+                        // ── Path improvement: NO eager teardown ──────────────────────────────
+                        // DO NOT REVERT to teardown_pending_links_to_destination here.
                         //
-                        // Bug: when a stale long-hop path is learned first (e.g. flooded
-                        // from a peer's cached announce on connect), iOS would commit a
-                        // link request to that path and then ignore a much shorter path
-                        // arriving 10-30s later, sitting on the 60s timeout.
+                        // Earlier behaviour: when an announce strictly improved the hop
+                        // count for a destination, Transport tore down every in-flight
+                        // outbound link to that destination on the assumption a fresh LR
+                        // would re-establish via the new path. That assumption was
+                        // brittle: the announce handler that would re-trigger
+                        // establishment can run BEFORE the teardown completes and bail
+                        // out because status is still ESTABLISHING, leaving the
+                        // destination idle until the next announce.
                         //
-                        // Fix: when an announce strictly improves the hop count for a
-                        // destination, tear down any in-flight (non-ACTIVE) outbound link
-                        // to that destination. The application's link_closed handler then
-                        // observes the new path entry and retries automatically.
+                        // New behaviour: Transport leaves the pending link alone and
+                        // updates the path table. The application layer (e.g.
+                        // app_links::AppLinks) sees the improved announce via its
+                        // registered announce handler and spawns a *racer* LR down the
+                        // new path; whichever LR (existing or racer) reaches ACTIVE
+                        // first wins, and AppLinks tears down the loser. This keeps
+                        // the in-flight LR as a guaranteed fallback while we try the
+                        // improved path, and removes the "stranded destination" bug.
+                        //
+                        // Path/link policy is owned by the app layer; Transport just
+                        // routes packets and maintains the path table.
                         // ──────────────────────────────────────────────────────────────────────
-                        if path_improved {
-                            let dest_hash_clone = destination_hash.clone();
-                            // Don't call teardown while holding the transport state lock —
-                            // cross-actor mpsc could deadlock if the link actor is mid-send
-                            // back into Transport. Defer to a tiny helper thread.
-                            let new_hops = packet.hops;
-                            let old_hops = existing_hops;
-                            std::thread::spawn(move || {
-                                let n = crate::link::teardown_pending_links_to_destination(&dest_hash_clone);
-                                if n > 0 {
-                                    crate::log(
-                                        &format!(
-                                            "Path improved for dest={}: hops {}\u{2192}{}, cancelled {} pending link(s)",
-                                            crate::hexrep(&dest_hash_clone, false),
-                                            old_hops,
-                                            new_hops,
-                                            n,
-                                        ),
-                                        crate::LOG_NOTICE,
-                                        false,
-                                        false,
-                                    );
-                                }
-                            });
-                        }
+                        let _ = path_improved; // explicitly unused — see comment above
 
                         // Python Transport.py line 1838-1865:
                         // If there is a waiting discovery path request for this destination,
@@ -4896,11 +4903,43 @@ impl Transport {
                 BROADCAST,
                 crate::packet::HEADER_1,
                 None,
-                attached_interface,
+                attached_interface.clone(),
                 false,
                 0,
             );
-            let _ = packet.send();
+            // Diagnostic: emit a single notice line so retichat.log shows
+            // both that the request went to the wire and which interface
+            // (if any) it was pinned to. Without this, a path-request that
+            // never arrives is indistinguishable from a peer with no
+            // cached path — both produce silence on the inbound side. The
+            // 5 s send-latency rule then fires with no actionable clue.
+            //
+            // Logged at NOTICE because it's low-volume (deduped via
+            // `path_requests` table just above) and direct evidence of
+            // intent vs. wire reality. NEVER REMOVE EVER —
+            // see DESIGN_PRINCIPLES.md §1 (we cannot meet the 5 s send
+            // budget without being able to attribute path-request
+            // failures to either "didn't send" or "no peer answered").
+            let send_result = packet.send();
+            crate::log(
+                &format!(
+                    "[PATH_REQ] emitted dest={} iface={:?} send_ok={}",
+                    crate::hexrep(&dest_for_job, false),
+                    attached_interface,
+                    send_result.is_ok(),
+                ),
+                crate::LOG_NOTICE, false, false,
+            );
+            if let Err(e) = send_result {
+                crate::log(
+                    &format!(
+                        "[PATH_REQ] send error dest={} err={}",
+                        crate::hexrep(&dest_for_job, false),
+                        e,
+                    ),
+                    crate::LOG_ERROR, false, false,
+                );
+            }
         });
     }
 
