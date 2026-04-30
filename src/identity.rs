@@ -497,24 +497,16 @@ impl Identity {
         // Perform ECDH
         let shared_secret = prv_key.diffie_hellman(ephemeral_pub);
 
-        crate::log(&format!("[DECRYPT-KEY] salt={} ephemeral_pub={} shared_secret={} prv_pub={}",
-            crate::hexrep(salt, false),
-            crate::hexrep(ephemeral_pub.as_bytes(), false),
-            crate::hexrep(shared_secret.as_bytes(), false),
-            crate::hexrep(&X25519PublicKey::from(prv_key).as_bytes()[..], false),
-        ), crate::LOG_NOTICE, false, false);
+        // NOTE: do NOT log shared_secret, derived_key, or token_data hex.
+        // Those values are sufficient to decrypt captured traffic and were
+        // previously emitted at LOG_NOTICE — a critical leak for any user
+        // who shares a log file. See log audit (2026-04).
 
         // Derive decryption key using HKDF
         let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), shared_secret.as_bytes());
         let mut derived_key = [0u8; 64];
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
-
-        crate::log(&format!("[DECRYPT-KEY] derived_key={} token_data_len={} token_data_hex={}",
-            crate::hexrep(&derived_key, false),
-            token_data.len(),
-            crate::hexrep(token_data, false),
-        ), crate::LOG_NOTICE, false, false);
 
         // Decrypt with Token
         let token = Token::new(&derived_key)?;
