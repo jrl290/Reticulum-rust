@@ -602,12 +602,7 @@ impl PacketReceipt {
                         self.status = PacketReceipt::DELIVERED;
                         self.proved = true;
                         self.concluded_at = Some(now_seconds());
-                        
-                        // Call delivery callback if set
-                        if let Some(callback) = &self.delivery_callback {
-                            callback(self);
-                        }
-                        
+                        self.fire_delivery_callback();
                         return true;
                     }
                 }
@@ -620,12 +615,7 @@ impl PacketReceipt {
                     self.status = PacketReceipt::DELIVERED;
                     self.proved = true;
                     self.concluded_at = Some(now_seconds());
-                    
-                    // Call delivery callback if set
-                    if let Some(callback) = &self.delivery_callback {
-                        callback(self);
-                    }
-                    
+                    self.fire_delivery_callback();
                     return true;
                 }
             }
@@ -680,12 +670,7 @@ impl PacketReceipt {
                     self.proved = true;
                     self.concluded_at = Some(now_seconds());
                     // link.last_proof = self.concluded_at
-                    
-                    // Call delivery callback if set
-                    if let Some(callback) = &self.delivery_callback {
-                        callback(self);
-                    }
-                    
+                    self.fire_delivery_callback();
                     return true;
                 }
             }
@@ -737,6 +722,20 @@ impl PacketReceipt {
     /// Set a function that gets called when successful delivery is proven
     pub fn set_delivery_callback(&mut self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
         self.delivery_callback = Some(callback);
+    }
+
+    /// Single, asserting entry-point for delivery-callback invocation.
+    ///
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
+    /// Every "send proved" path in this file routes through here so the
+    /// 5-second send-latency assertion runs at exactly one place.
+    fn fire_delivery_callback(&self) {
+        crate::send_assertion::assert_send_completed_in_time(
+            "packet.receipt", self.sent_at,
+        );
+        if let Some(callback) = &self.delivery_callback {
+            callback(self);
+        }
     }
 
     /// Set a function that gets called if delivery times out

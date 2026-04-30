@@ -9,7 +9,7 @@ use rmpv::encode::write_value as rmpv_write_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 use x25519_dalek::{StaticSecret as X25519PrivateKey, PublicKey as X25519PublicKey};
@@ -59,6 +59,11 @@ pub struct LinkSnapshot {
     pub track_phy_stats: bool,
     pub request_time: Option<f64>,
     pub establishment_cost: usize,
+    /// Wall-clock seconds of the most recent inbound packet of any type
+    /// (DATA, KEEPALIVE, PROOF, control frames). Used by LXMF's app_link
+    /// dual-link disambiguation to pick the link the peer is actually
+    /// servicing.
+    pub last_inbound: u64,
 }
 
 impl LinkSnapshot {
@@ -100,6 +105,11 @@ pub struct LinkHandle {
     /// Whether we initiated this link (true) or it was incoming (false).
     /// Immutable after creation — cached here to avoid channel round-trips.
     pub initiator: bool,
+    /// Set when Transport tears this link down because a better (fewer-hop)
+    /// path to the destination has just been learned.  Lets close-callback
+    /// consumers (e.g. `app_links`) skip remediation that would clobber the
+    /// freshly-improved path entry.
+    cancelled_for_better_path: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +248,7 @@ impl LinkHandle {
             status_atomic: Arc::clone(&status_atomic),
             dest_hash: Arc::clone(&dest_hash),
             initiator,
+            cancelled_for_better_path: Arc::new(AtomicBool::new(false)),
         };
         let self_handle = handle.clone();
         thread::Builder::new()
@@ -299,6 +310,20 @@ impl LinkHandle {
     /// Safe to call while holding any mutex (no channel round-trip).
     pub fn cached_destination_hash(&self) -> &[u8] {
         &self.dest_hash
+    }
+
+    /// Mark this link as having been cancelled because Transport learned a
+    /// better path to the destination.  Inspected by close-callback consumers
+    /// (notably `app_links`) to skip remediation that would clobber the
+    /// freshly-improved path entry.
+    pub fn mark_cancelled_for_better_path(&self) {
+        self.cancelled_for_better_path.store(true, Ordering::Relaxed);
+    }
+
+    /// True iff `mark_cancelled_for_better_path()` was called on this handle
+    /// before its close callback fired.
+    pub fn was_cancelled_for_better_path(&self) -> bool {
+        self.cancelled_for_better_path.load(Ordering::Relaxed)
     }
 
     /// Check if two LinkHandles refer to the same underlying link.
@@ -612,6 +637,7 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                         track_phy_stats: link.track_phy_stats,
                         request_time: link.request_time,
                         establishment_cost: link.establishment_cost,
+                        last_inbound: link.last_inbound,
                     }));
                 }
                 LinkMsg::Status(reply) => { let _ = reply.send(link.status); }
@@ -809,6 +835,11 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                     // if called on the actor thread itself (the actor can't process its
                     // own reply while it's blocked inside the callback).
                     if was_pending && now_active {
+                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                        crate::send_assertion::assert_send_completed_in_time(
+                            "link.establish",
+                            link.request_time.unwrap_or(0.0),
+                        );
                         if let Some(cb) = link.callbacks.link_established.take() {
                             let h = self_handle.clone();
                             thread::spawn(move || cb(h));
@@ -1072,6 +1103,7 @@ pub fn teardown_pending_links_to_destination(dest_hash: &[u8]) -> usize {
             false,
             false,
         );
+        handle.mark_cancelled_for_better_path();
         handle.teardown();
     }
     n
