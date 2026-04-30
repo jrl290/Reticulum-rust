@@ -373,10 +373,13 @@ impl AppLinks {
 			APP_LINK_ACTIVE | APP_LINK_ESTABLISHING => return,
 			_ => {}
 		}
-		log(
-			&format!("[APP_LINK] announce trigger → attempting {}", hexrep(dest_hash, false)),
-			LOG_NOTICE, false, false,
-		);
+		// NOTE: do NOT log "announce trigger" here. Two separate Transport
+		// announce handlers (the global app_links one + a per-aspect LXMF
+		// reconnect handler) can fan in to this function for the same
+		// inbound announce; only one of them will win the in_flight gate in
+		// `establish()`. Logging here produces misleading duplicate lines
+		// (observed in retichat.log Apr 2026). Let `establish()` log when
+		// it actually proceeds.
 		Self::establish(dest_hash);
 	}
 
@@ -508,13 +511,14 @@ impl AppLinks {
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 			.is_err()
 		{
-			log(
-				&format!("[APP_LINK] establish skipped for {} — attempt already in flight",
-					hexrep(dest_hash, false)),
-				LOG_NOTICE, false, false,
-			);
+			// Silent: this is the dedup point. A previous trigger already
+			// claimed the slot; logging here would just be a duplicate.
 			return;
 		}
+		log(
+			&format!("[APP_LINK] trigger → establishing {}", hexrep(dest_hash, false)),
+			LOG_NOTICE, false, false,
+		);
 
 		// If an existing tracked link is still alive, leave it alone.
 		{
