@@ -140,6 +140,14 @@ enum LinkMsg {
     Decrypt(Vec<u8>, Reply<Result<Vec<u8>, LinkGone>>),
 
     // --- Mutating with response ---
+    /// Request submission. The actor performs encrypt + `packet.send()`
+    /// (which is now bounded-latency thanks to Steps 1+2 of the
+    /// transport refactor: per-interface writer actors + global-lock
+    /// hoist) and replies with the real `request_id` on success.
+    ///
+    /// Latency on the caller is `O(actor mailbox + encrypt + lock
+    /// acquisition + writer enqueue)` — microseconds in the common
+    /// case, never bounded by socket RTT.
     Request {
         path: String,
         data: Vec<u8>,
@@ -313,6 +321,16 @@ impl LinkHandle {
     }
 
     /// Send a request on this link.
+    ///
+    /// Synchronous from the caller's perspective: returns once the actor
+    /// has encrypted the payload, packed the packet, and enqueued it on
+    /// the per-interface writer (Step 1 of the transport refactor). All
+    /// of those steps are bounded-latency — the caller is never blocked
+    /// on socket RTT, even against a wedged peer.
+    ///
+    /// Returns the `request_id` (truncated hash of the wire packet) on
+    /// success. Responses are delivered asynchronously via
+    /// `response_callback` / `failed_callback` / `progress_callback`.
     pub fn request(
         &self,
         path: String,
@@ -652,9 +670,24 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 }
 
                 // --- Mutating with response ---
+                // Process the request inline on the actor: encrypt the
+                // payload, pack the packet, and enqueue it on the per-
+                // interface writer (Step 1 of the transport refactor).
+                // All of these are bounded-latency, so replying
+                // synchronously to the caller is safe — the FFI / UI
+                // thread is never blocked on socket RTT.
                 LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, reply } => {
-                    let result = link.request(path, data, response_cb, failed_cb, progress_cb)
-                        .map_err(|_| LinkGone);
+                    let result = link
+                        .request(path, data, response_cb, failed_cb, progress_cb)
+                        .map_err(|e| {
+                            crate::log(
+                                &format!("[LINK] request submission failed: {}", e),
+                                crate::LOG_NOTICE,
+                                false,
+                                false,
+                            );
+                            LinkGone
+                        });
                     let _ = reply.send(result);
                 }
                 LinkMsg::SendPacket(data, reply) => {

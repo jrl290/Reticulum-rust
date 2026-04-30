@@ -330,8 +330,6 @@ pub struct TransportState {
     pub pending_local_path_requests: HashMap<Vec<u8>, InterfaceStub>,
     pub forced_shared_bitrate: Option<u64>,
     pub start_time: Option<f64>,
-    pub jobs_locked: bool,
-    pub jobs_running: bool,
     pub hashlist_maxsize: usize,
     pub job_interval: f64,
     pub links_last_checked: f64,
@@ -559,7 +557,40 @@ where
     }
 }
 
-pub(crate) static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::new(TransportState {
+/// Drop-in shim around `parking_lot::Mutex` that exposes the
+/// `std::sync::Mutex` API (`.lock() -> Result<Guard, Infallible>`),
+/// so existing call sites of the form `TRANSPORT.lock().unwrap()`
+/// keep compiling unchanged after the migration to parking_lot.
+///
+/// Why parking_lot:
+/// * No poisoning — a panic in a critical section doesn't kill the
+///   global Transport for the rest of the process. Steps 1+2
+///   eliminated the I/O blocking that made poisoning a worry; this
+///   removes the residual `LockResult` ceremony.
+/// * Smaller footprint and faster uncontended path than `std::sync::Mutex`.
+/// * Documented FIFO-ish fairness under contention (parking_lot's
+///   "eventual fairness" mode), which Steps 1+2 already rely on
+///   implicitly via the writer-actor architecture.
+///
+/// Used only for the global `TRANSPORT` state (the hottest lock in
+/// the system). Other intra-module locks remain on `std::sync::Mutex`
+/// for now.
+pub(crate) struct FastMutex<T>(parking_lot::Mutex<T>);
+
+impl<T> FastMutex<T> {
+    pub fn new(value: T) -> Self {
+        Self(parking_lot::Mutex::new(value))
+    }
+
+    /// Returns `Ok(guard)` always — parking_lot mutexes cannot be
+    /// poisoned. The `Result` wrapper exists solely so existing
+    /// `lock().unwrap()` call sites keep compiling.
+    pub fn lock(&self) -> Result<parking_lot::MutexGuard<'_, T>, std::convert::Infallible> {
+        Ok(self.0.lock())
+    }
+}
+
+pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| FastMutex::new(TransportState {
     max_pr_tags: 32000,
     hashlist_maxsize: 1_000_000,
     job_interval: 0.250,
@@ -623,17 +654,38 @@ fn mark_packet_sent(packet: &mut Packet, outbound_time: f64) {
 }
 
 impl Transport {
+    /// Register an outbound handler for an interface.
+    ///
+    /// The supplied `handler` is moved into a per-interface writer actor
+    /// (see `interface_writer`): one background thread + bounded mpsc
+    /// channel per interface. `dispatch_outbound` enqueues bytes onto
+    /// that channel and returns immediately, so a slow or wedged socket
+    /// can no longer block the caller (or, transitively, the global
+    /// `TRANSPORT` mutex). The original handler still runs synchronously
+    /// — just on the writer thread, never on the routing path.
     pub fn register_outbound_handler(
         name: &str,
         handler: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) {
+        // Spawn (or replace) the writer actor for this interface.
+        crate::interface_writer::register(
+            name,
+            handler,
+            crate::interface_writer::DEFAULT_WRITER_QUEUE_DEPTH,
+        );
+        // Keep the legacy registry populated so any direct lookup of
+        // OUTBOUND_HANDLERS still finds *something* — but the dispatcher
+        // prefers the writer below. We store a no-op marker so the entry
+        // exists for `dispatch_outbound`'s "is there a handler?" check.
+        let marker: OutboundHandler = Arc::new(|_bytes: &[u8]| true);
         OUTBOUND_HANDLERS
             .lock()
             .unwrap()
-            .insert(name.to_string(), handler);
+            .insert(name.to_string(), marker);
     }
 
     pub fn unregister_outbound_handler(name: &str) {
+        crate::interface_writer::unregister(name);
         OUTBOUND_HANDLERS.lock().unwrap().remove(name);
     }
 
@@ -684,6 +736,27 @@ impl Transport {
     }
 
     pub fn dispatch_outbound(name: &str, raw: &[u8]) -> bool {
+        // Prefer the per-interface writer actor: it enqueues onto a bounded
+        // channel and returns immediately, so this call cannot block on a
+        // wedged socket. Falls back to the legacy synchronous handler only
+        // if no writer is registered (e.g. test fixtures that bypass
+        // `register_outbound_handler`).
+        if let Some(writer) = crate::interface_writer::get(name) {
+            let result = writer.enqueue(raw);
+            crate::log(
+                &format!(
+                    "[DISPATCH-DIAG] iface={} raw_len={} writer_enqueue={}",
+                    name,
+                    raw.len(),
+                    result
+                ),
+                crate::LOG_EXTREME,
+                false,
+                false,
+            );
+            return result;
+        }
+
         let handler = {
             let handlers = OUTBOUND_HANDLERS.lock().unwrap();
             handlers.get(name).cloned()
@@ -796,7 +869,6 @@ impl Transport {
 
     pub fn start(is_connected_to_shared_instance: bool, transport_enabled: bool) {
         let mut state = TRANSPORT.lock().unwrap();
-        state.jobs_running = true;
         state.is_connected_to_shared_instance = is_connected_to_shared_instance;
         state.transport_enabled = transport_enabled;
 
@@ -2026,10 +2098,6 @@ impl Transport {
     pub fn jobs() {
         let jobs_lock_started = std::time::Instant::now();
         let mut state = TRANSPORT.lock().unwrap();
-        if state.jobs_locked {
-            return;
-        }
-        state.jobs_running = true;
 
         // DIAG: trace jobs() execution
         let at_size = state.announce_table.len();
@@ -2711,8 +2779,6 @@ impl Transport {
             state.blackhole_last_checked = now();
         }
 
-        state.jobs_running = false;
-
         drop(state);
 
         // DIAG: trace outgoing
@@ -2772,24 +2838,20 @@ impl Transport {
         state.interfaces.sort_by(|a, b| b.bitrate.partial_cmp(&a.bitrate).unwrap_or(std::cmp::Ordering::Equal));
     }
     pub fn outbound(packet: &mut Packet) -> bool {
-        let outbound_lock_wait_started = Instant::now();
+        // Step 2 of the transport refactor (TRANSPORT_REFACTOR_PLAN.md):
+        //
+        // Previously this function spinwaited on `state.jobs_running`,
+        // sleeping 1 ms in a loop until `Transport::jobs()` finished its
+        // body. That serialization was redundant — the TRANSPORT mutex
+        // already serializes the two functions — and it could stall the
+        // sender for hundreds of milliseconds during a slow jobs sweep.
+        //
+        // After Step 1 (per-interface writer actor) `dispatch_outbound`
+        // is non-blocking, so even if jobs() and outbound() interleave
+        // there is no head-of-line blocking on socket I/O. Step 3 dropped
+        // the `jobs_running` / `jobs_locked` flags entirely — they were
+        // load-bearing only for the now-deleted busy-wait.
         let mut state = TRANSPORT.lock().unwrap();
-        let initial_wait_ms = outbound_lock_wait_started.elapsed().as_millis();
-        if initial_wait_ms > 250 {
-        }
-        let mut wait_loops: u64 = 0;
-        while state.jobs_running {
-            drop(state);
-            thread::sleep(Duration::from_millis(1));
-            state = TRANSPORT.lock().unwrap();
-            wait_loops += 1;
-            if wait_loops % 1000 == 0 {
-            }
-        }
-        if wait_loops > 0 {
-        }
-        state.jobs_locked = true;
-        let outbound_lock_held_started = Instant::now();
         let mut sent = false;
         let mut transmissions: Vec<(String, Vec<u8>)> = Vec::new();
         let outbound_time = now();
@@ -3053,10 +3115,6 @@ impl Transport {
             crate::LOG_VERBOSE
         };
         crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), tx_log_level, false, false);
-        let outbound_held_ms = outbound_lock_held_started.elapsed().as_millis();
-        if outbound_held_ms > 500 {
-        }
-        state.jobs_locked = false;
         drop(state);
 
         for (iface_name, raw) in transmissions {
@@ -5941,8 +5999,6 @@ mod tests {
         // Reset relevant state so prior tests don't influence this one.
         {
             let mut state = TRANSPORT.lock().unwrap();
-            state.jobs_running = false;
-            state.jobs_locked = false;
             state.published_destinations.clear();
             state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
         }
@@ -5996,11 +6052,8 @@ mod tests {
         {
             let mut state = TRANSPORT.lock().unwrap();
             state.path_table.remove(&dest_hash);
-            // If jobs() is still spinning we cannot join the thread — leak it
-            // and force-clear the spinwait flag so subsequent tests don't
-            // inherit our deadlock.
-            state.jobs_running = false;
-            state.jobs_locked = false;
+            // (Step 3 removed jobs_running / jobs_locked. Cleanup of those
+            // flags is no longer required.)
         }
         assert!(
             outcome.is_ok(),
@@ -6023,8 +6076,6 @@ mod tests {
 
         {
             let mut state = TRANSPORT.lock().unwrap();
-            state.jobs_running = false;
-            state.jobs_locked = false;
             state.published_destinations.clear();
             state.last_mgmt_announce = now() + 60.0;
         }
@@ -6092,12 +6143,98 @@ mod tests {
         {
             let mut state = TRANSPORT.lock().unwrap();
             state.path_table.remove(&dest_hash);
-            state.jobs_running = false;
-            state.jobs_locked = false;
         }
         assert!(jobs_outcome.is_ok(), "Transport::jobs() deadlocked");
         assert!(out_outcome.is_ok(), "concurrent Transport::outbound deadlocked");
         let _ = jobs_handle.join();
         let _ = out_handle.join();
+    }
+
+    /// Step-2 cross-interface no-stall regression.
+    ///
+    /// Registers two outbound handlers via `Transport::register_outbound_handler`
+    /// — one that blocks for several seconds (simulating a wedged TCP peer),
+    /// one that returns immediately. After Step 1's per-interface writer
+    /// actor + Step 2's removal of the `jobs_running` busy-wait,
+    /// `Transport::dispatch_outbound` must return within milliseconds for
+    /// **both** interfaces, even while the slow interface's writer thread
+    /// is mid-block.
+    ///
+    /// Before Step 1, dispatch_outbound called the handler synchronously
+    /// and would itself block for the full sleep duration. Before Step 2,
+    /// any concurrent `Transport::outbound` would additionally spinwait on
+    /// `jobs_running`. Both pathologies are now eliminated.
+    #[test]
+    fn dispatch_outbound_does_not_stall_across_interfaces() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+
+        let wedged_name = "test-wedged-iface";
+        let fast_name = "test-fast-iface";
+
+        // Slow handler: blocks for 2 seconds on every call.
+        let slow_handler: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> =
+            Arc::new(|_bytes: &[u8]| {
+                std::thread::sleep(Duration::from_secs(2));
+                true
+            });
+
+        // Fast handler: counts invocations.
+        let fast_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fast_count_w = Arc::clone(&fast_count);
+        let fast_handler: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> =
+            Arc::new(move |_bytes: &[u8]| {
+                fast_count_w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            });
+
+        Transport::register_outbound_handler(wedged_name, slow_handler);
+        Transport::register_outbound_handler(fast_name, fast_handler);
+
+        // Prime the wedged writer so its thread is actually mid-sleep.
+        assert!(Transport::dispatch_outbound(wedged_name, b"prime"));
+        // Give the writer a moment to pick up the frame and start sleeping.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Now: dispatch on the fast interface must return within ms.
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            assert!(Transport::dispatch_outbound(fast_name, b"hello"));
+        }
+        let fast_elapsed = t0.elapsed();
+        assert!(
+            fast_elapsed < Duration::from_millis(100),
+            "10x dispatch_outbound on fast interface took {:?} — expected <100 ms (cross-interface stall regression)",
+            fast_elapsed
+        );
+
+        // And dispatch on the WEDGED interface also returns within ms
+        // (just enqueues onto the bounded mpsc behind the wedge).
+        let t1 = Instant::now();
+        let _ = Transport::dispatch_outbound(wedged_name, b"queued");
+        let wedged_elapsed = t1.elapsed();
+        assert!(
+            wedged_elapsed < Duration::from_millis(50),
+            "dispatch_outbound on wedged interface took {:?} — expected <50 ms (writer-actor regression)",
+            wedged_elapsed
+        );
+
+        // Wait briefly for the fast handler to finish draining its queue.
+        for _ in 0..50 {
+            if fast_count.load(std::sync::atomic::Ordering::SeqCst) >= 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fast_count.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "fast handler should have processed all 10 frames"
+        );
+
+        // Cleanup. The wedged writer thread is left to finish its sleep
+        // and exit on the Shutdown message; this happens off the test
+        // critical path.
+        Transport::unregister_outbound_handler(wedged_name);
+        Transport::unregister_outbound_handler(fast_name);
     }
 }
