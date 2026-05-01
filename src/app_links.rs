@@ -808,16 +808,23 @@ impl AppLinks {
 			LOG_NOTICE, false, false,
 		);
 
-		// Stale-cached-path hedge.
+		// Path-refresh hedge — UNCONDITIONAL on first racer.
 		//
-		// If this is the first racer for the destination AND the path
-		// we're about to use was NOT confirmed by an inbound announce
-		// during this session (i.e. it was loaded from disk on cold
-		// start, or expired-then-reused without re-announcement),
-		// fire a parallel PATH_REQUEST. Three outcomes:
+		// Per the SUBSYSTEMS.md AppLinks contract: every link
+		// establishment must race the cached path against a freshly
+		// requested one. The cached path may have been valid when
+		// learned but become stale due to upstream NAT rebinding,
+		// intermediate-hop reverse-route GC after an iface flap,
+		// or a peer that has since moved interfaces. We have no
+		// in-band signal for those events, so we treat every
+		// establishment as a potential stale-path scenario and
+		// fire a parallel PATH_REQUEST whenever there's an existing
+		// path to race against.
+		//
+		// Three outcomes (unchanged from the previous hedge):
 		//
 		//   1. Cached route works → link establishes in ~RTT, racer
-		//      wins, the bonus PATH_REQUEST is harmless background
+		//      wins, the parallel PATH_REQUEST is harmless background
 		//      noise (deduped by `Transport::path_requests`).
 		//
 		//   2. Cached route is stale → upstream answers with a fresh
@@ -825,10 +832,9 @@ impl AppLinks {
 		//      handler spawns racer #2 (subject to MAX_RACERS_PER_DEST)
 		//      via the standard inbound path. First success wins.
 		//
-		//   3. Both routes are dead → cached racer hits its 18 s LR
-		//      timeout (no change vs. before this hedge), then the
-		//      "Last racer closed pre-ACTIVE" branch expires the path
-		//      and re-requests. Net: no regression, only upside.
+		//   3. Both routes are dead → cached racer hits its LR
+		//      timeout, then the "Last racer closed pre-ACTIVE" branch
+		//      expires the path and re-requests.
 		//
 		// We do this BEFORE `Link::new_outbound` so the request hits
 		// the wire concurrently with the handshake — we are NOT
@@ -836,20 +842,19 @@ impl AppLinks {
 		// readiness signals): the racing mechanism IS the readiness
 		// signal — whichever route's link establishes first wins.
 		//
-		// Without this hedge, a stale cached path on cold start
-		// burns the full 18 s establishment timeout before we even
-		// consider re-resolving — a hard violation of §1 (5 s send
-		// budget). Observed in retichat.log on 2026-04-30: cached
-		// path for rfed channel 2b8f4b46 was route-stale; the link
-		// racer wasted 18 s before triggering re-request, then
-		// another 22 s for upstream recursive discovery.
-		// NEVER REMOVE EVER.
-		if Self::racer_count(dest_hash) == 0
-			&& current_hops.is_some()
-			&& !Transport::is_path_verified_this_session(dest_hash)
-		{
+		// Cost: one extra PATH_REQUEST packet per first establishment
+		// attempt per destination. Path-request rate-limiting and
+		// dedup in Transport bound the wire impact. The benefit is
+		// that we recover from silent stale-path failures (the
+		// 2026-05-01 Android TCP-flap case where the cached route
+		// looked valid but the reverse-path on intermediate hops had
+		// been GC'd) in one round-trip instead of waiting for the
+		// link establishment to time out.
+		// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 and
+		// Reticulum-rust/SUBSYSTEMS.md §1 (AppLinks).
+		if Self::racer_count(dest_hash) == 0 && current_hops.is_some() {
 			log(
-				&format!("[APP_LINK] hedge → parallel request_path for unverified cached path to {}",
+				&format!("[APP_LINK] hedge → parallel request_path for cached path to {}",
 					hexrep(dest_hash, false)),
 				LOG_NOTICE, false, false,
 			);

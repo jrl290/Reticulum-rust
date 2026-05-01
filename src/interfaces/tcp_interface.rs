@@ -116,6 +116,11 @@ pub struct TcpClientInterface {
     /// /memories/repo/rfed-tcp-watchdog-failure.md).
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     force_read_exit: Arc<AtomicBool>,
+    /// Sentinel set when `start_heartbeat_loop` has spawned the
+    /// per-interface heartbeat thread. Prevents double-spawn when
+    /// `start_read_loop` is restarted (e.g. after detach/reattach).
+    /// Cleared when the heartbeat thread exits.
+    pub heartbeat_running: bool,
 }
 
 impl TcpClientInterface {
@@ -203,6 +208,7 @@ impl TcpClientInterface {
             socket: None,
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
+            heartbeat_running: false,
         };
 
         // Attempt initial connection.  If it fails, the interface is still
@@ -254,6 +260,7 @@ impl TcpClientInterface {
             socket: Some(socket),
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
+            heartbeat_running: false,
         }
     }
 
@@ -1046,6 +1053,96 @@ impl TcpClientInterface {
         });
     }
 
+    /// Application-layer heartbeat interval for non-KISS TCP backbones.
+    ///
+    /// Every `HEARTBEAT_INTERVAL` seconds while the interface is online,
+    /// non-detached, and not in KISS framing mode, a `synthesize_tunnel`
+    /// packet is emitted on the socket. This serves three purposes:
+    ///
+    ///   1. **NAT / stateful-firewall keepalive.** Outbound traffic on the
+    ///      schedule keeps the upstream NAT mapping warm, so the peer
+    ///      can route packets back to us without us first having to
+    ///      re-initiate.
+    ///   2. **Upstream tunnel-binding refresh.** `synthesize_tunnel`
+    ///      tells the upstream rnsd "this TCP socket carries our
+    ///      transport identity", refreshing any reverse-route state
+    ///      that may have been GC'd while we were idle.
+    ///   3. **Kernel TCP-keepalive trigger.** Any successful write
+    ///      against a half-open peer will, within `TCP_USER_TIMEOUT`
+    ///      (configured ~30 s in `apply_keepalive`), get an RST/EPIPE
+    ///      from the kernel — surfacing dead peers we'd otherwise
+    ///      only notice on the next application send.
+    ///
+    /// 60 s is short enough to detect Doze/suspend gaps quickly after
+    /// resume and long enough that the bandwidth cost (one signed
+    /// packet per minute) is negligible.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 and
+    /// SUBSYSTEMS.md §3 (Interfaces — liveness contract).
+    pub const HEARTBEAT_INTERVAL: u64 = 60;
+
+    /// Spawn a per-interface heartbeat thread. Idempotent: subsequent
+    /// calls for the same Arc are a no-op via the `heartbeat_running`
+    /// sentinel. Exits when the interface is detached.
+    pub fn start_heartbeat_loop(interface: Arc<Mutex<TcpClientInterface>>) {
+        {
+            let mut iface = interface.lock().unwrap();
+            if iface.heartbeat_running {
+                return;
+            }
+            // KISS-framed sockets carry no Reticulum control packets;
+            // the heartbeat would be ignored by the peer and would
+            // pollute the framing. Skip entirely.
+            if iface.kiss_framing {
+                return;
+            }
+            iface.heartbeat_running = true;
+        }
+
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(Self::HEARTBEAT_INTERVAL));
+
+                let (detached, online, kiss_framing, iname, irepr) = {
+                    let iface = match interface.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    (
+                        iface.detached,
+                        iface.base.online,
+                        iface.kiss_framing,
+                        iface.base.name.clone().unwrap_or_default(),
+                        iface.to_string(),
+                    )
+                };
+
+                if detached {
+                    break;
+                }
+                if kiss_framing {
+                    // Configuration changed under us — bail out.
+                    break;
+                }
+                if !online {
+                    // Interface is between connections; the
+                    // post-reconnect synthesize_tunnel in the read
+                    // loop covers the up-edge case. Skip this tick.
+                    continue;
+                }
+
+                crate::log(
+                    &format!("[HEARTBEAT] iface={} synthesize_tunnel", iname),
+                    crate::LOG_DEBUG, false, false,
+                );
+                Transport::synthesize_tunnel(&iname, &irepr);
+            }
+
+            if let Ok(mut iface) = interface.lock() {
+                iface.heartbeat_running = false;
+            }
+        });
+    }
+
     /// Detach interface
     pub fn detach(&mut self) {
         self.base.online = false;
@@ -1358,6 +1455,7 @@ impl TcpServerInterface {
                     }
 
                     TcpClientInterface::start_read_loop(Arc::clone(&spawned_interface));
+                    TcpClientInterface::start_heartbeat_loop(Arc::clone(&spawned_interface));
                     spawned.lock().unwrap().push(spawned_interface);
                 }
                 Err(_e) => {

@@ -1638,6 +1638,7 @@ impl Reticulum {
                                 }),
                             );
                             crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
+                            crate::interfaces::tcp_interface::TcpClientInterface::start_heartbeat_loop(Arc::clone(&interface));
                             // STRICT ORDERING (DESIGN_PRINCIPLES.md §3 + §4):
                             // `register_interface_stub_config` MUST run before
                             // `synthesize_tunnel`. The latter calls
