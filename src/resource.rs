@@ -868,24 +868,74 @@ impl Resource {
                 // because send() acquires the link lock (via encrypt), and the TCP reader
                 // thread acquires locks in the opposite order (link → resource), causing deadlock.
                 // Instead, we prepare packets inside the lock and send them after dropping it.
+                //
+                // NEVER REMOVE EVER — DESIGN_PRINCIPLES §4 (strict ordering).
+                //
+                // Pre-fetch link state OUTSIDE the resource lock.
+                //
+                // The link actor handles inbound packets that may need to
+                // acquire this resource's lock (via `Resource::receive_part`,
+                // `Resource::cancel`, etc.). If the watchdog held the resource
+                // lock and then made an mpsc round-trip into the link actor —
+                // e.g. via `Link::build_link_destination()` (which is
+                // `LinkMsg::BuildLinkDestination`) or `Link::snapshot()`
+                // (`LinkMsg::Snapshot`) — and the actor was simultaneously
+                // blocked trying to lock the resource, the result is a
+                // permanent deadlock. This is the same shape as the RFed
+                // 23:11:36 stall (see /memories/repo/rfed-stall-deadlock.md).
+                //
+                // Solution: clone the LinkHandle (cheap), then build the
+                // Destination + LinkSnapshot via mpsc to the actor BEFORE
+                // taking the resource lock. The resource lock body uses the
+                // pre-fetched values. `Link::status()` is a lock-free atomic
+                // and is safe to call anywhere.
+                let link = {
+                    let r = match resource_arc.lock() {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    if (r.status as u8) >= (ResourceStatus::Assembling as u8) || this_job_id != r.watchdog_job_id {
+                        break;
+                    }
+                    r.link.clone()
+                };
+
+                // Lock-free atomic — safe to call without any lock held.
+                let link_status = link.status();
+                if link_status == crate::link::STATE_CLOSED || link_status == crate::link::STATE_STALE {
+                    if let Ok(mut r) = resource_arc.lock() {
+                        r.cancel();
+                    }
+                    break;
+                }
+
+                // mpsc round-trips to the link actor; MUST NOT be done under
+                // the resource lock (see comment block above).
+                let pkt_dest = link.build_link_destination().ok();
+                let link_snapshot = link.snapshot().ok();
+                // Build a partial ResourceLinkContext from the snapshot so
+                // `update_eifr` does not need to issue its own snapshot mpsc
+                // while the resource lock is held. Only the fields actually
+                // read by `update_eifr` (rtt, establishment_cost) are
+                // populated from the snapshot; the rest take harmless defaults.
+                let eifr_ctx = link_snapshot.as_ref().map(|s| ResourceLinkContext {
+                    mtu: s.mtu.unwrap_or(0),
+                    rtt: s.rtt,
+                    traffic_timeout_factor: s.traffic_timeout_factor,
+                    establishment_cost: s.establishment_cost,
+                    last_resource_window: None,
+                    last_resource_eifr: None,
+                });
+
                 let (sleep_time, pending_packet) = {
                     let mut r = match resource_arc.lock() {
                         Ok(r) => r,
                         Err(_) => break,
                     };
 
-                    // Check termination conditions
+                    // Re-check termination conditions (state may have changed
+                    // while we were doing the unlocked mpsc round-trips above).
                     if (r.status as u8) >= (ResourceStatus::Assembling as u8) || this_job_id != r.watchdog_job_id {
-                        break;
-                    }
-
-                    // Check if the underlying link is still alive
-                    let link_dead = {
-                        let status = r.link.status();
-                        status == crate::link::STATE_CLOSED || status == crate::link::STATE_STALE
-                    };
-                    if link_dead {
-                        r.cancel();
                         break;
                     }
 
@@ -908,7 +958,7 @@ impl Resource {
                                     let adv = ResourceAdvertisement::new_from_resource(&r);
                                     let packed = adv.pack(0).unwrap_or_default();
                                     let packet = Packet::new(
-                                        r.packet_destination(),
+                                        pkt_dest.clone(),
                                         packed,
                                         crate::packet::DATA,
                                         RESOURCE_ADV,
@@ -932,9 +982,10 @@ impl Resource {
                             if !r.initiator {
                                 let retries_used = r.max_retries - r.retries_left;
                                 let extra_wait = retries_used as f64 * Resource::PER_RETRY_DELAY;
-                                // Watchdog runs on its own thread (not the actor), so passing
-                                // None is safe — snapshot() will not deadlock here.
-                                r.update_eifr(None);
+                                // Pass pre-fetched ctx (built from snapshot above)
+                                // so update_eifr does NOT issue an mpsc snapshot
+                                // call while we hold the resource lock.
+                                r.update_eifr(eifr_ctx.as_ref());
                                 let expected_tof_remaining = (r.outstanding_parts as f64 * r.sdu as f64 * 8.0) / r.eifr.unwrap_or(1.0);
 
                                 let st = if r.req_resp_rtt_rate != 0.0 {
@@ -956,7 +1007,24 @@ impl Resource {
                                         }
                                         r.retries_left -= 1;
                                         r.waiting_for_hmu = false;
-                                        let packet = r.prepare_request_next();
+                                        // Build the RESOURCE_REQ via the
+                                        // payload-only path so we do NOT
+                                        // round-trip through `packet_destination`
+                                        // (which calls Link::build_link_destination
+                                        // — an mpsc to the actor) while the
+                                        // resource lock is held.
+                                        let packet = r.prepare_request_next_data().map(|data| Packet::new(
+                                            pkt_dest.clone(),
+                                            data,
+                                            crate::packet::DATA,
+                                            RESOURCE_REQ,
+                                            BROADCAST,
+                                            crate::packet::HEADER_1,
+                                            None,
+                                            None,
+                                            false,
+                                            0,
+                                        ));
                                         (0.001, packet)
                                     } else {
                                         r.cancel();
@@ -989,7 +1057,7 @@ impl Resource {
                                     let mut expected_data = r.hash.clone();
                                     expected_data.extend_from_slice(&r.expected_proof);
                                     let mut expected_packet = Packet::new(
-                                        r.packet_destination(),
+                                        pkt_dest.clone(),
                                         expected_data,
                                         PROOF,
                                         RESOURCE_PRF,

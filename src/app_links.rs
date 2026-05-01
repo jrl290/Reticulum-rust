@@ -172,6 +172,13 @@ struct Racer {
 	id: u64,
 	handle: LinkHandle,
 	hops: u8,
+	/// Name of the interface the LR was emitted on at spawn time.
+	/// Used by the same-hops tie rule in `establish()` so we don't
+	/// burn racer slots on a duplicate path down the same upstream
+	/// (observed retichat.log 2026-04-30 22:45:32-22:45:52: both
+	/// racers went out London and we paid two LR-timeouts before a
+	/// re-announce gave us RMap, where the link came up in <1s).
+	interface: Option<String>,
 }
 
 static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::new()));
@@ -695,17 +702,24 @@ impl AppLinks {
 		// Decide eligibility:
 		//   1. Bail if we're already ACTIVE (winner exists).
 		//   2. Bail if the racer cap is full.
-		//   3. Bail if the current path is no better than every existing
-		//      racer's path. "Better" = strictly fewer hops. This stops the
-		//      common case where two consecutive announces arrive over the
-		//      same upstream interface with identical hop counts: the 2nd
-		//      announce would spawn a duplicate LR down the same path,
-		//      wasting our one extra racer slot. Reserve racer #2 for a
-		//      genuinely-better path.
+		//   3. Bail if the current path is worse than the best existing
+		//      racer's path. "Worse" = strictly more hops.
+		//   4. If the current path ties the best existing hop count, allow
+		//      the new racer ONLY IF it would go out a different upstream
+		//      interface than every existing racer at that hop count.
+		//      Rationale: the whole point of racing same-hops paths is
+		//      that one upstream may be momentarily wedged while another
+		//      is healthy (observed retichat.log 2026-04-30 22:45:32-52:
+		//      both racers went out London, both LR-timed-out at 18s,
+		//      and only after expire+re-announce did we get an RMap path
+		//      where the link came up in <1s). Racing two LRs down the
+		//      SAME interface just doubles wire load and shares fate —
+		//      a duplicate path is no better than the original one.
 		//
 		// First-racer (no existing racers) ALWAYS allowed regardless of
 		// hops — that's the cold-start trigger.
 		let current_hops = Transport::path_hops(dest_hash);
+		let current_iface = Transport::next_hop_interface(dest_hash);
 		{
 			let reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			if let Some(existing) = reg.links.get(dest_hash) {
@@ -723,21 +737,40 @@ impl AppLinks {
 				return;
 			}
 			if n > 0 {
-				// Need a strictly-better path to be worth a new racer.
+				// Allow the new racer if it strictly improves on the
+				// best existing path, OR ties the best path AND would
+				// go out a different upstream interface than every
+				// existing racer at that hop count (see eligibility
+				// comment above).
 				let best_existing = existing_racers
 					.and_then(|v| v.iter().map(|r| r.hops).min())
 					.unwrap_or(u8::MAX);
-				let improves = match current_hops {
-					Some(h) => h < best_existing,
-					None => false, // no path info → can't claim improvement
+				let ifaces_at_best: Vec<Option<String>> = existing_racers
+					.map(|v| v.iter()
+						.filter(|r| r.hops == best_existing)
+						.map(|r| r.interface.clone())
+						.collect())
+					.unwrap_or_default();
+				let new_iface_distinct = match &current_iface {
+					Some(iface) => !ifaces_at_best.iter().any(|e| e.as_deref() == Some(iface.as_str())),
+					// If we don't know which interface this racer would
+					// take, treat it as a same-path duplicate to be safe.
+					None => false,
 				};
-				if !improves {
+				let allow = match current_hops {
+					Some(h) if h < best_existing => true,
+					Some(h) if h == best_existing && new_iface_distinct => true,
+					_ => false,
+				};
+				if !allow {
 					log(
 						&format!(
-							"[APP_LINK] skip racer for {} — path hops {:?} not better than existing racer (best={})",
+							"[APP_LINK] skip racer for {} — path hops {:?} iface {:?} not better than existing racer (best={}, ifaces_at_best={:?})",
 							hexrep(dest_hash, false),
 							current_hops,
+							current_iface,
 							best_existing,
+							ifaces_at_best,
 						),
 						LOG_NOTICE, false, false,
 					);
@@ -1043,7 +1076,12 @@ impl AppLinks {
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			reg.racers.entry(dest_hash.to_vec())
 				.or_insert_with(Vec::new)
-				.push(Racer { id: my_racer_id, handle: link_handle.clone(), hops: my_hops });
+				.push(Racer {
+					id: my_racer_id,
+					handle: link_handle.clone(),
+					hops: my_hops,
+					interface: current_iface.clone(),
+				});
 		}
 
 		// Release the in-flight gate now — we've successfully claimed a
