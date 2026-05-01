@@ -1638,19 +1638,55 @@ impl Reticulum {
                                 }),
                             );
                             crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
-                            // For non-KISS TCP client interfaces, synthesize tunnel
-                            // so the remote transport daemon associates this connection
-                            // with our transport identity.
-                            // Only if already connected; the reconnect loop handles this
-                            // for deferred connections.
+                            // STRICT ORDERING (DESIGN_PRINCIPLES.md §3 + §4):
+                            // `register_interface_stub_config` MUST run before
+                            // `synthesize_tunnel`. The latter calls
+                            // `Transport::outbound`, which iterates
+                            // `state.interfaces` to broadcast the tunnel
+                            // synthesis packet. If the stub isn't there
+                            // yet, the broadcast loop finds zero matching
+                            // interfaces, returns sent=false, and THE
+                            // TUNNEL SYNTHESIS NEVER REACHES THE WIRE.
+                            //
+                            // The downstream consequence is catastrophic:
+                            // the upstream rnsd has no mapping from this
+                            // TCP connection back to our transport identity,
+                            // so it will not route PATH_RESPONSE packets
+                            // back to us. PATH_REQUESTs we send go
+                            // unanswered (or only "answered" when an
+                            // organic broadcast announce happens to pass
+                            // through carrying the path we asked for —
+                            // observed at 22 seconds in retichat.log on
+                            // 2026-04-30 for dest 2b8f4b46).
+                            //
+                            // NEVER REMOVE EVER. NEVER REORDER. The fix
+                            // for "synthesize_tunnel: sent=false" is to
+                            // ensure the stub is registered first, NOT to
+                            // sleep, NOT to retry, NOT to defer.
+                            crate::transport::Transport::register_interface_stub_config(stub_config.clone());
+                            // For non-KISS TCP client interfaces, synthesize a
+                            // tunnel so the remote transport daemon associates
+                            // this connection with our transport identity.
+                            //
+                            // Runs inline, before `Reticulum::new()` returns.
+                            // The race the previously-deferred call masked:
+                            // the iOS / Android host calls
+                            // `requestEssentialPaths()` immediately after
+                            // `Reticulum::new()` returns. If `synthesize_tunnel`
+                            // hasn't yet been written to the wire when those
+                            // PATH_REQUESTs go out, the upstream rnsd has no
+                            // mapping from this TCP connection back to our
+                            // transport identity, so it will not route the
+                            // PATH_RESPONSE / announce reply back to us. The
+                            // observable failure mode was minute-scale "no
+                            // path" gaps after every cold start.
+                            //
+                            // NEVER REMOVE EVER — this is the load-bearing
+                            // ordering guarantee for the cold-start launch
+                            // budget. If you re-introduce a sleep here, you
+                            // will re-introduce the cold-start stall.
                             if !kiss_framing && is_online {
-                                let iname = name.clone();
-                                let irepr = interface_repr.clone();
-                                std::thread::spawn(move || {
-                                    // Small delay to allow Transport to fully initialize
-                                    std::thread::sleep(std::time::Duration::from_millis(250));
-                                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
-                                });
+                                crate::transport::Transport::synthesize_tunnel(&name, &interface_repr);
                             }
                             self.system_interfaces.push(SystemInterface::TcpClient(interface));
                         }
@@ -1666,6 +1702,12 @@ impl Reticulum {
                             }
                         }
                     }
+                    // Defensive: ensures a stub exists even on the error
+                    // path above (where the inline registration in the Ok
+                    // arm did not run). On the success path this is a
+                    // no-op because `register_interface_stub_config`
+                    // checks `state.interfaces.iter().any(|i| i.name == config.name)`
+                    // and returns early when the stub is already present.
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
                 "PipeInterface" => {

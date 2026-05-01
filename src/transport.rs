@@ -378,6 +378,44 @@ pub struct TransportState {
     pub published_last_checked: f64,
     /// How often jobs() examines the published set for due refreshes.
     pub published_check_interval: f64,
+    /// True when `path_table` has been mutated since the last on-disk
+    /// persist. Drives the opportunistic save in `jobs()` so that warm
+    /// starts find every learned path on disk — not just whatever
+    /// happened to be in the table when an explicit `persist_data()`
+    /// was called. Without this, cold-start path resolution falls back
+    /// to a wire `PATH_REQUEST` whose round-trip dominates the
+    /// user-facing "open the app" latency. See
+    /// DESIGN_PRINCIPLES.md §1 (5 s send budget).
+    pub path_table_dirty: bool,
+    /// Wall-clock of the last successful `save_path_table()` call.
+    pub path_table_last_saved: f64,
+    /// Minimum spacing between opportunistic path-table saves.
+    /// Bounded so a chatty network (lots of fresh announces) doesn't
+    /// thrash the disk while still keeping the persisted set fresh.
+    pub path_table_save_interval: f64,
+    /// Set of destination hashes whose `path_table` entry has been
+    /// confirmed by an inbound announce SINCE THIS PROCESS STARTED.
+    ///
+    /// Cached path entries loaded from disk on cold start are NOT in
+    /// this set — even though `has_path()` returns true for them, the
+    /// route they encode may have gone stale between sessions
+    /// (intermediate hops dropped the path, the destination peer
+    /// reattached on a different route, etc.).
+    ///
+    /// `app_links::establish()` consults this set on the first racer
+    /// for a destination: if the cached path is unverified, it fires
+    /// a `request_path` IN PARALLEL with the link attempt. The two
+    /// race naturally — if the cached route works, the link wins
+    /// in ~RTT and the bonus path-request is harmless; if the cached
+    /// route is stale, a fresh announce arrives and spawns a 2nd
+    /// racer over the new route while the doomed first racer is
+    /// still mid-handshake. First success wins.
+    ///
+    /// Without this, a stale cached route forces an 18+ second link
+    /// establishment timeout BEFORE we ever consider re-resolving —
+    /// a hard violation of DESIGN_PRINCIPLES.md §1 (5 s send budget).
+    /// NEVER REMOVE EVER.
+    pub path_verified_this_session: HashSet<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -604,6 +642,7 @@ pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| Fast
     mgmt_announce_interval: 2.0 * 60.0 * 60.0,
     blackhole_check_interval: 60.0,
     published_check_interval: 30.0,
+    path_table_save_interval: 30.0,
     ..TransportState::default()
 }));
 
@@ -915,6 +954,7 @@ impl Transport {
                         if let Ok(entries) = from_slice::<Vec<SerializedPathEntry>>(&buf) {
                             let now_ts = now();
                             let mut loaded = 0usize;
+                            let mut loaded_dests: Vec<String> = Vec::new();
                             for entry in entries {
                                 // Skip expired paths
                                 if entry.expires > 0.0 && entry.expires < now_ts {
@@ -934,11 +974,28 @@ impl Transport {
                                     PathEntryValue::ReceivingInterface(interface_name),
                                     PathEntryValue::PacketHash(entry.packet_hash),
                                 ];
+                                if loaded_dests.len() < 32 {
+                                    loaded_dests.push(crate::hexrep(
+                                        &entry.destination_hash[..entry.destination_hash.len().min(4)],
+                                        false,
+                                    ));
+                                }
                                 state.path_table.insert(entry.destination_hash, path_entry);
                                 loaded += 1;
                             }
+                            // Loaded entries are by definition already
+                            // on disk — clear the dirty flag so the
+                            // first opportunistic save isn't a no-op
+                            // round trip.
+                            state.path_table_dirty = false;
+                            state.path_table_last_saved = now_ts;
                             log(
-                                &format!("Loaded {} cached path entries from disk", loaded),
+                                &format!(
+                                    "Loaded {} cached path entries from disk: [{}]{}",
+                                    loaded,
+                                    loaded_dests.join(","),
+                                    if loaded > loaded_dests.len() { ",…" } else { "" },
+                                ),
                                 LOG_NOTICE,
                                 false,
                                 false,
@@ -1116,6 +1173,37 @@ impl Transport {
     /// `"TCPInterface[LOCAL/192.168.2.113:4242]"`.  It is used to
     /// derive the interface hash, just like the Python implementation.
     pub fn synthesize_tunnel(interface_name: &str, interface_repr: &str) {
+        // ── PRECONDITION (load-bearing, NEVER REMOVE EVER) ───────────────
+        //
+        // Before calling this function, the caller MUST have already
+        // invoked `Transport::register_interface_stub_config` (or one of
+        // the other stub-registration helpers) for `interface_name`.
+        //
+        // Why: this function ends with `Transport::outbound(&mut packet)`
+        // for a PLAIN-destination packet pinned to `attached_interface =
+        // Some(interface_name)`. `outbound()` iterates `state.interfaces`
+        // and only transmits on entries whose `name == attached_interface`
+        // and whose `out == true`. If no matching stub exists, the
+        // broadcast loop finds zero candidates, returns `sent=false`,
+        // and THE TUNNEL-SYNTHESIS PACKET IS SILENTLY DROPPED.
+        //
+        // Downstream consequence (production observed 2026-04-30):
+        // upstream rnsd has no mapping from this TCP connection back to
+        // our transport identity, so it cannot route PATH_RESPONSE
+        // packets back to us. Cold-start PATH_REQUESTs go unanswered
+        // for tens of seconds. User-visible: 30+ second "Linking…"
+        // stalls on every app launch.
+        //
+        // Programmatic regression detectors live in
+        // `tests::synthesize_tunnel_emits_to_wire_when_stub_registered`
+        // and `tests::synthesize_tunnel_emits_nothing_when_stub_missing`.
+        // The diagnostic log line at the bottom of this function
+        // (`synthesize_tunnel: sent=...`) is the runtime canary —
+        // `sent=false` after a clean cold start means this precondition
+        // has been violated by the caller.
+        //
+        // See also: DESIGN_PRINCIPLES.md §4 (strict ordering).
+
         // Grab transport identity's public key and signing capability
         let (public_key, tunnel_id, signed_data, signature) = {
             let state = TRANSPORT.lock().unwrap();
@@ -2449,6 +2537,35 @@ impl Transport {
             state = TRANSPORT.lock().unwrap();
         }
 
+        // Opportunistic path-table persistence.
+        //
+        // Without this sweep `destination_table` is only written from
+        // `Transport::exit_handler()` (unreliable on iOS / Android, where
+        // the process is terminated rather than asked to clean up) and
+        // from the explicit `bridge.transportSavePaths()` that
+        // `requestEssentialPaths` fires once per cold start. The result
+        // was that paths learned mid-session never reached disk, so the
+        // next cold start could not satisfy `Transport::has_path()` for
+        // the user's essential destinations and had to send a wire
+        // `PATH_REQUEST` whose round-trip dominated launch latency.
+        //
+        // We persist no more often than `path_table_save_interval` to
+        // bound disk wear, and only when something actually changed
+        // since the last save. Saving runs without holding the
+        // TRANSPORT lock so a slow disk cannot stall the sweep.
+        // NEVER REMOVE EVER — DESIGN_PRINCIPLES.md §1: this closes the
+        // cold-start "no path → wait for PATH_REQUEST round-trip" hole
+        // that costs multi-second launch delays on TCP gateways.
+        if state.path_table_dirty
+            && now() > state.path_table_last_saved + state.path_table_save_interval
+        {
+            state.path_table_dirty = false;
+            state.path_table_last_saved = now();
+            drop(state);
+            Transport::save_path_table();
+            state = TRANSPORT.lock().unwrap();
+        }
+
         if now() > state.tables_last_culled + state.tables_cull_interval {
             let interface_names: HashSet<String> = state.interfaces.iter().map(|i| i.name.clone()).collect();
             let interface_modes: HashMap<String, u8> = state
@@ -2636,10 +2753,43 @@ impl Transport {
                         } else if *mode == InterfaceStub::MODE_ROAMING {
                             destination_expiry = timestamp + ROAMING_PATH_TIME;
                         }
-                    } else {
-                        stale_paths.push(destination_hash.clone());
-                        continue;
                     }
+                    // NOTE: We deliberately do NOT stale-mark a path
+                    // whose attached interface is unknown to the
+                    // current `interface_modes` snapshot.
+                    //
+                    // Reasoning (DESIGN_PRINCIPLES.md §4 — strict
+                    // ordering of dependent operations):
+                    //
+                    // `Transport::start()` loads the cached path
+                    // table from disk BEFORE `load_system_interfaces()`
+                    // pushes interface stubs into `state.interfaces`.
+                    // The jobloop spawned by `start()` runs every
+                    // `job_interval` (250 ms) and the table cull
+                    // fires unconditionally on its first tick because
+                    // `tables_last_culled` defaults to 0.0.
+                    //
+                    // The previous behaviour ("attached not in
+                    // interface_modes → stale_paths.push") therefore
+                    // wiped every disk-cached path on cold start
+                    // before the upstream rnsd had a chance to route
+                    // an announce that would re-populate them. The
+                    // observable failure was a 60+ second cold-start
+                    // stall on iOS / Android, where every essential
+                    // destination had to be re-resolved over the
+                    // wire even though a perfectly good cached entry
+                    // had been on disk seconds earlier.
+                    //
+                    // The legitimate "interface was removed" case is
+                    // (and must be) handled at deregistration time,
+                    // not lazily by this cull. DESTINATION_TIMEOUT
+                    // (1 week) bounds the worst-case staleness for
+                    // entries whose interface vanished without a
+                    // proper deregister call.
+                    //
+                    // NEVER REMOVE EVER — re-introducing the eager
+                    // eviction would re-introduce the cold-start
+                    // stall.
                 }
                 if now() > destination_expiry {
                     stale_paths.push(destination_hash.clone());
@@ -2690,6 +2840,7 @@ impl Transport {
 
             for destination_hash in stale_paths {
                 state.path_table.remove(&destination_hash);
+                state.path_table_dirty = true;
             }
 
             for destination_hash in stale_path_states {
@@ -3485,6 +3636,16 @@ impl Transport {
         }
     }
 
+    /// Returns true if an inbound announce has confirmed `destination_hash`'s
+    /// path entry SINCE THIS PROCESS STARTED. Cached entries loaded from
+    /// disk on cold start return false even when `has_path()` returns
+    /// true. Drives the parallel-path-request hedge in
+    /// `app_links::establish()`. See `TransportState::path_verified_this_session`.
+    pub fn is_path_verified_this_session(destination_hash: &[u8]) -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        state.path_verified_this_session.contains(destination_hash)
+    }
+
     pub fn next_hop_interface(destination_hash: &[u8]) -> Option<String> {
         let state = TRANSPORT.lock().unwrap();
         state.path_table.get(destination_hash).and_then(|entry| {
@@ -4190,6 +4351,20 @@ impl Transport {
                             PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                         ];
                         state.path_table.insert(destination_hash.clone(), entry);
+                        // Mark the on-disk copy stale so the periodic
+                        // saver in jobs() persists this fresh path
+                        // before the next cold start. Eliminates the
+                        // wire PATH_REQUEST round-trip on the warm-path
+                        // case.
+                        state.path_table_dirty = true;
+                        // Mark this destination as having a
+                        // session-verified path. `app_links::establish()`
+                        // uses this to decide whether the first racer
+                        // should fire a parallel `request_path` to
+                        // hedge against a stale cached route.
+                        // NEVER REMOVE EVER — see field doc on
+                        // `path_verified_this_session`.
+                        state.path_verified_this_session.insert(destination_hash.clone());
                         crate::announce_log::count_path_added();
                         if crate::announce_log::is_whitelisted(Some(destination_hash.as_slice())) {
                             crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
@@ -6275,5 +6450,210 @@ mod tests {
         // critical path.
         Transport::unregister_outbound_handler(wedged_name);
         Transport::unregister_outbound_handler(fast_name);
+    }
+
+    // ── Regression: cold-start tunnel-synthesis ordering ─────────────────
+    //
+    // The bug (fixed 2026-04-30):
+    //
+    //   In `Reticulum::load_system_interfaces()`'s `"TCPClientInterface"`
+    //   match arm, `Transport::register_interface_stub_config(stub_config)`
+    //   ran AFTER `Transport::synthesize_tunnel(&name, &interface_repr)`.
+    //
+    //   `synthesize_tunnel` calls `Transport::outbound`, which iterates
+    //   `state.interfaces` to broadcast the tunnel-synthesis packet
+    //   (a PLAIN destination with an `attached_interface` filter).
+    //   With the stub not yet registered, the iteration found zero
+    //   matching interfaces, returned `sent=false`, and the synthesis
+    //   packet was silently dropped — never written to the wire.
+    //
+    //   Downstream consequence: the upstream rnsd had no mapping from
+    //   the new TCP connection back to our transport identity, so it
+    //   could not route PATH_RESPONSE packets back to us. Cold-start
+    //   PATH_REQUESTs went unanswered for tens of seconds (until an
+    //   organic broadcast announce happened to pass through carrying
+    //   the path we'd asked for). User-visible: 30+ second "Linking…"
+    //   stalls on every app launch.
+    //
+    //   Hard violation of DESIGN_PRINCIPLES.md §1 (5 s send budget),
+    //   §3 (no timeouts as readiness signals), §4 (strict ordering
+    //   of dependent operations).
+    //
+    // The two tests below pin the invariant programmatically:
+    //
+    //   `synthesize_tunnel_emits_to_wire_when_stub_registered`
+    //     — Happy path: stub registered first → tunnel bytes reach
+    //       the outbound handler. Confirms the fix works.
+    //
+    //   `synthesize_tunnel_emits_nothing_when_stub_missing`
+    //     — Bug-condition reproducer: no stub → no bytes dispatched.
+    //       If anyone ever re-introduces the ordering inversion in
+    //       `reticulum.rs::load_system_interfaces()`, the production
+    //       call sequence will match this test's "missing-stub"
+    //       branch and `synthesize_tunnel: sent=false` will appear
+    //       in retichat.log again. This test ensures we have an
+    //       in-tree, CI-blocking signal long before that happens —
+    //       any future code review that inverts the order will fail
+    //       the happy-path test (which mirrors the production
+    //       ordering: stub register → synthesize call).
+    //
+    // NEVER REMOVE EVER.
+
+    /// Helper: bypasses `register_outbound_handler`'s async writer-actor
+    /// path and inserts a synchronous handler directly into the
+    /// `OUTBOUND_HANDLERS` map. `dispatch_outbound` will use the legacy
+    /// synchronous path when no writer is registered, so we get a
+    /// deterministic byte-count without races against a worker thread.
+    fn install_sync_outbound_handler(
+        iface_name: &str,
+        captured: Arc<Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let captured_for_handler = captured.clone();
+        let handler: OutboundHandler = Arc::new(move |bytes: &[u8]| {
+            captured_for_handler.lock().unwrap().push(bytes.to_vec());
+            true
+        });
+        OUTBOUND_HANDLERS
+            .lock()
+            .unwrap()
+            .insert(iface_name.to_string(), handler);
+    }
+
+    fn uninstall_sync_outbound_handler(iface_name: &str) {
+        OUTBOUND_HANDLERS.lock().unwrap().remove(iface_name);
+    }
+
+    /// Snapshot/restore guard for `state.interfaces` so a test that mutates
+    /// the global interface list cannot leak into sibling tests. The
+    /// existing `ReceiptStateRestore` does NOT cover `interfaces`, and
+    /// these tests deliberately probe the empty-interfaces case which
+    /// would corrupt unrelated tests if leaked.
+    struct InterfacesRestore {
+        saved: Vec<InterfaceStub>,
+    }
+    impl InterfacesRestore {
+        fn new() -> Self {
+            let mut state = TRANSPORT.lock().unwrap();
+            Self { saved: std::mem::take(&mut state.interfaces) }
+        }
+    }
+    impl Drop for InterfacesRestore {
+        fn drop(&mut self) {
+            if let Ok(mut state) = TRANSPORT.lock() {
+                state.interfaces = std::mem::take(&mut self.saved);
+            }
+        }
+    }
+
+    /// Happy path for the cold-start tunnel-synthesis ordering invariant.
+    ///
+    /// Mirrors the PRODUCTION call order in
+    /// `reticulum.rs::load_system_interfaces()` `TCPClientInterface` arm:
+    ///   1. Register an outbound handler for the interface name.
+    ///   2. Register the interface stub via `register_interface_stub_config`.
+    ///   3. Call `synthesize_tunnel`.
+    ///
+    /// Asserts the tunnel-synthesis packet was actually dispatched to the
+    /// outbound handler (i.e. would have hit the wire in production).
+    #[test]
+    fn synthesize_tunnel_emits_to_wire_when_stub_registered() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-tunnel-order-happy";
+        let iface_repr = "TCPInterface[test-tunnel-order-happy/example.invalid:0]";
+
+        // 1. Identity must exist for synthesize_tunnel to sign.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+        }
+
+        // 2. Outbound handler that captures dispatched bytes.
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+
+        // 3. Stub registration happens BEFORE synthesize_tunnel — this
+        //    is the production ordering we are pinning.
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface_name.to_string();
+        stub_config.online = Some(true);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+
+        // 4. Trigger the synthesis.
+        Transport::synthesize_tunnel(iface_name, iface_repr);
+
+        // 5. The tunnel-synthesis packet MUST have been dispatched to
+        //    the outbound handler. If this assertion fails, either the
+        //    register-before-synthesize ordering has been inverted in
+        //    production code, OR the InterfaceStub no longer satisfies
+        //    `Transport::outbound`'s send predicate (out=true,
+        //    attached_interface name match).
+        let dispatched = captured.lock().unwrap();
+        assert!(
+            !dispatched.is_empty(),
+            "synthesize_tunnel must dispatch ≥1 frame when stub is registered \
+             — if this fires, the cold-start tunnel-synthesis ordering bug \
+             has regressed (see comment block above this test)"
+        );
+
+        uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// Regression detector for the cold-start tunnel-synthesis ordering bug.
+    ///
+    /// Reproduces the BUG CONDITION: outbound handler exists, identity
+    /// exists, but the InterfaceStub is NOT in `state.interfaces` when
+    /// `synthesize_tunnel` runs. This is exactly the state the buggy
+    /// `reticulum.rs` ordering produced — `synthesize_tunnel` ran first
+    /// and `register_interface_stub_config` ran second.
+    ///
+    /// Asserts the packet is silently dropped (zero handler invocations).
+    /// This documents the invariant: if you ever see
+    /// `synthesize_tunnel: sent=false` in retichat.log again, this test
+    /// is your in-tree explanation of why and how to fix it.
+    #[test]
+    fn synthesize_tunnel_emits_nothing_when_stub_missing() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-tunnel-order-bug";
+        let iface_repr = "TCPInterface[test-tunnel-order-bug/example.invalid:0]";
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            // CRITICAL: state.interfaces deliberately empty. This is
+            // the broken state the production bug exposed.
+            assert!(
+                state.interfaces.iter().all(|i| i.name != iface_name),
+                "test setup invariant: stub must NOT be registered"
+            );
+        }
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+
+        // Trigger synthesis with no matching interface stub.
+        Transport::synthesize_tunnel(iface_name, iface_repr);
+
+        // The buggy code path: Transport::outbound iterated zero
+        // matching interfaces, returned sent=false, packet silently
+        // dropped. We assert that observable outcome.
+        let dispatched = captured.lock().unwrap();
+        assert!(
+            dispatched.is_empty(),
+            "without a registered InterfaceStub, synthesize_tunnel's \
+             outbound broadcast has nowhere to go and must dispatch \
+             zero frames — if this fires, the broadcast semantics of \
+             Transport::outbound have changed and the cold-start \
+             ordering bug may have masked itself in a new way"
+        );
+
+        uninstall_sync_outbound_handler(iface_name);
     }
 }

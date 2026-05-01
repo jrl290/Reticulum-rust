@@ -775,6 +775,54 @@ impl AppLinks {
 			LOG_NOTICE, false, false,
 		);
 
+		// Stale-cached-path hedge.
+		//
+		// If this is the first racer for the destination AND the path
+		// we're about to use was NOT confirmed by an inbound announce
+		// during this session (i.e. it was loaded from disk on cold
+		// start, or expired-then-reused without re-announcement),
+		// fire a parallel PATH_REQUEST. Three outcomes:
+		//
+		//   1. Cached route works → link establishes in ~RTT, racer
+		//      wins, the bonus PATH_REQUEST is harmless background
+		//      noise (deduped by `Transport::path_requests`).
+		//
+		//   2. Cached route is stale → upstream answers with a fresh
+		//      announce on a better/working route. The announce
+		//      handler spawns racer #2 (subject to MAX_RACERS_PER_DEST)
+		//      via the standard inbound path. First success wins.
+		//
+		//   3. Both routes are dead → cached racer hits its 18 s LR
+		//      timeout (no change vs. before this hedge), then the
+		//      "Last racer closed pre-ACTIVE" branch expires the path
+		//      and re-requests. Net: no regression, only upside.
+		//
+		// We do this BEFORE `Link::new_outbound` so the request hits
+		// the wire concurrently with the handshake — we are NOT
+		// waiting for it. DESIGN_PRINCIPLES.md §3 (no timeouts as
+		// readiness signals): the racing mechanism IS the readiness
+		// signal — whichever route's link establishes first wins.
+		//
+		// Without this hedge, a stale cached path on cold start
+		// burns the full 18 s establishment timeout before we even
+		// consider re-resolving — a hard violation of §1 (5 s send
+		// budget). Observed in retichat.log on 2026-04-30: cached
+		// path for rfed channel 2b8f4b46 was route-stale; the link
+		// racer wasted 18 s before triggering re-request, then
+		// another 22 s for upstream recursive discovery.
+		// NEVER REMOVE EVER.
+		if Self::racer_count(dest_hash) == 0
+			&& current_hops.is_some()
+			&& !Transport::is_path_verified_this_session(dest_hash)
+		{
+			log(
+				&format!("[APP_LINK] hedge → parallel request_path for unverified cached path to {}",
+					hexrep(dest_hash, false)),
+				LOG_NOTICE, false, false,
+			);
+			Transport::request_path(dest_hash, None, None, None, None);
+		}
+
 		let aspect_refs: Vec<&str> = spec.aspects.iter().map(|s| s.as_str()).collect();
 		let destination = match Destination::from_destination_hash(dest_hash, &spec.app_name, &aspect_refs) {
 			Ok(d) => d,
