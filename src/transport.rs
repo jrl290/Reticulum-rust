@@ -192,6 +192,17 @@ pub struct InterfaceStub {
     pub tunnel_id: Option<Vec<u8>>,
     pub parent_is_local_shared: bool,
     pub is_connected_to_shared_instance: bool,
+    /// Wall-clock seconds of the most recent successful inbound packet
+    /// processed on this interface. Updated by `Transport::inbound`.
+    /// Consumed by the §1 watchdog in `Transport::outbound` to detect
+    /// "outbound succeeds but no inbound for too long" half-open peers.
+    /// Zero means no inbound has ever been recorded.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    pub last_inbound_at: f64,
+    /// Wall-clock seconds of the most recent §1 "no inbound for Ns"
+    /// warning emitted for this interface. Used to throttle the warning
+    /// to once per minute so a sustained wedge doesn't fill the log.
+    pub last_inbound_warn_at: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -3218,6 +3229,87 @@ impl Transport {
             }
         }
 
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Fix 4: refuse to claim sent=true on a transmission whose target
+        // interface is currently offline. Without this, callers (e.g.
+        // lxmf.prop sync, link establishment) record a successful send
+        // and burn the §1 budget waiting for a reply that will never
+        // arrive — exactly the wedge analysed in
+        // /memories/repo/rfed-tcp-watchdog-failure.md (12 h of "sent=true"
+        // on a dead interface). Filter and re-derive `sent` BEFORE the
+        // receipt is created so we don't queue receipts for dead sends.
+        //
+        // Fix 5: while we're walking interfaces, also detect "outbound
+        // succeeds but no inbound for >30 s" — a half-open peer signal.
+        // Emit a [Error] once per minute per interface so the wedge is
+        // visible in the log instead of silent.
+        let now_secs = now();
+        let mut filtered: Vec<(String, Vec<u8>)> = Vec::with_capacity(transmissions.len());
+        let mut offline_drops: Vec<String> = Vec::new();
+        let mut silent_warnings: Vec<(String, f64)> = Vec::new();
+        for (iface_name, raw) in transmissions.into_iter() {
+            let iface_online = state
+                .interfaces
+                .iter()
+                .find(|i| i.name == iface_name)
+                .map(|i| i.online)
+                .or_else(|| {
+                    state
+                        .local_client_interfaces
+                        .iter()
+                        .find(|i| i.name == iface_name)
+                        .map(|i| i.online)
+                })
+                .unwrap_or(false);
+            if !iface_online {
+                offline_drops.push(iface_name);
+                continue;
+            }
+
+            // Half-open detection: only meaningful once we've seen at
+            // least one inbound on this iface (skip cold-start window).
+            if let Some(iface) = state
+                .interfaces
+                .iter_mut()
+                .find(|i| i.name == iface_name)
+            {
+                if iface.last_inbound_at > 0.0 {
+                    let silent_for = now_secs - iface.last_inbound_at;
+                    if silent_for > 30.0 && now_secs - iface.last_inbound_warn_at > 60.0 {
+                        iface.last_inbound_warn_at = now_secs;
+                        silent_warnings.push((iface_name.clone(), silent_for));
+                    }
+                }
+            }
+
+            filtered.push((iface_name, raw));
+        }
+        sent = !filtered.is_empty();
+        let transmissions = filtered;
+
+        for name in &offline_drops {
+            crate::log(
+                &format!(
+                    "[OUTBOUND] dropping send: interface {} is offline (sent=false)",
+                    name
+                ),
+                crate::LOG_WARNING,
+                false,
+                false,
+            );
+        }
+        for (name, silent_for) in &silent_warnings {
+            crate::log(
+                &format!(
+                    "[OUTBOUND] §1 WARNING: interface {} has not received inbound data for {:.0}s — possible half-open connection",
+                    name, silent_for
+                ),
+                crate::LOG_ERROR,
+                false,
+                false,
+            );
+        }
+
         if sent && packet.should_generate_receipt() && packet.receipt.is_none() {
             let timeout = if packet.destination_type == Some(crate::destination::DestinationType::Link) {
                 let destination = packet.destination.clone().unwrap_or_default();
@@ -3265,6 +3357,7 @@ impl Transport {
         } else {
             crate::LOG_VERBOSE
         };
+
         crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), tx_log_level, false, false);
         drop(state);
 
@@ -3881,6 +3974,23 @@ impl Transport {
         if !packet.unpack() {
             crate::log(&format!("inbound unpack FAILED len={} raw_ptype={}", packet.raw.len(), raw_ptype_str), crate::LOG_NOTICE, false, false);
             return false;
+        }
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Record the wall-clock of this inbound packet against its
+        // receiving interface so `Transport::outbound`'s §1 watchdog
+        // can detect "outbound dispatched but no inbound for >30 s"
+        // half-open peers (the wedge analysed in
+        // /memories/repo/rfed-tcp-watchdog-failure.md).
+        if let Some(ref recv_iface) = packet.receiving_interface {
+            let now_secs = now();
+            if let Ok(mut state) = TRANSPORT.lock() {
+                if let Some(iface) = state.interfaces.iter_mut().find(|i| &i.name == recv_iface) {
+                    iface.last_inbound_at = now_secs;
+                }
+                if let Some(iface) = state.local_client_interfaces.iter_mut().find(|i| &i.name == recv_iface) {
+                    iface.last_inbound_at = now_secs;
+                }
+            }
         }
         // Early-drop: when drop_announces is enabled, silently discard
         // announce packets before any logging or processing. Two exceptions

@@ -2,6 +2,7 @@ use super::interface::{Interface, InterfaceMode};
 use crate::transport::Transport;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -106,6 +107,15 @@ pub struct TcpClientInterface {
     pub connect_timeout: u64,
     socket: Option<TcpStream>,
     writing: bool,
+    /// Shared kill-switch read by the read loop in its WouldBlock branch.
+    /// `process_outgoing` sets this to `true` when a write fails so the
+    /// read loop wakes within one read-timeout interval and proceeds to
+    /// reconnect, instead of relying on `shutdown(Both)` propagating
+    /// to the cloned read fd (which is observed to NOT happen reliably
+    /// on long-running half-open connections — see
+    /// /memories/repo/rfed-tcp-watchdog-failure.md).
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    force_read_exit: Arc<AtomicBool>,
 }
 
 impl TcpClientInterface {
@@ -192,6 +202,7 @@ impl TcpClientInterface {
             connect_timeout,
             socket: None,
             writing: false,
+            force_read_exit: Arc::new(AtomicBool::new(false)),
         };
 
         // Attempt initial connection.  If it fails, the interface is still
@@ -219,6 +230,14 @@ impl TcpClientInterface {
         // Set TCP_NODELAY
         let _ = socket.set_nodelay(true);
 
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Server-accepted client connections must enable SO_KEEPALIVE the
+        // same way initiator-side `connect()` does. Without this, a NAT
+        // box / peer host that goes silent leaves the cloned read fd
+        // blocked forever — the wedge analysed in
+        // /memories/repo/rfed-tcp-watchdog-failure.md.
+        Self::apply_keepalive(&socket, false);
+
         TcpClientInterface {
             base,
             target_ip: peer_addr.as_ref().map(|a| a.ip().to_string()).unwrap_or_default(),
@@ -234,6 +253,7 @@ impl TcpClientInterface {
             connect_timeout: Self::INITIAL_CONNECT_TIMEOUT,
             socket: Some(socket),
             writing: false,
+            force_read_exit: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -297,65 +317,78 @@ impl TcpClientInterface {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn set_socket_options_linux(&self, stream: &TcpStream) -> Result<(), String> {
-        use std::os::unix::io::AsRawFd;
-        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
-        
-        let optlen = std::mem::size_of::<i32>();
-        unsafe {
-            let fd = stream.as_raw_fd();
-            let keepalive: i32 = 1;
-            
-            if !self.i2p_tunneled {
-                let user_timeout = (Self::TCP_USER_TIMEOUT * 1000) as i32;
-                let keepidle = Self::TCP_PROBE_AFTER as i32;
-                let keepintvl = Self::TCP_PROBE_INTERVAL as i32;
-                let keepcnt = Self::TCP_PROBES as i32;
-                
-                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
-            } else {
-                let user_timeout = (Self::I2P_USER_TIMEOUT * 1000) as i32;
-                let keepidle = Self::I2P_PROBE_AFTER as i32;
-                let keepintvl = Self::I2P_PROBE_INTERVAL as i32;
-                let keepcnt = Self::I2P_PROBES as i32;
-                
-                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
-            }
-        }
-        
+        Self::apply_keepalive(stream, self.i2p_tunneled);
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     fn set_socket_options_macos(&self, stream: &TcpStream) -> Result<(), String> {
+        Self::apply_keepalive(stream, self.i2p_tunneled);
+        Ok(())
+    }
+
+    /// Enable SO_KEEPALIVE plus aggressive probe timing on a TcpStream.
+    /// Called by both initiator (`connect`) and server-accepted
+    /// (`from_socket`) construction paths so EVERY TCP socket the process
+    /// owns will be RST'd by the kernel within ~30 s when the peer goes
+    /// silent (rather than blocking `read()` forever).
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 and
+    /// /memories/repo/rfed-tcp-watchdog-failure.md.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
         use std::os::unix::io::AsRawFd;
-        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
-        
-        const TCP_KEEPALIVE: i32 = 0x10;
-        
+        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
+
+        let optlen = std::mem::size_of::<i32>();
         unsafe {
             let fd = stream.as_raw_fd();
             let keepalive: i32 = 1;
-            
+
+            let (user_timeout_secs, keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
+                (Self::TCP_USER_TIMEOUT, Self::TCP_PROBE_AFTER, Self::TCP_PROBE_INTERVAL, Self::TCP_PROBES)
+            } else {
+                (Self::I2P_USER_TIMEOUT, Self::I2P_PROBE_AFTER, Self::I2P_PROBE_INTERVAL, Self::I2P_PROBES)
+            };
+
+            let user_timeout = (user_timeout_secs * 1000) as i32;
+            let keepidle = keepidle as i32;
+            let keepintvl = keepintvl as i32;
+            let keepcnt = keepcnt as i32;
+
+            setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
+        use std::os::unix::io::AsRawFd;
+        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
+
+        const TCP_KEEPALIVE: i32 = 0x10;
+
+        unsafe {
+            let fd = stream.as_raw_fd();
+            let keepalive: i32 = 1;
+
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-            
-            let keepidle = if !self.i2p_tunneled {
+
+            let keepidle = if !i2p_tunneled {
                 Self::TCP_PROBE_AFTER as i32
             } else {
                 Self::I2P_PROBE_AFTER as i32
             };
-            
+
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
         }
-        
-        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) {
+        // No platform-specific keepalive support compiled in.
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
@@ -485,6 +518,18 @@ impl TcpClientInterface {
                     // existing reconnect path (RECONNECT_WAIT=5s, matching Python)
                     // wakes up and re-establishes the connection.
                     let _ = socket.shutdown(std::net::Shutdown::Both);
+                    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                    // Belt-and-braces: shutdown(Both) on the writer-side fd has
+                    // been observed to NOT wake the cloned read-side fd on
+                    // long-running half-open connections (the wedge analysed
+                    // in /memories/repo/rfed-tcp-watchdog-failure.md ran for
+                    // 12+ hours after a write-failure with the read clone
+                    // still blocked). Set an explicit kill-switch the read
+                    // loop polls in its WouldBlock branch so a write failure
+                    // forces the read loop to exit within one read-timeout
+                    // interval (≤ READ_WAKE_INTERVAL seconds) and proceed
+                    // straight to reconnect.
+                    self.force_read_exit.store(true, Ordering::Relaxed);
                     self.socket = None;
                     self.writing = false;
                     return Err(format!("Failed to send data: {}", e));
@@ -636,6 +681,12 @@ impl TcpClientInterface {
     /// (Lower values can cause false reconnects on quiet networks.)
     const READ_WATCHDOG_TIMEOUT: u64 = 180;
 
+    /// How often the read loop wakes from `read()` to poll the
+    /// `force_read_exit` kill-switch and re-evaluate the watchdog.
+    /// Bounded by §1 (5 s send budget): a write-failure must be able to
+    /// trigger reconnect in well under 5 s of further blocking.
+    const READ_WAKE_INTERVAL: u64 = 2;
+
     pub fn start_read_loop(interface: Arc<Mutex<TcpClientInterface>>) {
         // Guard: use `reconnecting` as a "loop is live" sentinel.
         // If another loop is already running for this exact Arc (e.g. a duplicate
@@ -660,7 +711,7 @@ impl TcpClientInterface {
             // reading again in the same thread.
             'running: loop {
                 // ── Clone current socket and read static config ───────────────
-                let socket_result: Option<(TcpStream, Option<String>, bool, usize, bool)> = {
+                let socket_result: Option<(TcpStream, Option<String>, bool, usize, bool, Arc<AtomicBool>)> = {
                     let iface = interface.lock().unwrap();
                     if let Some(socket_ref) = iface.socket.as_ref() {
                         if let Ok(cloned_socket) = socket_ref.try_clone() {
@@ -668,12 +719,17 @@ impl TcpClientInterface {
                                 use std::os::unix::io::AsRawFd;
                                 crate::log(&format!("TCP socket clone: original_fd={} clone_fd={}", socket_ref.as_raw_fd(), cloned_socket.as_raw_fd()), crate::LOG_NOTICE, false, false);
                             }
+                            // Clear any stale kill-switch from a previous
+                            // wedged connection — the new socket is healthy
+                            // until proven otherwise.
+                            iface.force_read_exit.store(false, Ordering::Relaxed);
                             Some((
                                 cloned_socket,
                                 iface.base.name.clone(),
                                 iface.kiss_framing,
                                 iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
                                 iface.initiator,
+                                Arc::clone(&iface.force_read_exit),
                             ))
                         } else {
                             crate::log("TCP read loop: socket clone failed", crate::LOG_WARNING, false, false);
@@ -696,7 +752,7 @@ impl TcpClientInterface {
                     );
                 } else {
 
-                let (raw_socket, interface_name, kiss_framing, hw_mtu, is_initiator) = socket_result.unwrap();
+                let (raw_socket, interface_name, kiss_framing, hw_mtu, is_initiator, force_read_exit) = socket_result.unwrap();
                 // Wrap in ManuallyDrop so we control when close() is called.
                 // If the OS reclaims our fd (e.g., iOS background), Rust's
                 // automatic Drop would call close() on a potentially-reused fd
@@ -706,10 +762,15 @@ impl TcpClientInterface {
 
                 crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
 
-                // Set a read timeout so we can detect zombie / half-open
-                // connections that Android's TCP keepalive fails to catch.
-                let watchdog_duration = Duration::from_secs(Self::READ_WATCHDOG_TIMEOUT);
-                if let Err(e) = socket.set_read_timeout(Some(watchdog_duration)) {
+                // Wake from blocking read every READ_WAKE_INTERVAL seconds so
+                // we can poll the `force_read_exit` kill-switch (set by
+                // `process_outgoing` when a write fails) and so the
+                // READ_WATCHDOG_TIMEOUT no-data deadline is checked at fine
+                // granularity. The kernel-level SO_KEEPALIVE / TCP_USER_TIMEOUT
+                // is the primary defence against half-open peers; this poll
+                // interval is a belt-and-braces backstop.
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                if let Err(e) = socket.set_read_timeout(Some(Duration::from_secs(Self::READ_WAKE_INTERVAL))) {
                     crate::log(&format!("TCP read loop: set_read_timeout failed: {}", e), crate::LOG_WARNING, false, false);
                 }
 
@@ -838,6 +899,20 @@ impl TcpClientInterface {
                             }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                            // Belt-and-braces wake from process_outgoing's
+                            // write-failure path. shutdown(Both) on the
+                            // writer-side fd has been observed to NOT
+                            // propagate to this cloned read fd on
+                            // long-running half-open connections (see
+                            // /memories/repo/rfed-tcp-watchdog-failure.md).
+                            if force_read_exit.load(Ordering::Relaxed) {
+                                crate::log(
+                                    "TCP read loop: force_read_exit set by writer — exiting to reconnect",
+                                    crate::LOG_WARNING, false, false,
+                                );
+                                break 'reading;
+                            }
                             let idle_secs = last_data_time.elapsed().as_secs();
                             if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
                                 crate::log(
