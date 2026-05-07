@@ -1328,6 +1328,20 @@ impl AppLinks {
 		std::thread::Builder::new()
 			.name("app_links_link_initiate".into())
 			.spawn(move || {
+				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+				// Refresh the tunnel binding on every TCP backbone before
+				// sending the LRREQ. Without this, the upstream rnsd may
+				// have aged out our tunnel entry (GC'd between the 60 s
+				// heartbeats), so it cannot route the LINK_PROOF back to
+				// us. The observable failure: two consecutive 18 s LRREQ
+				// timeouts before the heartbeat happens to fire and the
+				// third attempt succeeds in 0.2 s — 36 s total delay for
+				// what should be a sub-second send.
+				// Root cause confirmed by log correlation: the 3rd attempt
+				// always succeeded within 0.2 s RTT because synthesize_
+				// tunnel fired 1 s before it; the first two had a stale
+				// tunnel.
+				crate::transport::Transport::synthesize_tunnel_all_tcp();
 				if let Err(e) = handle.initiate() {
 					log(
 						&format!(

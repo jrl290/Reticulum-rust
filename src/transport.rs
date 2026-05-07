@@ -203,6 +203,13 @@ pub struct InterfaceStub {
     /// warning emitted for this interface. Used to throttle the warning
     /// to once per minute so a sustained wedge doesn't fill the log.
     pub last_inbound_warn_at: f64,
+    /// Full string representation of the interface (e.g.
+    /// `TCPInterface[London/132.145.75.143:4242]`). Stored at
+    /// registration time and used by `synthesize_tunnel_all_tcp` to
+    /// re-send tunnel bindings without holding a TCP interface Arc.
+    /// Empty for non-TCP / non-tunnel interfaces.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    pub repr: String,
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +298,8 @@ pub struct InterfaceStubConfig {
     pub ifac_netkey: Option<String>,
     pub ifac_key: Option<Vec<u8>>,
     pub ifac_signature: Option<Vec<u8>>,
+    /// See `InterfaceStub::repr`.
+    pub repr: Option<String>,
 }
 
 #[derive(Default)]
@@ -1393,8 +1402,33 @@ impl Transport {
         iface.ifac_netkey = config.ifac_netkey;
         iface.ifac_key = config.ifac_key;
         iface.ifac_signature = config.ifac_signature;
+        iface.repr = config.repr.unwrap_or_default();
 
         state.interfaces.push(iface);
+    }
+
+    /// Re-send a `synthesize_tunnel` packet on every TCP tunnel interface
+    /// that was registered with a `repr` string. Call this immediately
+    /// before initiating any new outbound link so the upstream rnsd always
+    /// has a fresh reverse-route entry when the LINK_PROOF comes back.
+    ///
+    /// This is the deterministic fix for the 36-second send stall:
+    /// two consecutive LRREQ attempts failed because the rnsd tunnel
+    /// binding had aged between 60-second heartbeats. The PROOF arrived
+    /// at the rnsd but could not be forwarded back to us.
+    ///
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    pub fn synthesize_tunnel_all_tcp() {
+        let entries: Vec<(String, String)> = {
+            let state = TRANSPORT.lock().unwrap();
+            state.interfaces.iter()
+                .filter(|i| i.online && !i.repr.is_empty())
+                .map(|i| (i.name.clone(), i.repr.clone()))
+                .collect()
+        };
+        for (name, repr) in entries {
+            Self::synthesize_tunnel(&name, &repr);
+        }
     }
 
     pub fn deregister_interface_stub(name: &str) {
