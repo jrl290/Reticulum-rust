@@ -441,6 +441,8 @@ impl Packet {
             ..Default::default()
         };
 
+        let proof_len = proof_data.len();
+
         // Create and send PROOF packet on same interface the original arrived on
         let mut proof_packet = Packet::new(
             Some(proof_destination),
@@ -454,6 +456,13 @@ impl Packet {
             false,
             FLAG_UNSET,
         );
+
+        crate::log(&format!(
+            "prove_packet hash={} interface={:?} proof_len={}",
+            crate::hexrep(packet_hash, false),
+            self.receiving_interface,
+            proof_len,
+        ), crate::LOG_NOTICE, false, false);
 
         match proof_packet.send() {
             Ok(_) => {
