@@ -6800,4 +6800,198 @@ mod tests {
 
         uninstall_sync_outbound_handler(iface_name);
     }
+
+    // ── Regression: synthesize_tunnel_all_tcp covers all TCP stubs ────────
+    //
+    // The 36-second LRREQ stall (2026-05-07 retichat.log):
+    //
+    //   Two consecutive link-establishment attempts (each 18 s) timed out
+    //   because rnsd had no tunnel binding for our TCP connection when the
+    //   LINK_PROOF arrived. The third attempt succeeded in 0.208 s because
+    //   the 60 s heartbeat happened to fire 1 s before it, refreshing the
+    //   binding.
+    //
+    //   The fix: `start_persistent_link` now calls
+    //   `Transport::synthesize_tunnel_all_tcp()` before `handle.initiate()`
+    //   on every attempt, guaranteeing the binding is fresh.
+    //
+    //   The invariants pinned here:
+    //
+    //   `repr_stored_in_interface_stub`
+    //     — `register_interface_stub_config` persists `config.repr` into
+    //       `InterfaceStub::repr`. Without this field,
+    //       `synthesize_tunnel_all_tcp` cannot reconstruct the tunnel_id
+    //       (which is `full_hash(public_key + full_hash(repr.as_bytes()))`).
+    //
+    //   `synthesize_tunnel_all_tcp_fires_on_stubs_with_repr`
+    //     — Online stubs with a non-empty repr DO get a synthesis packet.
+    //       Stubs without a repr (non-TCP interfaces) are correctly skipped.
+    //       This is the production invariant: every TCP backbone gets a
+    //       fresh tunnel binding before each LRREQ.
+    //
+    //   `synthesize_tunnel_all_tcp_skips_offline_stubs`
+    //     — Offline stubs are skipped. Sending a synthesis packet to an
+    //       offline interface would fail anyway, but more importantly it
+    //       would try to hash an empty or stale fd.
+    //
+    // NEVER REMOVE EVER.
+
+    /// Asserts that `register_interface_stub_config` persists `config.repr`
+    /// into `InterfaceStub::repr`. This is load-bearing: without the stored
+    /// repr, `synthesize_tunnel_all_tcp` cannot compute the tunnel_id and
+    /// would emit a DIFFERENT tunnel_id than the one the heartbeat uses,
+    /// silently breaking the rnsd reverse-route for link-initiated stubs.
+    #[test]
+    fn repr_stored_in_interface_stub() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-repr-persist";
+        let iface_repr = "TCPInterface[test-repr-persist/192.0.2.1:4242]";
+
+        let mut config = InterfaceStubConfig::default();
+        config.name = iface_name.to_string();
+        config.online = Some(true);
+        config.out = true;
+        config.mode = InterfaceStub::MODE_FULL;
+        config.repr = Some(iface_repr.to_string());
+        Transport::register_interface_stub_config(config);
+
+        let state = TRANSPORT.lock().unwrap();
+        let stub = state.interfaces.iter().find(|i| i.name == iface_name)
+            .expect("stub should be registered");
+        assert_eq!(
+            stub.repr, iface_repr,
+            "InterfaceStub::repr must equal the repr passed via InterfaceStubConfig — \
+             if this fails, synthesize_tunnel_all_tcp will compute a wrong tunnel_id \
+             for TCP interfaces and the 36s LRREQ stall will regress"
+        );
+    }
+
+    /// Asserts that `synthesize_tunnel_all_tcp` dispatches a synthesis packet
+    /// on every online stub that has a non-empty repr (TCP backbone interfaces)
+    /// and dispatches NOTHING on stubs without a repr (non-TCP / non-tunnel).
+    ///
+    /// This is the core invariant of the 36-second stall fix: before each
+    /// LRREQ we call this to guarantee the rnsd reverse-route is fresh.
+    /// If this test fails, the fix has regressed and the stall will return.
+    #[test]
+    fn synthesize_tunnel_all_tcp_fires_on_stubs_with_repr() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        // Identity required for signing.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+        }
+
+        // Two TCP-style stubs (repr set) and one plain stub (no repr).
+        let tcp1_name = "test-synth-all-tcp1";
+        let tcp1_repr = "TCPInterface[test-synth-all-tcp1/10.0.0.1:4242]";
+        let tcp2_name = "test-synth-all-tcp2";
+        let tcp2_repr = "TCPInterface[test-synth-all-tcp2/10.0.0.2:4242]";
+        let plain_name = "test-synth-all-plain";
+
+        for (name, repr_opt, online) in [
+            (tcp1_name,  Some(tcp1_repr),  true),
+            (tcp2_name,  Some(tcp2_repr),  true),
+            (plain_name, None,             true),
+        ] {
+            let mut cfg = InterfaceStubConfig::default();
+            cfg.name = name.to_string();
+            cfg.online = Some(online);
+            cfg.out = true;
+            cfg.mode = InterfaceStub::MODE_FULL;
+            cfg.repr = repr_opt.map(|s| s.to_string());
+            Transport::register_interface_stub_config(cfg);
+        }
+
+        // Wire up sync outbound handlers for all three.
+        let captured_tcp1: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_tcp2: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_plain: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(tcp1_name,  captured_tcp1.clone());
+        install_sync_outbound_handler(tcp2_name,  captured_tcp2.clone());
+        install_sync_outbound_handler(plain_name, captured_plain.clone());
+
+        Transport::synthesize_tunnel_all_tcp();
+
+        // Each TCP stub MUST have received exactly one synthesis packet.
+        assert_eq!(
+            captured_tcp1.lock().unwrap().len(), 1,
+            "synthesize_tunnel_all_tcp must dispatch one packet to each online \
+             TCP stub (tcp1 got none) — 36s stall regression if this fires"
+        );
+        assert_eq!(
+            captured_tcp2.lock().unwrap().len(), 1,
+            "synthesize_tunnel_all_tcp must dispatch one packet to each online \
+             TCP stub (tcp2 got none) — 36s stall regression if this fires"
+        );
+        // Plain stub (no repr) must NOT have received anything.
+        assert!(
+            captured_plain.lock().unwrap().is_empty(),
+            "synthesize_tunnel_all_tcp must skip stubs with no repr \
+             (plain stub received a packet — filter logic broken)"
+        );
+
+        uninstall_sync_outbound_handler(tcp1_name);
+        uninstall_sync_outbound_handler(tcp2_name);
+        uninstall_sync_outbound_handler(plain_name);
+    }
+
+    /// Asserts that `synthesize_tunnel_all_tcp` skips offline stubs.
+    /// An offline interface has no live socket; sending a synthesis packet
+    /// through it would fail silently and more importantly waste the 60-byte
+    /// signed packet on an interface that cannot forward it.
+    #[test]
+    fn synthesize_tunnel_all_tcp_skips_offline_stubs() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+        }
+
+        let online_name  = "test-synth-skip-online";
+        let offline_name = "test-synth-skip-offline";
+        let online_repr  = "TCPInterface[test-synth-skip-online/10.0.0.1:4242]";
+        let offline_repr = "TCPInterface[test-synth-skip-offline/10.0.0.2:4242]";
+
+        for (name, repr, online) in [
+            (online_name,  online_repr,  true),
+            (offline_name, offline_repr, false),
+        ] {
+            let mut cfg = InterfaceStubConfig::default();
+            cfg.name   = name.to_string();
+            cfg.online = Some(online);
+            cfg.out    = true;
+            cfg.mode   = InterfaceStub::MODE_FULL;
+            cfg.repr   = Some(repr.to_string());
+            Transport::register_interface_stub_config(cfg);
+        }
+
+        let captured_online:  Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_offline: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(online_name,  captured_online.clone());
+        install_sync_outbound_handler(offline_name, captured_offline.clone());
+
+        Transport::synthesize_tunnel_all_tcp();
+
+        assert_eq!(
+            captured_online.lock().unwrap().len(), 1,
+            "online TCP stub must receive a synthesis packet"
+        );
+        assert!(
+            captured_offline.lock().unwrap().is_empty(),
+            "synthesize_tunnel_all_tcp must skip offline stubs — \
+             if this fires, we're trying to synthesize on a dead socket"
+        );
+
+        uninstall_sync_outbound_handler(online_name);
+        uninstall_sync_outbound_handler(offline_name);
+    }
 }
