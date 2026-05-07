@@ -127,7 +127,8 @@ impl TcpClientInterface {
     pub const HW_MTU: usize = 262144;
     pub const BITRATE_GUESS: u64 = 10_000_000; // 10 Mbps
     pub const DEFAULT_IFAC_SIZE: usize = 16;
-    pub const RECONNECT_WAIT: u64 = 5; // seconds
+    pub const RECONNECT_WAIT_BASE: u64 = 5;  // seconds — first retry delay
+    pub const RECONNECT_WAIT_MAX: u64  = 300; // seconds — cap (5 min)
     pub const INITIAL_CONNECT_TIMEOUT: u64 = 5; // seconds
     
     // TCP socket timeouts (Linux)
@@ -424,7 +425,10 @@ impl TcpClientInterface {
         let mut attempts = 0;
 
         while !self.base.online {
-            thread::sleep(Duration::from_secs(Self::RECONNECT_WAIT));
+            let shift = (attempts as u64).min(6);
+            let wait_secs = (Self::RECONNECT_WAIT_BASE << shift)
+                .min(Self::RECONNECT_WAIT_MAX);
+            thread::sleep(Duration::from_secs(wait_secs));
             attempts += 1;
 
             if let Some(max_tries) = self.max_reconnect_tries {
@@ -522,7 +526,7 @@ impl TcpClientInterface {
                     // so nulling self.socket is not enough — the cloned fd would stay
                     // blocked in read() forever. Explicitly shut down BOTH halves so
                     // the cloned read fd returns EOF/error and the read loop's
-                    // existing reconnect path (RECONNECT_WAIT=5s, matching Python)
+                    // existing reconnect path (exponential backoff, base 5s, max 300s)
                     // wakes up and re-establishes the connection.
                     let _ = socket.shutdown(std::net::Shutdown::Both);
                     // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
@@ -997,9 +1001,14 @@ impl TcpClientInterface {
                 crate::log("TCP read loop: initiator, attempting reconnect...", crate::LOG_NOTICE, false, false);
                 let mut attempts = 0u32;
                 let reconnected = 'reconnect: loop {
-                    // Wait up to RECONNECT_WAIT seconds, but wake immediately
+                    // Exponential backoff: base * 2^attempts, capped at RECONNECT_WAIT_MAX.
+                    // attempts==0 on the first iteration → 5 s; 10 s; 20 s; 40 s … 300 s.
+                    let shift = attempts.min(6) as u64;
+                    let wait_secs = (Self::RECONNECT_WAIT_BASE << shift)
+                        .min(Self::RECONNECT_WAIT_MAX);
+                    // Wait up to `wait_secs`, but wake immediately
                     // if the platform signals that network connectivity is back.
-                    wait_or_nudge(Self::RECONNECT_WAIT);
+                    wait_or_nudge(wait_secs);
                     attempts += 1;
 
                     let (detached, max_tries) = {
