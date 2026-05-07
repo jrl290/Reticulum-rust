@@ -1639,6 +1639,11 @@ impl Reticulum {
                             );
                             crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
                             crate::interfaces::tcp_interface::TcpClientInterface::start_heartbeat_loop(Arc::clone(&interface));
+                            // Store the repr so synthesize_tunnel_all_tcp can
+                            // refresh this interface's tunnel binding on demand
+                            // (e.g. before each LRREQ in start_persistent_link).
+                            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                            stub_config.repr = Some(interface_repr.clone());
                             // STRICT ORDERING (DESIGN_PRINCIPLES.md §3 + §4):
                             // `register_interface_stub_config` MUST run before
                             // `synthesize_tunnel`. The latter calls
