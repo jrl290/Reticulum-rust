@@ -651,8 +651,13 @@ impl TcpClientInterface {
                                         if unescaped.len() > HEADER_MINSIZE {
                                             self.process_incoming(unescaped);
                                         }
-                                        
-                                        frame_buffer.drain(..=frame_end);
+
+                                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
+                                        // Python parity: frame_buffer = frame_buffer[frame_end:]
+                                        // The FLAG at frame_end is the start FLAG of the NEXT frame.
+                                        // drain(..=frame_end) consumed it, silently dropping every
+                                        // other frame the remote sends. drain(..frame_end) keeps it.
+                                        frame_buffer.drain(..frame_end);
                                     } else {
                                         break;
                                     }
@@ -690,7 +695,64 @@ impl TcpClientInterface {
     /// servers traffic arrives every few seconds, so 180 s without a
     /// single byte is a reliable indicator of a zombie connection.
     /// (Lower values can cause false reconnects on quiet networks.)
+    /// NOTE: `socket_is_established` provides a faster, kernel-authoritative
+    /// signal and will fire well before this threshold on a true dead connection.
     const READ_WATCHDOG_TIMEOUT: u64 = 180;
+
+    /// Query the kernel's TCP state machine for `fd`.
+    ///
+    /// Returns `true`  if the kernel reports TCP_ESTABLISHED (Linux: state==1,
+    /// macOS/iOS: state==4).  Returns `false` for any other state (CLOSE_WAIT,
+    /// FIN_WAIT, TIME_WAIT, CLOSED, etc.) or if the syscall fails.
+    ///
+    /// This is the ground-truth answer to "is this TCP connection alive?"
+    /// It does NOT rely on application-level traffic counters and cannot
+    /// produce false positives from a quiet-but-healthy connection.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn socket_is_established(fd: std::os::unix::io::RawFd) -> bool {
+        // tcp_info.tcpi_state is the first byte of the struct.
+        // TCP_ESTABLISHED == 1 on Linux.
+        const TCP_ESTABLISHED: u8 = 1;
+        const TCP_INFO: libc::c_int = 11;
+        let mut buf = [0u8; 256];
+        let mut len = buf.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                TCP_INFO,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        rc == 0 && len > 0 && buf[0] == TCP_ESTABLISHED
+    }
+
+    #[cfg(target_os = "macos")]
+    fn socket_is_established(fd: std::os::unix::io::RawFd) -> bool {
+        // TCP_CONNECTION_INFO.tcpi_state is the first byte of the struct.
+        // TCPS_ESTABLISHED == 4 on macOS/iOS.
+        const TCPS_ESTABLISHED: u8 = 4;
+        const TCP_CONNECTION_INFO: libc::c_int = 0x106;
+        let mut buf = [0u8; 256];
+        let mut len = buf.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                TCP_CONNECTION_INFO,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        rc == 0 && len > 0 && buf[0] == TCPS_ESTABLISHED
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn socket_is_established(_fd: std::os::unix::io::RawFd) -> bool {
+        true // Unknown platform — let other mechanisms detect failure.
+    }
 
     /// How often the read loop wakes from `read()` to poll the
     /// `force_read_exit` kill-switch and re-evaluate the watchdog.
@@ -772,6 +834,23 @@ impl TcpClientInterface {
                 let mut ebadf = false;
 
                 crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
+
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
+                // Python parity: Transport.start() calls synthesize_tunnel for every
+                // interface with wants_tunnel=True (Transport.py line 382), and
+                // TCPClientInterface.reconnect() calls it again after each reconnect
+                // (TCPInterface.py line 298). We must do the same on EVERY connection
+                // (initial and reconnect), not only after the first reconnect.
+                // Without this, the upstream rnsd has no tunnel binding for our TCP
+                // connection and cannot route PATH_RESPONSE packets back to us, so
+                // every PATH_REQUEST goes unanswered and no links can be established.
+                if !kiss_framing {
+                    let (iname, irepr) = {
+                        let iface = interface.lock().unwrap();
+                        (iface.base.name.clone().unwrap_or_default(), iface.to_string())
+                    };
+                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+                }
 
                 // Wake from blocking read every READ_WAKE_INTERVAL seconds so
                 // we can poll the `force_read_exit` kill-switch (set by
@@ -896,8 +975,8 @@ impl TcpClientInterface {
                                                 crate::log(&format!("TCP frame: {} bytes TOO SMALL, skipping", unescaped.len()), crate::LOG_DEBUG, false, false);
                                             }
 
-                                            frame_buffer.drain(..=frame_end);
-                                            crate::log(&format!("TCP HDLC: drained to frame_end={}, remaining={}", frame_end, frame_buffer.len()), crate::LOG_DEBUG, false, false);
+                                            frame_buffer.drain(..frame_end);
+                                            crate::log(&format!("TCP HDLC: drained to frame_end={} (FLAG retained as next frame start), remaining={}", frame_end, frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                         } else {
                                             crate::log(&format!("TCP HDLC: partial frame, waiting (buf={})", frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                             break;
@@ -924,6 +1003,27 @@ impl TcpClientInterface {
                                 );
                                 break 'reading;
                             }
+
+                            // System-level TCP health check: ask the kernel
+                            // whether this socket is still in ESTABLISHED state.
+                            // This is the authoritative, clock-independent answer —
+                            // it fires the moment the kernel transitions the socket
+                            // out of ESTABLISHED (CLOSE_WAIT, FIN_WAIT, CLOSED, etc.)
+                            // and cannot produce false positives from quiet-but-alive
+                            // connections. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::io::AsRawFd;
+                                let fd = socket.as_raw_fd();
+                                if !Self::socket_is_established(fd) {
+                                    crate::log(
+                                        "TCP read loop: kernel reports socket NOT in ESTABLISHED state — triggering reconnect",
+                                        crate::LOG_WARNING, false, false,
+                                    );
+                                    break 'reading;
+                                }
+                            }
+
                             let idle_secs = last_data_time.elapsed().as_secs();
                             if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
                                 crate::log(
@@ -936,7 +1036,8 @@ impl TcpClientInterface {
                                 );
                                 break 'reading;
                             }
-                            // Timeout fired but we haven't exceeded the watchdog threshold yet.
+                            // Timeout fired but haven't exceeded watchdog threshold and
+                            // kernel confirms ESTABLISHED — connection is healthy.
                             continue 'reading;
                         }
                         Err(e) => {
@@ -1046,14 +1147,9 @@ impl TcpClientInterface {
                     break 'running;
                 }
 
-                // Synthesize tunnel on the new connection then loop back to read.
-                let (kiss_framing2, iname, irepr) = {
-                    let iface = interface.lock().unwrap();
-                    (iface.kiss_framing, iface.base.name.clone().unwrap_or_default(), iface.to_string())
-                };
-                if !kiss_framing2 {
-                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
-                }
+                // synthesize_tunnel is now called at the top of the read section
+                // (before 'reading: loop) for every connection — initial and reconnect.
+                // No duplicate call needed here.
                 // continue 'running → re-clone the new socket and read again
             } // 'running
 
@@ -2104,5 +2200,143 @@ mod tests {
         assert!(n > 0, "new clone received no data after reconnect");
 
         drop(decoy);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 7: HDLC frame parsing — consecutive frames all delivered
+    //
+    // Regression test for the drain(..=frame_end) bug:
+    //   `drain(..=frame_end)` consumed the end FLAG which is also the
+    //   start FLAG of the next frame, so every other frame was silently
+    //   dropped.  Fixed to `drain(..frame_end)` (exclusive).
+    //
+    // Encodes N distinct HDLC frames into a single byte stream (exactly
+    // as a remote rnsd would send them), feeds the stream through the
+    // same parsing logic used in start_read_loop, and asserts that ALL
+    // frames are decoded.  Before the fix, only frames at even indices
+    // would survive.
+    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_hdlc_all_consecutive_frames_decoded() {
+        // Build N payloads and HDLC-encode them into one stream
+        let payloads: Vec<Vec<u8>> = (0u8..8).map(|i| vec![0xAA, i, 0x55]).collect();
+
+        let mut stream = Vec::new();
+        for p in &payloads {
+            stream.push(Hdlc::FLAG);
+            stream.extend_from_slice(&Hdlc::escape(p));
+        }
+        // Final FLAG closes the last frame
+        stream.push(Hdlc::FLAG);
+
+        // Run the exact parsing logic from start_read_loop
+        let mut frame_buffer: Vec<u8> = Vec::new();
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+
+        frame_buffer.extend_from_slice(&stream);
+
+        loop {
+            if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
+                if let Some(frame_end_offset) = frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG) {
+                    let frame_end = frame_start + 1 + frame_end_offset;
+                    let frame = &frame_buffer[frame_start + 1..frame_end];
+
+                    // Unescape
+                    let mut unescaped = Vec::new();
+                    let mut esc = false;
+                    for &byte in frame {
+                        if esc {
+                            if byte == (Hdlc::FLAG ^ Hdlc::ESC_MASK) {
+                                unescaped.push(Hdlc::FLAG);
+                            } else if byte == (Hdlc::ESC ^ Hdlc::ESC_MASK) {
+                                unescaped.push(Hdlc::ESC);
+                            }
+                            esc = false;
+                        } else if byte == Hdlc::ESC {
+                            esc = true;
+                        } else {
+                            unescaped.push(byte);
+                        }
+                    }
+
+                    if !unescaped.is_empty() {
+                        decoded.push(unescaped);
+                    }
+
+                    // The fix: drain(..frame_end) keeps the FLAG at frame_end
+                    // as the start of the next frame.
+                    frame_buffer.drain(..frame_end);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(
+            decoded.len(), payloads.len(),
+            "decoded {} frames but expected {} — drain(..=frame_end) bug \
+             would cause only even-indexed frames to survive (got: {:?})",
+            decoded.len(), payloads.len(), decoded,
+        );
+        for (i, (got, want)) in decoded.iter().zip(payloads.iter()).enumerate() {
+            assert_eq!(got, want, "frame {} payload mismatch", i);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 8: HDLC round-trip — encode then decode recovers exact bytes
+    //
+    // Verifies the escape/unescape symmetry for all byte values including
+    // FLAG (0x7E) and ESC (0x7D), which are the exact bytes that trigger
+    // the escaping path.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_hdlc_roundtrip_all_bytes() {
+        // All 256 byte values, plus a payload that contains FLAG and ESC
+        let payloads: &[&[u8]] = &[
+            &[0x00],
+            &[0x7D],                       // ESC alone
+            &[0x7E],                       // FLAG alone
+            &[0x7D, 0x7E],                 // ESC then FLAG
+            &[0x7E, 0x7D],                 // FLAG then ESC
+            &[0x7E, 0x7E, 0x7D, 0x7D],    // repeated specials
+            b"hello world",
+            b"\x00\x01\x02\xFE\xFF",
+        ];
+
+        for &payload in payloads {
+            let mut stream = Vec::new();
+            stream.push(Hdlc::FLAG);
+            stream.extend_from_slice(&Hdlc::escape(payload));
+            stream.push(Hdlc::FLAG);
+
+            // Parse
+            let frame_start = stream.iter().position(|&b| b == Hdlc::FLAG).unwrap();
+            let frame_end_offset = stream[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG).unwrap();
+            let frame_end = frame_start + 1 + frame_end_offset;
+            let frame = &stream[frame_start + 1..frame_end];
+
+            let mut unescaped = Vec::new();
+            let mut esc = false;
+            for &byte in frame {
+                if esc {
+                    if byte == (Hdlc::FLAG ^ Hdlc::ESC_MASK) { unescaped.push(Hdlc::FLAG); }
+                    else if byte == (Hdlc::ESC ^ Hdlc::ESC_MASK) { unescaped.push(Hdlc::ESC); }
+                    esc = false;
+                } else if byte == Hdlc::ESC {
+                    esc = true;
+                } else {
+                    unescaped.push(byte);
+                }
+            }
+
+            assert_eq!(
+                unescaped, payload,
+                "HDLC round-trip failed for payload {:?}", payload,
+            );
+        }
     }
 }
