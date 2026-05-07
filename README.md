@@ -1,3 +1,7 @@
+> **⚠ WIP — API is unstable.** This crate is being actively refactored. App-specific
+> conveniences (AppLinks, send-strategy layer) will be extracted to a higher-level crate.
+> The public API will break. Not yet recommended for external use.
+
 # Rusticulum
 
 A Rust implementation of the [Reticulum Network Stack](https://reticulum.network/) — a cryptography-based networking protocol for building resilient, decentralized communication networks that can operate over any transport medium.

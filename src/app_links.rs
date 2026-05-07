@@ -25,14 +25,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 
 use crate::destination::{Destination, DestinationType};
 use crate::identity::Identity;
 use crate::link::{Link, LinkHandle, MODE_AES256_CBC, STATE_ACTIVE};
-use crate::transport::{AnnounceCallback, AnnounceHandler, Transport};
+use crate::packet::{self, Packet};
+use crate::transport::{AnnounceCallback, AnnounceHandler, Transport, BROADCAST};
 use crate::{hexrep, log, LOG_NOTICE};
 
 // ─── Path-race AppLink semantics ────────────────────────────────────────
@@ -67,6 +68,21 @@ pub const APP_LINK_PATH_REQUESTED: u8 = 0x01;
 pub const APP_LINK_ESTABLISHING: u8 = 0x02;
 pub const APP_LINK_ACTIVE: u8 = 0x03;
 pub const APP_LINK_DISCONNECTED: u8 = 0x04;
+
+/// Happy-Eyeballs tier-2 stagger delay. After a successful tier-1 DIRECT
+/// send, AppLinks fires a duplicate PACKET on the alt link after this many
+/// seconds so the first LRPROOF from either tier wins.
+/// Owned here because AppLinks controls all Happy-Eyeballs scheduling.
+pub const DIRECT_STAGGER_WAIT: f64 = 1.0;
+
+/// Settling window for dual-link disambiguation (seconds).
+/// When both an outbound (PersistentLink) and an inbound (peer-initiated)
+/// link exist for the same app-link destination, the link whose most-recent
+/// inbound traffic is older than this value AND is older than the other
+/// side's most-recent inbound is torn down.
+/// Set to 2 × KEEPALIVE_MAX (360 s) so a healthy link with regular
+/// keepalives is never tagged as the loser.
+pub const DUAL_LINK_SETTLING_SECS: u64 = 720;
 
 /// Host lifecycle policy that gates which triggers are allowed to attempt
 /// new link establishments. Set via [`AppLinks::set_policy`] from the host
@@ -123,8 +139,9 @@ pub type AppLinkStatusCallback = Arc<dyn Fn(&[u8], u8, Option<LinkHandle>) + Sen
 ///   `APP_LINK_ESTABLISHING` after `Link::initiate()` is dispatched and
 ///   `APP_LINK_ACTIVE` (with `Some(LinkHandle)`) when the link reaches
 ///   `STATE_ACTIVE`. On link-closed: drops the handle, fires
-///   `APP_LINK_DISCONNECTED`, and waits for the next external trigger
-///   (announce / network_changed / explicit `open`) to re-establish.
+///   `APP_LINK_DISCONNECTED`, and immediately re-triggers establishment
+///   (equivalent to calling `open()` again — the CAS gate prevents
+///   duplicate in-flight races).
 ///
 /// `PersistentLink` is the right mode for things that *require* a live
 /// link to function — propagation node uploads/downloads, long-running
@@ -199,6 +216,13 @@ struct Registry {
 	/// PathRace destinations are never present here. At most one entry
 	/// per destination (single-attempt CAS invariant).
 	links: HashMap<Vec<u8>, LinkHandle>,
+	/// Peer-initiated (inbound) links. Populated by
+	/// [`AppLinks::register_inbound`] from the LXMF delivery-destination
+	/// identify callback when a peer opens a link to us and we learn their
+	/// identity (and therefore their destination hash). Removed
+	/// automatically when the link closes (via a closed-callback installed
+	/// in `register_inbound`) or via [`AppLinks::close`] cleanup.
+	inbound_links: HashMap<Vec<u8>, LinkHandle>,
 	status_callbacks: Vec<AppLinkStatusCallback>,
 	/// Set once the announce handler has been registered with `Transport`.
 	announce_handler_installed: bool,
@@ -215,6 +239,7 @@ impl Registry {
 			specs: HashMap::new(),
 			ready: HashMap::new(),
 			links: HashMap::new(),
+			inbound_links: HashMap::new(),
 			status_callbacks: Vec::new(),
 			announce_handler_installed: false,
 			ready_watcher_installed: false,
@@ -336,12 +361,15 @@ impl AppLinks {
 
 	// ─── Public lifecycle ───────────────────────────────────────────────
 
-	/// Open an app link for `dest_hash` in [`LinkMode::PathRace`].
+	/// Open an app link for `dest_hash` in [`LinkMode::PersistentLink`].
 	///
-	/// Convenience shorthand for [`Self::open_with_mode`] —
-	/// see that method for the full lifecycle description.
+	/// Always uses `PersistentLink` mode — builds and holds a real outbound
+	/// `Link` to the destination so the caller owns the keepalive cycle and
+	/// always has a live link handle without rebuilding per-send. The status
+	/// callback fires `APP_LINK_ACTIVE` with `Some(LinkHandle)` when the link
+	/// reaches `STATE_ACTIVE`.
 	pub fn open(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
-		Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PathRace);
+		Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PersistentLink);
 	}
 
 	/// Open an app link for `dest_hash` in [`LinkMode::PersistentLink`].
@@ -416,18 +444,21 @@ impl AppLinks {
 
 	/// Close an app link.  Removes the destination from the registry,
 	/// drops the READY marker (if any), tears down any held `LinkHandle`
-	/// (PersistentLink mode), and fires a `NONE` status callback.
+	/// (PersistentLink mode), drops any inbound link, and fires a `NONE`
+	/// status callback.
 	pub fn close(dest_hash: &[u8]) {
-		let (was_registered, dropped_link) = {
+		let (was_registered, dropped_link, dropped_inbound) = {
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			let removed_spec = reg.specs.remove(dest_hash).is_some();
 			reg.ready.remove(dest_hash);
 			let dropped_link = reg.links.remove(dest_hash);
-			(removed_spec, dropped_link)
+			let dropped_inbound = reg.inbound_links.remove(dest_hash);
+			(removed_spec, dropped_link, dropped_inbound)
 		};
-		// Drop the link handle outside the registry lock so its actor
+		// Drop link handles outside the registry lock so their actor
 		// teardown can't deadlock on a callback that takes the lock.
 		drop(dropped_link);
+		drop(dropped_inbound);
 		if was_registered {
 			let cbs: Vec<AppLinkStatusCallback> = REGISTRY
 				.lock()
@@ -509,6 +540,266 @@ impl AppLinks {
 			.and_then(|r| r.links.get(dest_hash).cloned())
 	}
 
+	/// Register a peer-initiated (inbound) link for `dest_hash`.
+	///
+	/// Called from the LXMF delivery-destination identify callback when a
+	/// peer opens a link to our delivery destination and identifies
+	/// themselves. AppLinks takes ownership of the inbound-link slot: a
+	/// link-closed callback is installed that removes the entry
+	/// automatically when the peer closes or the link times out.
+	///
+	/// Only stores an entry when `dest_hash` is already registered via
+	/// [`AppLinks::open`] — inbound links from unknown peers are ignored.
+	pub fn register_inbound(dest_hash: &[u8], link: LinkHandle) {
+		if !Self::contains(dest_hash) {
+			return;
+		}
+		// Install a closed callback that auto-removes the inbound entry.
+		{
+			let dest_owned = dest_hash.to_vec();
+			link.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
+				if let Ok(mut reg) = REGISTRY.lock() {
+					reg.inbound_links.remove(&dest_owned);
+				}
+				log(
+					&format!(
+						"[APP_LINK] inbound link closed for {}",
+						hexrep(&dest_owned, false)
+					),
+					LOG_NOTICE, false, false,
+				);
+			})));
+		}
+		log(
+			&format!(
+				"[APP_LINK] inbound link registered for {}",
+				hexrep(dest_hash, false)
+			),
+			LOG_NOTICE, false, false,
+		);
+		if let Ok(mut reg) = REGISTRY.lock() {
+			reg.inbound_links.insert(dest_hash.to_vec(), link);
+		}
+	}
+
+	/// Returns the live inbound `LinkHandle` for `dest_hash`, if any.
+	pub fn get_inbound_handle(dest_hash: &[u8]) -> Option<LinkHandle> {
+		REGISTRY
+			.lock()
+			.ok()
+			.and_then(|r| r.inbound_links.get(dest_hash).cloned())
+	}
+
+	/// True when an inbound link is tracked for `dest_hash`.
+	pub fn has_inbound(dest_hash: &[u8]) -> bool {
+		REGISTRY
+			.lock()
+			.map(|r| r.inbound_links.contains_key(dest_hash))
+			.unwrap_or(false)
+	}
+
+	/// Return the active link for `dest_hash` that is NOT `tried`.
+	///
+	/// Used by the Happy-Eyeballs stagger in `process_outbound`: after tier-1
+	/// fires on `tried`, tier-2 fires on the other link 1 s later without
+	/// canceling the tier-1 packet in-flight.
+	///
+	/// Returns `None` when no other ACTIVE link exists for this destination.
+	pub fn alt_link_for(dest_hash: &[u8], tried: &LinkHandle) -> Option<LinkHandle> {
+		let (outbound, inbound) = {
+			let reg = REGISTRY.lock().ok()?;
+			(
+				reg.links.get(dest_hash).cloned(),
+				reg.inbound_links.get(dest_hash).cloned(),
+			)
+		};
+		for candidate in [outbound, inbound].into_iter().flatten() {
+			if !candidate.same_link(tried) && candidate.status() == STATE_ACTIVE {
+				return Some(candidate);
+			}
+		}
+		None
+	}
+
+	/// Happy-Eyeballs tier-2: fire `packed` on the alt link for `dest_hash`
+	/// (the ACTIVE link that is NOT `tier1_link`) after `stagger_secs`.
+	///
+	/// Spawns a background thread that sleeps for `stagger_secs` then fires a
+	/// raw Packet on the alt link (if it is still ACTIVE when the timer fires).
+	/// The same `on_delivered` / `on_timeout` callbacks are installed on the
+	/// tier-2 receipt so that the first LRPROOF — from either tier — wins.
+	/// Both callbacks MUST be idempotent (mark_delivered_shared is a no-op
+	/// after DELIVERED state is already set).
+	///
+	/// This method returns immediately; tier-2 is best-effort and silent if
+	/// no alt link is available when the timer fires.
+	///
+	/// Called from `process_outbound` DIRECT STATE_ACTIVE after a successful
+	/// tier-1 send for PACKET representation.
+	/// // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub fn schedule_alt_packet_fire(
+		dest_hash: &[u8],
+		tier1_link: &LinkHandle,
+		packed: Vec<u8>,
+		on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+		on_timeout: Arc<dyn Fn() + Send + Sync + 'static>,
+		stagger_secs: f64,
+	) {
+		let dest_owned = dest_hash.to_vec();
+		let tier1_clone = tier1_link.clone();
+		std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_secs_f64(stagger_secs));
+			if let Some(alt) = Self::alt_link_for(&dest_owned, &tier1_clone) {
+				let Ok(dest) = alt.build_link_destination() else { return };
+				let mut pkt = Packet::new(
+					Some(dest),
+					packed,
+					packet::DATA,
+					packet::NONE,
+					BROADCAST,
+					packet::HEADER_1,
+					None, None, true, 0,
+				);
+				if let Ok(Some(mut receipt)) = pkt.send() {
+					let dcb: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync> =
+						Arc::new(move |_| on_delivered());
+					let tcb: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync> =
+						Arc::new(move |_| on_timeout());
+					receipt.set_delivery_callback(dcb.clone());
+					receipt.set_timeout_callback(tcb.clone());
+					Transport::set_receipt_delivery_callback(&receipt.hash, dcb);
+					Transport::set_receipt_timeout_callback(&receipt.hash, tcb);
+					log(
+						&format!(
+							"[AppLinks] Happy-Eyeballs tier-2 fired on alt link {}",
+							hexrep(&alt.link_id(), false)
+						),
+						LOG_NOTICE, false, false,
+					);
+				}
+			}
+		});
+	}
+
+	/// Dual-link settling for app-link destinations.
+	///
+	/// For each destination that has both an AppLinks-held outbound
+	/// (PersistentLink) and a peer-initiated inbound link that are both
+	/// ACTIVE, tears down whichever has been silent for longer than
+	/// [`DUAL_LINK_SETTLING_SECS`] AND is older than the other.
+	///
+	/// Side effects on the LXMF layer (clearing `outbound_links` and
+	/// `backchannel_identified_links` in LXMRouter) are handled via the
+	/// `APP_LINK_DISCONNECTED` status callback already registered by
+	/// `LXMRouter::new` — no LXMRouter reference is needed here.
+	///
+	/// Called from `LXMRouter::jobs` on JOB_LINKS_INTERVAL.
+	pub fn tick_dual_link_settling() {
+		// Collect candidates while holding the lock, release before teardown
+		// to avoid re-entrant lock when teardown fires back into AppLinks.
+		let candidates: Vec<(Vec<u8>, LinkHandle, LinkHandle)> = {
+			let Ok(reg) = REGISTRY.lock() else { return };
+			reg.specs
+				.keys()
+				.filter_map(|dest_hash| {
+					let out = reg.links.get(dest_hash).cloned()?;
+					let inn = reg.inbound_links.get(dest_hash).cloned()?;
+					Some((dest_hash.clone(), out, inn))
+				})
+				.collect()
+		};
+		if candidates.is_empty() { return; }
+
+		let now_secs = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let settling = DUAL_LINK_SETTLING_SECS;
+
+		for (dest_hash, out_link, in_link) in candidates {
+			if out_link.status() != STATE_ACTIVE || in_link.status() != STATE_ACTIVE {
+				continue;
+			}
+			let out_last = out_link.snapshot().ok().map(|s| s.last_inbound).unwrap_or(0);
+			let in_last  = in_link.snapshot().ok().map(|s| s.last_inbound).unwrap_or(0);
+			let out_silent = now_secs.saturating_sub(out_last);
+			let in_silent  = now_secs.saturating_sub(in_last);
+
+			if out_silent <= settling && in_silent <= settling {
+				continue; // both fresh — leave them alone
+			}
+			if out_silent > settling && in_last > out_last {
+				log(
+					&format!(
+						"[APP_LINK] dual-link settling: tearing down outbound to {} \
+						 (silent {}s, peer-side {}s)",
+						hexrep(&dest_hash, false), out_silent, in_silent,
+					),
+					LOG_NOTICE, false, false,
+				);
+				out_link.teardown();
+				// outbound_links + backchannel_identified_links removal is
+				// handled by LXMRouter's APP_LINK_DISCONNECTED status callback.
+			} else if in_silent > settling && out_last > in_last {
+				log(
+					&format!(
+						"[APP_LINK] dual-link settling: tearing down inbound from {} \
+						 (silent {}s, peer-side {}s)",
+						hexrep(&dest_hash, false), in_silent, out_silent,
+					),
+					LOG_NOTICE, false, false,
+				);
+				in_link.teardown();
+				// inbound_links removal handled by AppLinks closed-callback.
+			}
+			// If both silent past the settling window we leave them — they
+			// will eventually fail keepalive and tear themselves down.
+		}
+	}
+
+	/// Return the best currently-ACTIVE link for `dest_hash`.	///
+	/// Considers both the AppLinks-held outbound link and any peer-initiated
+	/// inbound link registered via [`AppLinks::register_inbound`]. Returns
+	/// `None` when no ACTIVE link exists.
+	///
+	/// Selection rule: prefer the link with the most recent `last_inbound`
+	/// traffic — that's the link the peer is actively servicing. On a tie
+	/// the outbound link wins: we own its keepalive cycle and can keep it
+	/// alive independently of the peer.
+	///
+	/// Called from `process_outbound` DIRECT branch; replaces the manual
+	/// per-field scoring block that previously lived in LXMRouter.
+	pub fn best_link_for(dest_hash: &[u8]) -> Option<LinkHandle> {
+		let (outbound, inbound) = {
+			let reg = REGISTRY.lock().ok()?;
+			(
+				reg.links.get(dest_hash).cloned(),
+				reg.inbound_links.get(dest_hash).cloned(),
+			)
+		};
+
+		let out_active = outbound.as_ref().map(|h| h.status() == STATE_ACTIVE).unwrap_or(false);
+		let in_active  = inbound.as_ref().map(|h| h.status() == STATE_ACTIVE).unwrap_or(false);
+
+		match (out_active, in_active) {
+			(false, false) => None,
+			(true,  false) => outbound,
+			(false, true)  => inbound,
+			(true,  true)  => {
+				// Both active: pick by last_inbound score. Tie → outbound wins.
+				let out_score = outbound.as_ref()
+					.and_then(|h| h.snapshot().ok())
+					.map(|s| (s.last_inbound, s.activated_at.unwrap_or(0)))
+					.unwrap_or((0, 0));
+				let in_score = inbound.as_ref()
+					.and_then(|h| h.snapshot().ok())
+					.map(|s| (s.last_inbound, s.activated_at.or(s.established_at).unwrap_or(0)))
+					.unwrap_or((0, 0));
+				if in_score > out_score { inbound } else { outbound }
+			}
+		}
+	}
+
 	// ─── External triggers ──────────────────────────────────────────────
 
 	/// Trigger one fresh app-link attempt for `dest_hash` on the strength
@@ -573,22 +864,24 @@ impl AppLinks {
 	/// `notify` is true, fires a `DISCONNECTED` status callback per
 	/// affected destination so hosts can flush mirrored state.
 	fn clear_all_ready(notify: bool) {
-		let (dropped, dropped_links) = {
+		let (dropped, dropped_links, dropped_inbound) = {
 			let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
 			let ready_keys: Vec<Vec<u8>> = reg.ready.keys().cloned().collect();
 			let link_keys: Vec<Vec<u8>> = reg.links.keys().cloned().collect();
 			reg.ready.clear();
 			let dropped_links: Vec<LinkHandle> = reg.links.drain().map(|(_, h)| h).collect();
+			let dropped_inbound: Vec<LinkHandle> = reg.inbound_links.drain().map(|(_, h)| h).collect();
 			let mut union: Vec<Vec<u8>> = ready_keys;
 			for k in link_keys {
 				if !union.contains(&k) {
 					union.push(k);
 				}
 			}
-			(union, dropped_links)
+			(union, dropped_links, dropped_inbound)
 		};
 		// Drop link handles outside the registry lock.
 		drop(dropped_links);
+		drop(dropped_inbound);
 		if !notify || dropped.is_empty() {
 			return;
 		}
@@ -970,9 +1263,17 @@ impl AppLinks {
 			})));
 		}
 
-		// link_closed → DISCONNECTED callback. Removes the handle and
-		// releases the in-flight gate so the next external trigger
-		// (announce / network_changed) can re-establish.
+		// link_closed → DISCONNECTED callback. Removes the handle,
+		// releases the in-flight gate, and immediately re-triggers
+		// establishment if the spec is still registered.
+		//
+		// PersistentLink semantics: the link must stay established as
+		// long as the destination is registered.  Waiting for an
+		// external trigger (announce / network_changed) after a close
+		// means the app can be unreachable for minutes.  Instead we
+		// re-call `establish()` right away — it is a no-op if the
+		// policy is Suspended, and the CAS gate inside prevents
+		// duplicate races. NEVER REMOVE EVER — see DESIGN_PRINCIPLES §1
 		{
 			let dest_cb = dest.clone();
 			let in_flight_cb = in_flight.clone();
@@ -997,6 +1298,14 @@ impl AppLinks {
 				for cb in &cbs_cb {
 					cb(&dest_cb, APP_LINK_DISCONNECTED, None);
 				}
+				// Re-establish immediately if still registered.
+				let dest_re = dest_cb.clone();
+				std::thread::Builder::new()
+					.name("app_links_reestablish".into())
+					.spawn(move || {
+						AppLinks::establish(&dest_re);
+					})
+					.ok();
 			})));
 		}
 
