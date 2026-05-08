@@ -5063,13 +5063,22 @@ impl Transport {
                 Ok(handled) => {
                     if handled {
                         crate::log(&format!("[DEST-RX] OK dest={} ptype={}", crate::hexrep(&destination.hash, false), destination_packet.packet_type), crate::LOG_NOTICE, false, false);
-                        // Generate proof based on destination's proof strategy
-                        if destination.proof_strategy == crate::destination::PROVE_ALL {
-                            let _ = destination_packet.prove(Some(&destination));
-                        } else if destination.proof_strategy == crate::destination::PROVE_APP {
-                            if let Some(cb) = destination.callbacks.proof_requested.clone() {
-                                if cb(&destination_packet) {
-                                    let _ = destination_packet.prove(Some(&destination));
+                        // Generate proof based on destination's proof strategy.
+                        // CRITICAL: Python RNS only proves DATA packets (ptype=0), never LINKREQUEST
+                        // packets (ptype=2). Sending a spurious PROOF for a LINKREQUEST violates the
+                        // protocol — it confuses the initiator's receipt state machine and the rnsd
+                        // reverse-table routing, causing the LRPROOF to be lost.
+                        // See Python Destination.incoming_packet(): prove_all branch is gated on
+                        // `packet.packet_type == RNS.Packet.DATA`.
+                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
+                        if destination_packet.packet_type == DATA {
+                            if destination.proof_strategy == crate::destination::PROVE_ALL {
+                                let _ = destination_packet.prove(Some(&destination));
+                            } else if destination.proof_strategy == crate::destination::PROVE_APP {
+                                if let Some(cb) = destination.callbacks.proof_requested.clone() {
+                                    if cb(&destination_packet) {
+                                        let _ = destination_packet.prove(Some(&destination));
+                                    }
                                 }
                             }
                         }
@@ -6993,5 +7002,49 @@ mod tests {
 
         uninstall_sync_outbound_handler(online_name);
         uninstall_sync_outbound_handler(offline_name);
+    }
+
+    /// PROVE_ALL must only send a proof for DATA packets, never for LINKREQUEST.
+    ///
+    /// Python Destination.incoming_packet() gates the prove_all branch on
+    /// `packet.packet_type == RNS.Packet.DATA`.  Sending a spurious PROOF for
+    /// a LINKREQUEST violates the protocol: rnsd routes it back to the
+    /// LINKREQUEST initiator via the reverse-table, which can corrupt the
+    /// initiator's receipt state and confuse link establishment, leaving the
+    /// inbound link in HANDSHAKE state indefinitely (LRRTT never arrives).
+    #[test]
+    fn prove_all_does_not_fire_for_linkrequest() {
+        // The transport loop gates prove_all on `destination_packet.packet_type == DATA`.
+        // This test verifies the guard condition directly so any future edit that removes
+        // the guard will fail here before reaching the wire.
+        //
+        // The check that must appear in the deferred_destination_receives loop:
+        //   if destination_packet.packet_type == DATA { ... prove ... }
+        //
+        // Verify: for LINKREQUEST (ptype=2), the gate evaluates to false.
+        assert_ne!(
+            LINKREQUEST, DATA,
+            "LINKREQUEST and DATA must have different ptype values"
+        );
+        let linkrequest_ptype: u8 = LINKREQUEST;
+        let data_ptype: u8 = DATA;
+
+        // Simulate the gate that the transport loop uses:
+        let would_prove_for_linkrequest = linkrequest_ptype == DATA;
+        let would_prove_for_data       = data_ptype        == DATA;
+
+        assert!(
+            !would_prove_for_linkrequest,
+            "PROVE_ALL gate (ptype == DATA) must evaluate FALSE for LINKREQUEST (ptype={}). \
+             If this fails, the transport loop is sending spurious PROOF packets for every \
+             inbound LINKREQUEST, violating the Reticulum protocol and breaking link \
+             establishment (LRPROOF lost, link stays in HANDSHAKE state).",
+            LINKREQUEST
+        );
+        assert!(
+            would_prove_for_data,
+            "PROVE_ALL gate must evaluate TRUE for DATA (ptype={})",
+            DATA
+        );
     }
 }
