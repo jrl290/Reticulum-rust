@@ -1470,14 +1470,17 @@ impl Transport {
 
     pub fn set_interface_online(name: &str, online: bool) {
         let mut transitioned_up = false;
+        let mut transitioned_down = false;
         {
             let mut state = TRANSPORT.lock().unwrap();
             if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == name) {
                 if online && !iface.online { transitioned_up = true; }
+                if !online && iface.online { transitioned_down = true; }
                 iface.online = online;
             }
             if let Some(iface) = state.local_client_interfaces.iter_mut().find(|i| i.name == name) {
                 if online && !iface.online { transitioned_up = true; }
+                if !online && iface.online { transitioned_down = true; }
                 iface.online = online;
             }
         }
@@ -1494,6 +1497,40 @@ impl Transport {
                 LOG_DEBUG, false, false,
             );
             Self::announce_all_destinations(name);
+        }
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§2
+        //
+        // On true→false transition, re-announce on every other online
+        // interface so remote nodes can update their path-to-us immediately.
+        //
+        // Without this, a remote peer (e.g. Meshchat) that last heard about
+        // us via the now-dead interface will still try to route LINKPROOF
+        // packets back via that interface — they'll be silently dropped and
+        // link establishment will time out.  Re-announcing via still-online
+        // interfaces (e.g. RMap) updates remote routing tables so proofs
+        // can reach us.  This is deterministic: interface offline IS the
+        // "routing stale" signal.
+        if transitioned_down {
+            let other_ifaces: Vec<String> = {
+                let state = TRANSPORT.lock().unwrap();
+                state.interfaces.iter()
+                    .chain(state.local_client_interfaces.iter())
+                    .filter(|i| i.online && i.name.as_str() != name)
+                    .map(|i| i.name.clone())
+                    .collect()
+            };
+            if !other_ifaces.is_empty() {
+                log(
+                    &format!(
+                        "Interface {} transitioned offline — re-announcing via {} other interface(s)",
+                        name, other_ifaces.len()
+                    ),
+                    LOG_DEBUG, false, false,
+                );
+                for iface_name in &other_ifaces {
+                    Self::announce_all_destinations(iface_name);
+                }
+            }
         }
     }
 
