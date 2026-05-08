@@ -2823,7 +2823,37 @@ impl Transport {
                     Some(PathEntryValue::Timestamp(ts)) => *ts,
                     _ => 0.0,
                 };
-                let mut destination_expiry = timestamp + DESTINATION_TIMEOUT;
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1, §2
+                //
+                // Use the stored `Expires` field, not `timestamp + DESTINATION_TIMEOUT`.
+                //
+                // expire_path() sets timestamp=0 ("soft-expire") to signal that
+                // race_path() must issue a fresh PATH_REQUEST before using this entry.
+                // It intentionally leaves the `Expires` field untouched so the PATH
+                // QUALITY GATE (below, in the announce handler) can still reject worse
+                // inbound paths — i.e., if we had a good 2-hop path cached and
+                // expire_path is called, the gate will not overwrite it with a 12-hop
+                // stale PATH_RESPONSE from a remote node.
+                //
+                // If we compute `destination_expiry = timestamp + DESTINATION_TIMEOUT`
+                // (the old code), a soft-expired entry gives:
+                //   `0.0 + 604800 ≈ 7 days in Unix seconds << now() (≈ 1.7 × 10⁹ s)`
+                // … so EVERY soft-expired entry is immediately culled here, destroying
+                // the cached hop-count before the quality gate can compare it.
+                // After the entry is gone, the next PATH_RESPONSE is always accepted
+                // unconditionally (has_existing=false), even if it is much worse.
+                //
+                // The fix: use the stored `Expires` value.  expire_path() does NOT
+                // change that field, so a recently-stored path (expires = now+7 days)
+                // survives the cull while still being "soft-expired" for has_path().
+                // A path is only culled when its `Expires` timestamp has genuinely
+                // elapsed (7 days after the path was last verified by a live announce
+                // or PATH_RESPONSE).
+                let stored_expires = match entry.get(IDX_PT_EXPIRES) {
+                    Some(PathEntryValue::Expires(e)) if *e > 0.0 => *e,
+                    _ => timestamp + DESTINATION_TIMEOUT,
+                };
+                let mut destination_expiry = stored_expires;
                 let attached = match entry.get(IDX_PT_RVCD_IF) {
                     Some(PathEntryValue::ReceivingInterface(name)) => name.clone(),
                     _ => None,
@@ -3869,7 +3899,26 @@ impl Transport {
             if let Some(PathEntryValue::Timestamp(ts)) = entry.get_mut(IDX_PT_TIMESTAMP) {
                 *ts = 0.0;
             }
-            state.tables_last_culled = 0.0;
+            // NEVER REMOVE EVER — do NOT set tables_last_culled = 0.0 here.
+            //
+            // Setting tables_last_culled = 0.0 triggers an immediate cull on the
+            // next jobs() tick.  The cull's stale-path check computed
+            // `destination_expiry = timestamp + DESTINATION_TIMEOUT`.  With
+            // timestamp=0 that gives `0 + 604800 ≈ 7 days` in Unix seconds, which
+            // is always << now() (~1.7 × 10⁹), so the entry is immediately deleted.
+            //
+            // Deleting the entry defeats the whole point of soft-expiry: the path
+            // QUALITY GATE uses the existing entry's hop count to reject worse
+            // PATH_RESPONSES.  With has_existing=false (entry gone), any incoming
+            // PATH_RESPONSE — including one with hops=12 when the cached entry was
+            // hops=2 — is accepted unconditionally.
+            //
+            // The cull is now fixed to use the stored `Expires` field (set to
+            // original_timestamp + DESTINATION_TIMEOUT, i.e., now+7 days for a
+            // recently-stored entry), so a soft-expired entry is NOT culled until its
+            // expiry legitimately elapses.  `tables_last_culled = 0.0` here would
+            // still force an immediate cull cycle, which is wasteful and was the
+            // original source of the deletion.  Leave tables_last_culled alone.
             true
         } else {
             false
