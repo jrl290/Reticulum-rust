@@ -1077,6 +1077,17 @@ impl AppLinks {
 		std::thread::Builder::new()
 			.name("app_links_race".into())
 			.spawn(move || {
+				// PersistentLink only: expire any stale disk-cached path so
+				// race_path always resolves via the relay that *currently* has
+				// a route to the destination.  Without this, a cached path may
+				// point to a relay that no longer knows the destination; the
+				// LINKREQUEST is silently dropped by that relay and never
+				// receives an LRPROOF, causing an 18 s timeout per attempt.
+				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+				if mode == LinkMode::PersistentLink {
+					crate::transport::Transport::expire_path(&dest_owned);
+				}
+
 				// The race itself; ≤ LIVENESS_BUDGET (5 s, §1).
 				// `liveness::race_path` is the same primitive used by
 				// `AppLinks::send` so cold-trigger and warm-send share
