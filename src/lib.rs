@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub mod version;
 
 pub mod announce_log;
-pub mod app_links;
 pub mod buffer;
 pub mod channel;
 pub mod destination;
