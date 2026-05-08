@@ -36,26 +36,22 @@ use crate::packet::{self, Packet};
 use crate::transport::{AnnounceCallback, AnnounceHandler, Transport, BROADCAST};
 use crate::{hexrep, log, LOG_NOTICE};
 
-// ─── Path-race AppLink semantics ────────────────────────────────────────
+// ─── PersistentLink AppLink semantics ───────────────────────────────────
 //
-// As of the path-race refactor (replaces the previous bounded LR racer
-// design), an "AppLink" is no longer a persistent `Link` object. The
-// registry instead tracks whether a *path* to the destination is known.
+// Every registered destination gets a persistent outbound `Link` that
+// AppLinks races, builds, and holds:
 //
-//   * `establish()` fires `Transport::request_path` on every online
-//     non-LoRa interface in parallel and waits (≤5 s, DESIGN_PRINCIPLES
-//     §1) for any iface to populate the path table.
-//   * Path arrival = "Ready" (status `APP_LINK_ACTIVE`).
-//   * Path expiry (Transport drops it) = "Disconnected" — a background
-//     watcher polls `Transport::has_path` for ready entries and emits
-//     `APP_LINK_DISCONNECTED` on the flip.
-//   * Sending uses LXMF's own DIRECT path (which builds a short-lived
-//     `Link` per outbound batch from `handle_outbound`) — AppLinks no
-//     longer holds long-lived `LinkHandle`s.
-//
-// The `AppLinkStatusCallback` `link` parameter is therefore always `None`
-// in this implementation. The signature is kept for ABI stability with
-// existing iOS/Android FFI callers.
+//   * `establish()` expires any stale disk-cached path, then fires
+//     `liveness::race_path` (≤5 s, DESIGN_PRINCIPLES §1).
+//   * On path arrival: `start_persistent_link` calls `Link::new_outbound`
+//     + `LinkHandle::initiate()`. Status → ESTABLISHING.
+//   * On link ACTIVE: registry stores the `LinkHandle`, status → ACTIVE,
+//     callback fires with `Some(handle)`.
+//   * On link closed: handle is dropped, status → DISCONNECTED, one
+//     auto-retry fires (if the link previously reached ACTIVE).
+//   * The single-attempt CAS gate (`attempt_in_flight`) is held through
+//     the entire race → establish → ACTIVE|CLOSED cycle, preventing
+//     orphan-handle creation from concurrent triggers.
 //
 // Poll cadence for the ready watcher. A path expiry only matters as a
 // hint that the next send will need a fresh race — exactness is not
@@ -119,53 +115,18 @@ impl Default for LinkPolicy {
 /// Callback fired by the registry whenever an app-link's tracked
 /// state changes.
 ///
-/// `(dest_hash, status, link)` — `link` is `Some(handle)` only when the
-/// destination is registered with [`LinkMode::PersistentLink`] and a real
-/// outbound `Link` exists in the registry. For [`LinkMode::PathRace`]
-/// destinations the parameter is always `None`.
+/// `(dest_hash, status, link)` — `link` is `Some(handle)` when a real
+/// outbound `Link` is held in the registry (i.e. after `ACTIVE`).
 pub type AppLinkStatusCallback = Arc<dyn Fn(&[u8], u8, Option<LinkHandle>) + Send + Sync>;
 
-/// How AppLinks should service a registered destination.
-///
-/// * [`LinkMode::PathRace`] — *(default)* lightweight liveness only. The
-///   registry races a `Transport::request_path` on every online non-LoRa
-///   interface; READY = a path arrived. No `Link` object is ever
-///   constructed by AppLinks — the caller (e.g. LXMF DIRECT branch)
-///   builds short-lived links itself when it needs to send. The status
-///   callback's `link` argument is always `None`.
-///
-/// * [`LinkMode::PersistentLink`] — race a path, then build a real
-///   outbound [`Link`] over the winning interface and hold it. Fires
-///   `APP_LINK_ESTABLISHING` after `Link::initiate()` is dispatched and
-///   `APP_LINK_ACTIVE` (with `Some(LinkHandle)`) when the link reaches
-///   `STATE_ACTIVE`. On link-closed: drops the handle, fires
-///   `APP_LINK_DISCONNECTED`, and immediately re-triggers establishment
-///   (equivalent to calling `open()` again — the CAS gate prevents
-///   duplicate in-flight races).
-///
-/// `PersistentLink` is the right mode for things that *require* a live
-/// link to function — propagation node uploads/downloads, long-running
-/// channel subscriptions — where every send would otherwise pay for a
-/// fresh handshake.
-///
-/// **Single-attempt invariant.** In both modes a per-destination
-/// `attempt_in_flight` CAS gate collapses concurrent triggers into a
-/// single race. For `PersistentLink` the gate is held through the entire
-/// `race_path → new_outbound → initiate → ACTIVE | CLOSED` cycle, so it
-/// is impossible for two `LinkHandle`s to coexist for the same
-/// destination — fixing the historical "orphan link" bug where a 2nd
-/// establish attempt would overwrite the live handle and leave LRPROOFs
-/// to be silently dropped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal marker — every registered destination gets a persistent
+/// outbound [`Link`] that AppLinks holds and automatically re-establishes
+/// on close.  Kept as a type so the `AppLinkSpec.mode` field compiles
+/// without breaking the existing FFI/callback signatures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LinkMode {
-	PathRace,
+	#[default]
 	PersistentLink,
-}
-
-impl Default for LinkMode {
-	fn default() -> Self {
-		LinkMode::PathRace
-	}
 }
 
 /// Per-destination state held by the registry.
@@ -175,8 +136,7 @@ pub struct AppLinkSpec {
 	pub aspects: Vec<String>,
 	pub mode: LinkMode,
 	/// True from the moment `establish` decides to attempt until the
-	/// in-flight cycle resolves. For `PathRace` that's the path-race
-	/// thread completion; for `PersistentLink` it spans
+	/// in-flight cycle resolves.  Spans
 	/// race_path → new_outbound → initiate → established|closed so a
 	/// concurrent trigger cannot create a second `LinkHandle`.
 	pub attempt_in_flight: Arc<AtomicBool>,
@@ -187,21 +147,22 @@ pub struct AppLinkSpec {
 
 impl AppLinkSpec {
 	pub fn new(app_name: impl Into<String>, aspects: Vec<String>) -> Self {
-		Self::with_mode(app_name, aspects, LinkMode::PathRace)
-	}
-
-	pub fn with_mode(
-		app_name: impl Into<String>,
-		aspects: Vec<String>,
-		mode: LinkMode,
-	) -> Self {
 		Self {
 			app_name: app_name.into(),
 			aspects,
-			mode,
+			mode: LinkMode::PersistentLink,
 			attempt_in_flight: Arc::new(AtomicBool::new(false)),
 			ever_established: Arc::new(AtomicBool::new(false)),
 		}
+	}
+
+	/// Retained for call-site compatibility; mode is always `PersistentLink`.
+	pub fn with_mode(
+		app_name: impl Into<String>,
+		aspects: Vec<String>,
+		_mode: LinkMode,
+	) -> Self {
+		Self::new(app_name, aspects)
 	}
 }
 
@@ -212,9 +173,8 @@ struct Registry {
 	/// debug/tracing only; the live source-of-truth is
 	/// `Transport::has_path`.
 	ready: HashMap<Vec<u8>, Instant>,
-	/// Live `LinkHandle`s for [`LinkMode::PersistentLink`] destinations.
-	/// PathRace destinations are never present here. At most one entry
-	/// per destination (single-attempt CAS invariant).
+	/// Live outbound `LinkHandle`s. At most one entry per destination
+	/// (single-attempt CAS invariant).
 	links: HashMap<Vec<u8>, LinkHandle>,
 	/// Peer-initiated (inbound) links. Populated by
 	/// [`AppLinks::register_inbound`] from the LXMF delivery-destination
@@ -361,25 +321,19 @@ impl AppLinks {
 
 	// ─── Public lifecycle ───────────────────────────────────────────────
 
-	/// Open an app link for `dest_hash` in [`LinkMode::PersistentLink`].
+	/// Open a persistent app link to `dest_hash`.
 	///
-	/// Always uses `PersistentLink` mode — builds and holds a real outbound
-	/// `Link` to the destination so the caller owns the keepalive cycle and
-	/// always has a live link handle without rebuilding per-send. The status
-	/// callback fires `APP_LINK_ACTIVE` with `Some(LinkHandle)` when the link
-	/// reaches `STATE_ACTIVE`.
+	/// Registers the destination, races for a live path (≤5 s), then builds
+	/// and holds a real outbound `Link`.  The link is automatically
+	/// re-established on close.  Status callback fires `APP_LINK_ACTIVE`
+	/// with `Some(LinkHandle)` once the link reaches `STATE_ACTIVE`.
 	pub fn open(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
 		Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PersistentLink);
 	}
 
-	/// Open an app link for `dest_hash` in [`LinkMode::PersistentLink`].
-	///
-	/// Convenience shorthand for [`Self::open_with_mode`] — registers
-	/// the destination so that AppLinks builds and holds a real outbound
-	/// `Link` to it (re-establishing on close, with a single-attempt
-	/// CAS gate that prevents orphan handles).
+	/// Alias for [`Self::open`] — retained for call-site compatibility.
 	pub fn open_persistent(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
-		Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PersistentLink);
+		Self::open(dest_hash, app_name, aspects);
 	}
 
 	/// Open an app link for `dest_hash` in `mode`.
@@ -472,67 +426,42 @@ impl AppLinks {
 
 	/// Snapshot status for `dest_hash`.  See `APP_LINK_*` constants.
 	///
-	/// `PathRace` mode:
-	///   * `APP_LINK_NONE` — destination is not registered.
-	///   * `APP_LINK_ACTIVE` — a path is known.
-	///   * `APP_LINK_PATH_REQUESTED` — `establish` is mid-race.
-	///   * `APP_LINK_DISCONNECTED` — registered, no path, no race.
-	///
-	/// `PersistentLink` mode:
-	///   * `APP_LINK_NONE` — destination is not registered.
-	///   * `APP_LINK_ACTIVE` — held `LinkHandle` reports `STATE_ACTIVE`.
-	///   * `APP_LINK_ESTABLISHING` — handle exists but link is not yet
-	///     `STATE_ACTIVE` (path-race won, `Link::initiate()` dispatched).
-	///   * `APP_LINK_PATH_REQUESTED` — `establish` is mid-race
-	///     (no `LinkHandle` yet).
-	///   * `APP_LINK_DISCONNECTED` — registered, no link, no race.
+	///   * `APP_LINK_NONE`           — destination is not registered.
+	///   * `APP_LINK_PATH_REQUESTED` — path-race is in flight, no link yet.
+	///   * `APP_LINK_ESTABLISHING`   — link handle exists, not yet `STATE_ACTIVE`.
+	///   * `APP_LINK_ACTIVE`         — held `LinkHandle` reports `STATE_ACTIVE`.
+	///   * `APP_LINK_DISCONNECTED`   — registered, no link, no race.
 	pub fn status(dest_hash: &[u8]) -> u8 {
-		let (mode, registered, ready, in_flight, link) = {
+		let (registered, in_flight, link) = {
 			let reg = match REGISTRY.lock() {
 				Ok(g) => g,
 				Err(_) => return APP_LINK_NONE,
 			};
 			let spec = reg.specs.get(dest_hash);
 			let registered = spec.is_some();
-			let mode = spec.map(|s| s.mode).unwrap_or(LinkMode::PathRace);
 			let in_flight = spec
 				.map(|s| s.attempt_in_flight.load(Ordering::Acquire))
 				.unwrap_or(false);
-			let ready = reg.ready.contains_key(dest_hash);
 			let link = reg.links.get(dest_hash).cloned();
-			(mode, registered, ready, in_flight, link)
+			(registered, in_flight, link)
 		};
 		if !registered {
 			return APP_LINK_NONE;
 		}
-		match mode {
-			LinkMode::PathRace => {
-				if ready && Transport::has_path(dest_hash) {
-					return APP_LINK_ACTIVE;
-				}
-				if in_flight {
-					return APP_LINK_PATH_REQUESTED;
-				}
-				APP_LINK_DISCONNECTED
+		if let Some(handle) = link {
+			if handle.status() == STATE_ACTIVE {
+				return APP_LINK_ACTIVE;
 			}
-			LinkMode::PersistentLink => {
-				if let Some(handle) = link {
-					if handle.status() == STATE_ACTIVE {
-						return APP_LINK_ACTIVE;
-					}
-					return APP_LINK_ESTABLISHING;
-				}
-				if in_flight {
-					return APP_LINK_PATH_REQUESTED;
-				}
-				APP_LINK_DISCONNECTED
-			}
+			return APP_LINK_ESTABLISHING;
 		}
+		if in_flight {
+			return APP_LINK_PATH_REQUESTED;
+		}
+		APP_LINK_DISCONNECTED
 	}
 
-	/// Returns the live `LinkHandle` for `dest_hash` if one is held by
-	/// the registry. Only ever populated for [`LinkMode::PersistentLink`]
-	/// destinations; always `None` for `PathRace`.
+	/// Returns the live outbound `LinkHandle` for `dest_hash` if one is held
+	/// by the registry.
 	pub fn get_handle(dest_hash: &[u8]) -> Option<LinkHandle> {
 		REGISTRY
 			.lock()
@@ -1071,22 +1000,19 @@ impl AppLinks {
 		let dest_owned = dest_hash.to_vec();
 		let in_flight = spec.attempt_in_flight.clone();
 		let ever_established = spec.ever_established.clone();
-		let mode = spec.mode;
 		let app_name = spec.app_name.clone();
 		let aspects = spec.aspects.clone();
 		std::thread::Builder::new()
 			.name("app_links_race".into())
 			.spawn(move || {
-				// PersistentLink only: expire any stale disk-cached path so
-				// race_path always resolves via the relay that *currently* has
-				// a route to the destination.  Without this, a cached path may
-				// point to a relay that no longer knows the destination; the
-				// LINKREQUEST is silently dropped by that relay and never
-				// receives an LRPROOF, causing an 18 s timeout per attempt.
+				// Expire any stale disk-cached path so race_path always
+				// resolves via the relay that *currently* has a route to the
+				// destination.  Without this, a cached path may point to a
+				// relay that no longer knows the destination; the LINKREQUEST
+				// is silently dropped and never receives an LRPROOF, causing
+				// an 18 s timeout per attempt.
 				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-				if mode == LinkMode::PersistentLink {
-					crate::transport::Transport::expire_path(&dest_owned);
-				}
+				crate::transport::Transport::expire_path(&dest_owned);
 
 				// The race itself; ≤ LIVENESS_BUDGET (5 s, §1).
 				// `liveness::race_path` is the same primitive used by
@@ -1124,34 +1050,17 @@ impl AppLinks {
 							false,
 						);
 
-						match mode {
-							LinkMode::PathRace => {
-								// Path-race mode: READY = path arrived.
-								// Release the in-flight gate before
-								// notifying — the callback may itself
-								// trigger another establish.
-								in_flight.store(false, Ordering::Release);
-								for cb in &cbs {
-									cb(&dest_owned, APP_LINK_ACTIVE, None);
-								}
-							}
-							LinkMode::PersistentLink => {
-								// Persistent mode: build + hold a real
-								// `Link`. The in-flight gate stays armed
-								// through the entire
-								// `new_outbound → initiate → ACTIVE | CLOSED`
-								// cycle so a concurrent trigger cannot
-								// create a second handle for the same
-								// destination (orphan-link prevention).
-								Self::start_persistent_link(
-									dest_owned.clone(),
-									app_name,
-									aspects,
-									in_flight.clone(),
-									cbs.clone(),
-								);
-							}
-						}
+						// Path won: build + hold a real Link. The in-flight gate
+						// stays armed through new_outbound → initiate → ACTIVE|CLOSED
+						// so a concurrent trigger cannot create a second handle
+						// (orphan-link prevention).
+						Self::start_persistent_link(
+							dest_owned.clone(),
+							app_name,
+							aspects,
+							in_flight.clone(),
+							cbs.clone(),
+						)
 					}
 					Err(e) => {
 						in_flight.store(false, Ordering::Release);
