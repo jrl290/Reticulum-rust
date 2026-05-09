@@ -306,9 +306,10 @@ impl TcpClientInterface {
             .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
 
         // Set keepalive and timeouts
+        // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
         #[cfg(any(target_os = "linux", target_os = "android"))]
         self.set_socket_options_linux(&stream)?;
-        
+
         #[cfg(target_os = "macos")]
         self.set_socket_options_macos(&stream)?;
 
@@ -329,6 +330,7 @@ impl TcpClientInterface {
         Ok(())
     }
 
+    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(target_os = "macos")]
     fn set_socket_options_macos(&self, stream: &TcpStream) -> Result<(), String> {
         Self::apply_keepalive(stream, self.i2p_tunneled);
@@ -371,6 +373,7 @@ impl TcpClientInterface {
         }
     }
 
+    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(target_os = "macos")]
     fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
         use std::os::unix::io::AsRawFd;
@@ -394,6 +397,7 @@ impl TcpClientInterface {
         }
     }
 
+    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) {
         // No platform-specific keepalive support compiled in.
@@ -729,6 +733,7 @@ impl TcpClientInterface {
         rc == 0 && len > 0 && buf[0] == TCP_ESTABLISHED
     }
 
+    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(target_os = "macos")]
     fn socket_is_established(fd: std::os::unix::io::RawFd) -> bool {
         // TCP_CONNECTION_INFO.tcpi_state is the first byte of the struct.
@@ -749,6 +754,7 @@ impl TcpClientInterface {
         rc == 0 && len > 0 && buf[0] == TCPS_ESTABLISHED
     }
 
+    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn socket_is_established(_fd: std::os::unix::io::RawFd) -> bool {
         true // Unknown platform — let other mechanisms detect failure.
@@ -778,6 +784,17 @@ impl TcpClientInterface {
         }
 
         thread::spawn(move || {
+            // First iteration of the outer reconnect loop is the *initial*
+            // connection — `reticulum.rs` already issued the inline
+            // synthesize_tunnel during the connect path, so firing again
+            // here would put two identical synthesis packets on the wire
+            // back-to-back. Skip on first iteration; fire on every
+            // subsequent iteration (i.e. after a reconnect, where the
+            // reticulum.rs path does NOT re-run).
+            // NEVER REMOVE EVER — the read-loop synthesize is the canonical
+            // post-reconnect fire site (matches Python TCPInterface.reconnect
+            // → synthesize_tunnel). Removing it breaks reconnect bindings.
+            let mut first_iter = true;
             // ── Outer loop: read → reconnect → read → … ─────────────────────
             // We never spawn a second thread.  After a successful reconnect we
             // simply `continue 'running` to re-clone the new socket and start
@@ -845,11 +862,17 @@ impl TcpClientInterface {
                 // connection and cannot route PATH_RESPONSE packets back to us, so
                 // every PATH_REQUEST goes unanswered and no links can be established.
                 if !kiss_framing {
-                    let (iname, irepr) = {
-                        let iface = interface.lock().unwrap();
-                        (iface.base.name.clone().unwrap_or_default(), iface.to_string())
-                    };
-                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+                    if first_iter {
+                        // Initial connection: reticulum.rs already issued the
+                        // synthesize_tunnel inline. Skip to avoid duplicate.
+                        first_iter = false;
+                    } else {
+                        let (iname, irepr) = {
+                            let iface = interface.lock().unwrap();
+                            (iface.base.name.clone().unwrap_or_default(), iface.to_string())
+                        };
+                        crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+                    }
                 }
 
                 // Wake from blocking read every READ_WAKE_INTERVAL seconds so

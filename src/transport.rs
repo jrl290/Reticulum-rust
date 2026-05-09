@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
@@ -605,6 +605,30 @@ static TRANSPORT_TASK_TX: Lazy<Mutex<std::sync::mpsc::Sender<TransportTask>>> = 
     Mutex::new(tx)
 });
 
+/// Event source for "a path was added or refreshed in `path_table`".
+///
+/// The `Mutex<u64>` is a monotonic generation counter; it is incremented
+/// every time `path_table.insert(...)` runs (i.e. every PATH_RESPONSE or
+/// announce that establishes/refreshes a route). Waiters can use the
+/// counter as a wakeup-fairness predicate so that an insert happening
+/// between their pre-check and `wait_timeout` does not get lost.
+///
+/// Mirrors the pattern of `RECONNECT_NUDGE` in `interfaces/tcp_interface.rs`.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4 (no timeout tuning):
+/// callers (e.g. `app_links::race_path`) use this to wake on the actual
+/// PATH_RESPONSE event instead of polling on a clock.
+pub(crate) static PATH_ADDED_NOTIFY: Lazy<(Mutex<u64>, Condvar)> =
+    Lazy::new(|| (Mutex::new(0), Condvar::new()));
+
+/// Called from every site that mutates `path_table` with a new/refreshed
+/// entry. Bumps the generation counter and wakes all waiters.
+pub(crate) fn notify_path_added() {
+    if let Ok(mut gen) = PATH_ADDED_NOTIFY.0.lock() {
+        *gen = gen.wrapping_add(1);
+    }
+    PATH_ADDED_NOTIFY.1.notify_all();
+}
+
 /// Submit a task to the transport-task worker.  Returns immediately.
 pub(crate) fn spawn_transport_task<F>(task: F)
 where
@@ -1113,7 +1137,7 @@ impl Transport {
             }
             log(
                 &format!("Re-announcing {} to interface {}", crate::hexrep(&dest.hash, true), iface),
-                LOG_DEBUG, false, false,
+                LOG_NOTICE, false, false,
             );
             if dest.announce(None, false, Some(iface.clone()), None, true).is_ok() {
                 announced.push(dest.hash.clone());
@@ -1494,7 +1518,7 @@ impl Transport {
         if transitioned_up {
             log(
                 &format!("Interface {} transitioned online — re-announcing local destinations", name),
-                LOG_DEBUG, false, false,
+                LOG_NOTICE, false, false,
             );
             Self::announce_all_destinations(name);
         }
@@ -1525,7 +1549,7 @@ impl Transport {
                         "Interface {} transitioned offline — re-announcing via {} other interface(s)",
                         name, other_ifaces.len()
                     ),
-                    LOG_DEBUG, false, false,
+                    LOG_NOTICE, false, false,
                 );
                 for iface_name in &other_ifaces {
                     Self::announce_all_destinations(iface_name);
@@ -1657,38 +1681,39 @@ impl Transport {
             }
         }
         
-        let _ = std::io::stderr().flush();
+        let is_from_local_client = Transport::from_local_client(packet);
 
-        // Diagnostic: log the source interface, requesting transport id and
-        // first 8 bytes of the tag so operators can identify a path-request
-        // flood source from rfed.log without needing a packet capture.  Kept
-        // at NOTICE because it fires per-request and we want it visible while
-        // diagnosing the current "Linking…" stall.  Demote/remove once the
-        // flood source is identified and addressed.
-        {
-            let iface = packet.receiving_interface.as_deref().unwrap_or("?");
-            let dst8 = crate::hexrep(&destination_hash[..destination_hash.len().min(4)], false);
-            let tag8 = tag_bytes
-                .as_ref()
-                .map(|t| crate::hexrep(&t[..t.len().min(8)], false))
-                .unwrap_or_else(|| "-".to_string());
-            let req8 = requesting_transport_instance
-                .map(|r| crate::hexrep(&r[..r.len().min(8)], false))
-                .unwrap_or_else(|| "-".to_string());
+        // If the requested destination is one of ours, always respond —
+        // even if the request has no tag (tagless format used by some clients).
+        // For all other cases, use the tag to deduplicate relay responses.
+        let is_own_dest = {
+            let state = TRANSPORT.lock().unwrap();
+            state.destinations.iter().any(|d| d.hash == destination_hash)
+        };
+        if is_own_dest {
             crate::log(
                 &format!(
-                    "[PR] iface={} dst={} req={} tag={} hops={}",
-                    iface, dst8, req8, tag8, packet.hops
+                    "[PR-SELF] iface={} dst={} hops={}",
+                    packet.receiving_interface.as_deref().unwrap_or("?"),
+                    crate::hexrep(&destination_hash[..destination_hash.len().min(4)], false),
+                    packet.hops
                 ),
                 crate::LOG_NOTICE,
                 false,
                 false,
             );
+            Transport::path_request(
+                destination_hash.to_vec(),
+                is_from_local_client,
+                packet.receiving_interface.clone(),
+                requesting_transport_instance.map(|b| b.to_vec()),
+                tag_bytes,
+            );
+            return;
         }
 
         if let Some(tag_bytes) = tag_bytes {
             let unique_tag = [destination_hash, tag_bytes.as_slice()].concat();
-            
             let is_new = {
                 let mut state = TRANSPORT.lock().unwrap();
                 if state.discovery_pr_tags_set.insert(unique_tag.clone()) {
@@ -1698,10 +1723,7 @@ impl Transport {
                     false
                 }
             };
-            
             if is_new {
-                let is_from_local_client = Transport::from_local_client(packet);
-                
                 Transport::path_request(
                     destination_hash.to_vec(),
                     is_from_local_client,
@@ -1709,11 +1731,9 @@ impl Transport {
                     requesting_transport_instance.map(|b| b.to_vec()),
                     Some(tag_bytes),
                 );
-            } else {
             }
-        } else {
         }
-        let _ = std::io::stderr().flush();
+        // tagless path requests for non-owned destinations: nothing to do
     }
     
     fn from_local_client(packet: &Packet) -> bool {
@@ -1785,6 +1805,13 @@ impl Transport {
         if let Some(idx) = local_dest_index {
             if let Some(mut dest) = state.destinations.get(idx).cloned() {
                 drop(state);
+                log(
+                    &format!(
+                        "[PR-SELF] responding with announce for {} (own destination)",
+                        crate::hexrep(&destination_hash, true)
+                    ),
+                    LOG_NOTICE, false, false,
+                );
                 let _ = dest.announce(None, true, attached_interface, tag, true);
                 let mut state = TRANSPORT.lock().unwrap();
                 if idx < state.destinations.len() {
@@ -3067,7 +3094,7 @@ impl Transport {
             match packet.send() {
                 Ok(_) => log(
                     &format!("Published-destination refresh: announced {}", crate::hexrep(&hash, true)),
-                    LOG_DEBUG, false, false,
+                    LOG_NOTICE, false, false,
                 ),
                 Err(e) => log(
                     &format!("Published-destination refresh: announce send failed for {}: {}", crate::hexrep(&hash, true), e),
@@ -3803,6 +3830,119 @@ impl Transport {
         }
     }
 
+    /// Block the calling thread until either:
+    ///   * a path to `destination_hash` is available
+    ///     (`Self::has_path` returns true), or
+    ///   * `budget` elapses.
+    ///
+    /// Wakes on the actual PATH_RESPONSE / announce event via the
+    /// `PATH_ADDED_NOTIFY` Condvar, NOT on a polling clock.
+    /// Returns true iff a usable path is present at return time.
+    ///
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4 (no timeout tuning).
+    /// `budget` is an upper bound on resource holding, not a poll interval.
+    pub fn wait_for_path(destination_hash: &[u8], budget: Duration) -> bool {
+        // Fast path: already have it.
+        if Self::has_path(destination_hash) {
+            return true;
+        }
+        let deadline = Instant::now() + budget;
+        let (lock, cvar) = &*PATH_ADDED_NOTIFY;
+        let mut gen_seen = match lock.lock() {
+            Ok(g) => *g,
+            Err(_) => return Self::has_path(destination_hash),
+        };
+        loop {
+            // Re-check under whatever wake just happened (or initial state).
+            if Self::has_path(destination_hash) {
+                return true;
+            }
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => return Self::has_path(destination_hash),
+            };
+            // Acquire the notify lock and wait until the generation
+            // counter advances (someone called `notify_path_added`)
+            // or the budget expires.
+            let guard = match lock.lock() {
+                Ok(g) => g,
+                Err(_) => return Self::has_path(destination_hash),
+            };
+            let (new_guard, timeout) = match cvar.wait_timeout_while(
+                guard, remaining, |gen| *gen == gen_seen,
+            ) {
+                Ok(r) => r,
+                Err(_) => return Self::has_path(destination_hash),
+            };
+            gen_seen = *new_guard;
+            drop(new_guard);
+            if timeout.timed_out() {
+                return Self::has_path(destination_hash);
+            }
+            // Spurious wake or insert for a different dest: loop and re-check.
+        }
+    }
+
+    /// Same event-driven wait as [`Self::wait_for_path`], but requires the
+    /// path to have been confirmed by a PATH_RESPONSE / announce observed in
+    /// this process. Cached path-table entries loaded from disk do not count.
+    ///
+    /// Propagation-node persistent links use this as their readiness signal:
+    /// the server has proven it can send traffic back to us before we send
+    /// LRREQ. No sleeps, no polling, no retry loop.
+    ///
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §5.
+    pub fn wait_for_path_verified_this_session(destination_hash: &[u8], budget: Duration) -> bool {
+        if Self::has_path(destination_hash) && Self::is_path_verified_this_session(destination_hash) {
+            return true;
+        }
+        let deadline = Instant::now() + budget;
+        let (lock, cvar) = &*PATH_ADDED_NOTIFY;
+        let mut gen_seen = match lock.lock() {
+            Ok(g) => *g,
+            Err(_) => {
+                return Self::has_path(destination_hash)
+                    && Self::is_path_verified_this_session(destination_hash);
+            }
+        };
+        loop {
+            if Self::has_path(destination_hash) && Self::is_path_verified_this_session(destination_hash) {
+                return true;
+            }
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => {
+                    return Self::has_path(destination_hash)
+                        && Self::is_path_verified_this_session(destination_hash);
+                }
+            };
+            let guard = match lock.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    return Self::has_path(destination_hash)
+                        && Self::is_path_verified_this_session(destination_hash);
+                }
+            };
+            let (new_guard, timeout) = match cvar.wait_timeout_while(
+                guard,
+                remaining,
+                |gen| *gen == gen_seen,
+            ) {
+                Ok(r) => r,
+                Err(_) => {
+                    return Self::has_path(destination_hash)
+                        && Self::is_path_verified_this_session(destination_hash);
+                }
+            };
+            gen_seen = *new_guard;
+            drop(new_guard);
+            if timeout.timed_out() {
+                return Self::has_path(destination_hash)
+                    && Self::is_path_verified_this_session(destination_hash);
+            }
+        }
+    }
+
     /// Hop count for the currently-cached path to `destination_hash`, or
     /// `None` if no live path entry exists. Live = present in path_table
     /// AND not soft-expired (timestamp != 0). Used by `app_links` to
@@ -4148,9 +4288,14 @@ impl Transport {
                     packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
             }
         } else {
-            crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
-                packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-                packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+            // Suppress DATA hops=0 — these are high-volume local-interface
+            // keepalive/control packets and contribute nothing to ops triage.
+            let suppress = packet.packet_type == DATA && packet.hops == 0;
+            if !suppress {
+                crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
+                    packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                    packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+            }
         }
         let _trace_dest_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
         let _trace_is_target = _trace_dest_hex.starts_with("6b9f66014d9853");
@@ -4595,6 +4740,13 @@ impl Transport {
                         // NEVER REMOVE EVER — see field doc on
                         // `path_verified_this_session`.
                         state.path_verified_this_session.insert(destination_hash.clone());
+                        // Wake any race_path waiter that is blocked on this
+                        // exact destination. This must happen AFTER both
+                        // `path_table` and `path_verified_this_session` have
+                        // been updated so verified-path waiters see a coherent
+                        // server-response event.
+                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
+                        crate::transport::notify_path_added();
                         crate::announce_log::count_path_added();
                         if crate::announce_log::is_whitelisted(Some(destination_hash.as_slice())) {
                             crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
@@ -5321,19 +5473,17 @@ impl Transport {
                 false,
                 0,
             );
-            // Diagnostic: emit a single notice line so retichat.log shows
-            // both that the request went to the wire and which interface
-            // (if any) it was pinned to. Without this, a path-request that
-            // never arrives is indistinguishable from a peer with no
-            // cached path — both produce silence on the inbound side. The
-            // 5 s send-latency rule then fires with no actionable clue.
+            // Diagnostic: emit a single line so we can see (when debugging
+            // at LOG_DEBUG) both that the request went to the wire and which
+            // interface it was pinned to. Without this, a path-request that
+            // never arrives is indistinguishable from a peer with no cached
+            // path — both produce silence on the inbound side. The 5 s
+            // send-latency rule then fires with no actionable clue.
             //
-            // Logged at NOTICE because it's low-volume (deduped via
-            // `path_requests` table just above) and direct evidence of
-            // intent vs. wire reality. NEVER REMOVE EVER —
-            // see DESIGN_PRINCIPLES.md §1 (we cannot meet the 5 s send
-            // budget without being able to attribute path-request
-            // failures to either "didn't send" or "no peer answered").
+            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+            // Kept at LOG_DEBUG (not NOTICE) to avoid log spam in normal
+            // operation; raise to LOG_NOTICE temporarily when diagnosing
+            // path-request failures.
             let send_result = packet.send();
             crate::log(
                 &format!(
@@ -5342,7 +5492,7 @@ impl Transport {
                     attached_interface,
                     send_result.is_ok(),
                 ),
-                crate::LOG_NOTICE, false, false,
+                crate::LOG_DEBUG, false, false,
             );
             if let Err(e) = send_result {
                 crate::log(
@@ -6364,6 +6514,9 @@ mod tests {
             ];
             state.path_table.insert(dest_hash.clone(), path_entry);
         }
+        // Synthetic 2-hop entry was just installed; wake race_path waiters.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
+        crate::transport::notify_path_added();
 
         // Build a LINKREQUEST packet with HEADER_2 and our transport_id
         // A LINKREQUEST data field needs at least ECPUBSIZE (32) bytes for
