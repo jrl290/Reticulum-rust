@@ -373,13 +373,14 @@ impl TcpClientInterface {
         }
     }
 
-    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(target_os = "macos")]
     fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
         use std::os::unix::io::AsRawFd;
         use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
 
         const TCP_KEEPALIVE: i32 = 0x10;
+        const TCP_KEEPINTVL: i32 = 0x101;
+        const TCP_KEEPCNT: i32 = 0x102;
 
         unsafe {
             let fd = stream.as_raw_fd();
@@ -387,17 +388,26 @@ impl TcpClientInterface {
 
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
 
-            let keepidle = if !i2p_tunneled {
-                Self::TCP_PROBE_AFTER as i32
+            let (keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
+                (
+                    Self::TCP_PROBE_AFTER as i32,
+                    Self::TCP_PROBE_INTERVAL as i32,
+                    Self::TCP_PROBES as i32,
+                )
             } else {
-                Self::I2P_PROBE_AFTER as i32
+                (
+                    Self::I2P_PROBE_AFTER as i32,
+                    Self::I2P_PROBE_INTERVAL as i32,
+                    Self::I2P_PROBES as i32,
+                )
             };
 
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, std::mem::size_of::<i32>() as u32);
         }
     }
 
-    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) {
         // No platform-specific keepalive support compiled in.
@@ -733,7 +743,6 @@ impl TcpClientInterface {
         rc == 0 && len > 0 && buf[0] == TCP_ESTABLISHED
     }
 
-    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(target_os = "macos")]
     fn socket_is_established(fd: std::os::unix::io::RawFd) -> bool {
         // TCP_CONNECTION_INFO.tcpi_state is the first byte of the struct.
@@ -754,10 +763,19 @@ impl TcpClientInterface {
         rc == 0 && len > 0 && buf[0] == TCPS_ESTABLISHED
     }
 
-    // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn socket_is_established(_fd: std::os::unix::io::RawFd) -> bool {
         true // Unknown platform — let other mechanisms detect failure.
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn read_watchdog_enforced() -> bool {
+        false
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn read_watchdog_enforced() -> bool {
+        true
     }
 
     /// How often the read loop wakes from `read()` to poll the
@@ -1048,7 +1066,7 @@ impl TcpClientInterface {
                             }
 
                             let idle_secs = last_data_time.elapsed().as_secs();
-                            if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
+                            if Self::read_watchdog_enforced() && idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
                                 crate::log(
                                     &format!(
                                         "TCP watchdog: no data received for {}s (threshold {}s), connection appears dead — triggering reconnect",
