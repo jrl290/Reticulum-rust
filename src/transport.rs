@@ -3127,6 +3127,17 @@ impl Transport {
         let mut state = TRANSPORT.lock().unwrap();
         state.interfaces.sort_by(|a, b| b.bitrate.partial_cmp(&a.bitrate).unwrap_or(std::cmp::Ordering::Equal));
     }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn inbound_silence_warning_enforced(iface: &InterfaceStub) -> bool {
+        !iface.repr.starts_with("TCPInterface[")
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn inbound_silence_warning_enforced(_iface: &InterfaceStub) -> bool {
+        true
+    }
+
     pub fn outbound(packet: &mut Packet) -> bool {
         // Step 2 of the transport refactor (TRANSPORT_REFACTOR_PLAN.md):
         //
@@ -3368,9 +3379,11 @@ impl Transport {
         // receipt is created so we don't queue receipts for dead sends.
         //
         // Fix 5: while we're walking interfaces, also detect "outbound
-        // succeeds but no inbound for >30 s" — a half-open peer signal.
-        // Emit a [Error] once per minute per interface so the wedge is
-        // visible in the log instead of silent.
+        // succeeds but no inbound for >30 s" for transports that do not
+        // have kernel-level socket state available here. TCP interfaces on
+        // Linux/Android/macOS use OS-level socket reporting in the read loop
+        // instead, so this elapsed-time warning would just be misleading log
+        // noise there.
         let now_secs = now();
         let mut filtered: Vec<(String, Vec<u8>)> = Vec::with_capacity(transmissions.len());
         let mut offline_drops: Vec<String> = Vec::new();
@@ -3401,7 +3414,7 @@ impl Transport {
                 .iter_mut()
                 .find(|i| i.name == iface_name)
             {
-                if iface.last_inbound_at > 0.0 {
+                if Self::inbound_silence_warning_enforced(iface) && iface.last_inbound_at > 0.0 {
                     let silent_for = now_secs - iface.last_inbound_at;
                     if silent_for > 30.0 && now_secs - iface.last_inbound_warn_at > 60.0 {
                         iface.last_inbound_warn_at = now_secs;
@@ -6913,6 +6926,38 @@ mod tests {
 
     fn uninstall_sync_outbound_handler(iface_name: &str) {
         OUTBOUND_HANDLERS.lock().unwrap().remove(iface_name);
+    }
+
+    #[test]
+    fn inbound_silence_warning_kept_for_non_tcp_interfaces() {
+        let iface = InterfaceStub {
+            repr: "SerialInterface[test]".to_string(),
+            ..InterfaceStub::default()
+        };
+
+        assert!(Transport::inbound_silence_warning_enforced(&iface));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn inbound_silence_warning_disabled_for_tcp_interfaces() {
+        let iface = InterfaceStub {
+            repr: "TCPInterface[test/192.0.2.1:4242]".to_string(),
+            ..InterfaceStub::default()
+        };
+
+        assert!(!Transport::inbound_silence_warning_enforced(&iface));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[test]
+    fn inbound_silence_warning_kept_for_tcp_interfaces_without_os_support() {
+        let iface = InterfaceStub {
+            repr: "TCPInterface[test/192.0.2.1:4242]".to_string(),
+            ..InterfaceStub::default()
+        };
+
+        assert!(Transport::inbound_silence_warning_enforced(&iface));
     }
 
     /// Snapshot/restore guard for `state.interfaces` so a test that mutates
