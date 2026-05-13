@@ -38,7 +38,7 @@ pub const SIGLENGTH: usize = KEYSIZE;
 pub const NAME_HASH_LENGTH: usize = 80;
 pub const TRUNCATED_HASHLENGTH: usize = crate::reticulum::TRUNCATED_HASHLENGTH;
 
-static KNOWN_RATCHETS: Lazy<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static KNOWN_RATCHETS: Lazy<Mutex<HashMap<Vec<u8>, RatchetEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static RATCHET_PERSIST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static KNOWN_DESTINATIONS: Lazy<Mutex<HashMap<Vec<u8>, KnownDestination>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static KNOWN_DESTINATIONS_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
@@ -160,6 +160,20 @@ pub fn get_random_hash() -> Vec<u8> {
 struct RatchetEntry {
     public_key: Vec<u8>,
     timestamp: u64,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn known_ratchet_max_age() -> u64 {
+    let receiver_window = (crate::destination::RATCHET_COUNT.saturating_sub(1) as u64)
+        .saturating_mul(crate::destination::RATCHET_INTERVAL);
+    receiver_window.min(RATCHET_EXPIRY)
+}
+
+fn ratchet_entry_fresh(entry: &RatchetEntry, now: u64) -> bool {
+    now <= entry.timestamp.saturating_add(known_ratchet_max_age())
 }
 
 /// Known destination data
@@ -593,9 +607,15 @@ impl Identity {
             return Err(format!("Invalid ratchet public key length: {}", ratchet_pub.len()));
         }
 
+        let now = unix_now_secs();
+        let entry = RatchetEntry {
+            public_key: ratchet_pub.to_vec(),
+            timestamp: now,
+        };
+
         let mut known = KNOWN_RATCHETS.lock().unwrap();
         if let Some(existing) = known.get(destination_hash) {
-            if existing == ratchet_pub {
+            if existing.public_key == ratchet_pub && ratchet_entry_fresh(existing, now) {
                 return Ok(());
             }
         }
@@ -608,7 +628,7 @@ impl Identity {
             false,
         );
 
-        known.insert(destination_hash.to_vec(), ratchet_pub.to_vec());
+        known.insert(destination_hash.to_vec(), entry.clone());
         drop(known);
 
         if crate::transport::Transport::is_connected_to_shared_instance() {
@@ -616,7 +636,6 @@ impl Identity {
         }
 
         let destination_hash = destination_hash.to_vec();
-        let ratchet_pub = ratchet_pub.to_vec();
         thread::spawn(move || {
             let _lock = RATCHET_PERSIST_LOCK.lock().unwrap();
             let hexhash = crate::hexrep(&destination_hash, false);
@@ -626,10 +645,6 @@ impl Identity {
             }
             let outpath = ratchet_dir.join(format!("{}.out", hexhash));
             let finalpath = ratchet_dir.join(hexhash);
-            let entry = RatchetEntry {
-                public_key: ratchet_pub,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            };
             if let Ok(data) = rmp_serde::to_vec(&entry) {
                 if fs::write(&outpath, data).is_ok() {
                     let _ = fs::rename(outpath, finalpath);
@@ -641,8 +656,15 @@ impl Identity {
     }
 
     pub fn get_ratchet(destination_hash: &[u8]) -> Option<Vec<u8>> {
-        if let Some(ratchet) = KNOWN_RATCHETS.lock().unwrap().get(destination_hash).cloned() {
-            return Some(ratchet);
+        let now = unix_now_secs();
+        {
+            let mut known = KNOWN_RATCHETS.lock().unwrap();
+            if let Some(entry) = known.get(destination_hash).cloned() {
+                if ratchet_entry_fresh(&entry, now) {
+                    return Some(entry.public_key);
+                }
+                known.remove(destination_hash);
+            }
         }
 
         let hexhash = crate::hexrep(destination_hash, false);
@@ -653,12 +675,11 @@ impl Identity {
 
         if let Ok(data) = fs::read(&ratchet_path) {
             if let Ok(entry) = rmp_serde::from_slice::<RatchetEntry>(&data) {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                if now > entry.timestamp + RATCHET_EXPIRY {
+                if !ratchet_entry_fresh(&entry, now) {
                     let _ = fs::remove_file(&ratchet_path);
                     return None;
                 }
-                KNOWN_RATCHETS.lock().unwrap().insert(destination_hash.to_vec(), entry.public_key.clone());
+                KNOWN_RATCHETS.lock().unwrap().insert(destination_hash.to_vec(), entry.clone());
                 return Some(entry.public_key);
             }
         }
@@ -1125,4 +1146,29 @@ mod tests {
         
         assert_eq!(&decrypted[..], expected_plaintext, "Decrypted plaintext must match");
     }
+
+            #[test]
+            fn test_known_ratchet_max_age_matches_receiver_window() {
+                let receiver_window = (crate::destination::RATCHET_COUNT.saturating_sub(1) as u64)
+                    .saturating_mul(crate::destination::RATCHET_INTERVAL);
+                assert_eq!(known_ratchet_max_age(), receiver_window);
+                assert!(known_ratchet_max_age() < RATCHET_EXPIRY);
+            }
+
+            #[test]
+            fn test_ratchet_entry_fresh_uses_receiver_window() {
+                let max_age = known_ratchet_max_age();
+                let now = max_age + 100;
+                let fresh = RatchetEntry {
+                    public_key: vec![0u8; 32],
+                    timestamp: now - max_age,
+                };
+                let stale = RatchetEntry {
+                    public_key: vec![0u8; 32],
+                    timestamp: now - max_age - 1,
+                };
+
+                assert!(ratchet_entry_fresh(&fresh, now));
+                assert!(!ratchet_entry_fresh(&stale, now));
+            }
 }
