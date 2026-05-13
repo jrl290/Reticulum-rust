@@ -244,6 +244,15 @@ pub extern "C" fn rns_transport_has_path(dest_hash: *const u8, len: u32) -> i32 
     if ffi::transport_has_path(&h) { 1 } else { 0 }
 }
 
+/// Check whether the destination's identity (public key) is in the
+/// known-destinations table. Outbound encrypted send needs identity,
+/// not just a path.  Returns 1/0.
+#[no_mangle]
+pub extern "C" fn rns_identity_known(dest_hash: *const u8, len: u32) -> i32 {
+    let h = slice_from_raw(dest_hash, len);
+    if ffi::identity_known(&h) { 1 } else { 0 }
+}
+
 /// Request a path to a destination.  Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn rns_transport_request_path(dest_hash: *const u8, len: u32) -> i32 {

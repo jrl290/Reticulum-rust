@@ -269,6 +269,13 @@ pub fn transport_has_path(dest_hash: &[u8]) -> bool {
     Transport::has_path(dest_hash)
 }
 
+/// Check whether the destination's identity (public key) is in the
+/// known-destinations table. Outbound link/packet construction needs
+/// the identity to encrypt — `transport_has_path` is not sufficient.
+pub fn identity_known(dest_hash: &[u8]) -> bool {
+    Identity::recall_public_key(dest_hash).is_some()
+}
+
 /// Request a path to a destination hash.
 pub fn transport_request_path(dest_hash: &[u8]) -> Result<(), String> {
     Transport::request_path(dest_hash, None, None, None, None);
