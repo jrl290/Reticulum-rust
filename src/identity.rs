@@ -448,7 +448,7 @@ impl Identity {
             ratchet_info,
             hexrep(salt, false),
             hexrep(ephemeral_pub.as_bytes(), false)
-        ), crate::LOG_DEBUG, false, false);
+        ), crate::LOG_NOTICE, false, false);
         
         let token = Token::new(&derived_key)?;
         let ciphertext = token.encrypt(plaintext)?;
@@ -456,7 +456,7 @@ impl Identity {
                 // The actual HMAC is the last 32 bytes of ciphertext
                 if ciphertext.len() >= 32 {
                     let hmac = &ciphertext[ciphertext.len() - 32..];
-                    crate::log(&format!("[ENCRYPT] hmac_first_16={}", hexrep(&hmac[..16], false)), crate::LOG_DEBUG, false, false);
+                    crate::log(&format!("[ENCRYPT] hmac_first_16={}", hexrep(&hmac[..16], false)), crate::LOG_NOTICE, false, false);
                 }
         
         
@@ -501,11 +501,11 @@ impl Identity {
                     let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
                     match self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
                         Ok(plaintext) => {
-                            crate::log(&format!("[DECRYPT] SUCCESS with dest_ratchet[{}]", idx), crate::LOG_DEBUG, false, false);
+                            crate::log(&format!("[DECRYPT] SUCCESS with dest_ratchet[{}]", idx), crate::LOG_NOTICE, false, false);
                             return Ok(plaintext);
                         }
                         Err(e) => {
-                            crate::log(&format!("[DECRYPT] dest_ratchet[{}] failed: {}", idx, e), crate::LOG_DEBUG, false, false);
+                            crate::log(&format!("[DECRYPT] dest_ratchet[{}] failed: {}", idx, e), crate::LOG_NOTICE, false, false);
                         }
                     }
                 }
@@ -517,11 +517,11 @@ impl Identity {
             let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
             match self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
                 Ok(plaintext) => {
-                    crate::log(&format!("[DECRYPT] SUCCESS with identity_ratchet[{}]", hexrep(ratchet_id, false)), crate::LOG_DEBUG, false, false);
+                    crate::log(&format!("[DECRYPT] SUCCESS with identity_ratchet[{}]", hexrep(ratchet_id, false)), crate::LOG_NOTICE, false, false);
                     return Ok(plaintext);
                 }
                 Err(e) => {
-                    crate::log(&format!("[DECRYPT] identity_ratchet[{}] failed: {}", hexrep(ratchet_id, false), e), crate::LOG_DEBUG, false, false);
+                    crate::log(&format!("[DECRYPT] identity_ratchet[{}] failed: {}", hexrep(ratchet_id, false), e), crate::LOG_NOTICE, false, false);
                 }
             }
         }
@@ -531,7 +531,7 @@ impl Identity {
         crate::log(&format!("[DECRYPT] trying main key, token_data_len={}", token_data.len()), crate::LOG_NOTICE, false, false);
         match self.decrypt_with_key(enc_prv, &ephemeral_pub, token_data) {
             Ok(plaintext) => {
-                crate::log("[DECRYPT] SUCCESS with main key", crate::LOG_DEBUG, false, false);
+                crate::log("[DECRYPT] SUCCESS with main key", crate::LOG_NOTICE, false, false);
                 Ok(plaintext)
             }
             Err(e) => {
