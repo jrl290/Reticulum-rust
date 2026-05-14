@@ -20,6 +20,7 @@ use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use crate::log;
+use crate::hexrep;
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcEnc = Encryptor<Aes256>;
@@ -437,9 +438,27 @@ impl Identity {
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
         
-        // Encrypt with Token
+        // Log encryption attempt (ratchet selection, ephemeral key, salt hash)
+        let ratchet_info = if ratchet.is_some() {
+            format!("ratchet[{}]", hexrep(&ratchet.unwrap()[..16], false))
+        } else {
+            "main_key".to_string()
+        };
+        crate::log(&format!("[ENCRYPT] {} salt={} ephemeral_pub={}", 
+            ratchet_info,
+            hexrep(salt, false),
+            hexrep(ephemeral_pub.as_bytes(), false)
+        ), crate::LOG_DEBUG, false, false);
+        
         let token = Token::new(&derived_key)?;
         let ciphertext = token.encrypt(plaintext)?;
+                // Log computed HMAC (first 16 bytes of the computed HMAC for debugging)
+                // The actual HMAC is the last 32 bytes of ciphertext
+                if ciphertext.len() >= 32 {
+                    let hmac = &ciphertext[ciphertext.len() - 32..];
+                    crate::log(&format!("[ENCRYPT] hmac_first_16={}", hexrep(&hmac[..16], false)), crate::LOG_DEBUG, false, false);
+                }
+        
         
         // Return: ephemeral_pub (32) + ciphertext
         let mut result = ephemeral_pub.as_bytes().to_vec();
@@ -477,28 +496,49 @@ impl Identity {
 
         // Try destination ratchet keys first (from Destination.ratchets rotation)
         if let Some(ratchets) = dest_ratchets {
-            for ratchet_prv_bytes in ratchets {
+            for (idx, ratchet_prv_bytes) in ratchets.iter().enumerate() {
                 if ratchet_prv_bytes.len() == 32 {
                     let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
-                    if let Ok(plaintext) = self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
-                        return Ok(plaintext);
+                    match self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
+                        Ok(plaintext) => {
+                            crate::log(&format!("[DECRYPT] SUCCESS with dest_ratchet[{}]", idx), crate::LOG_DEBUG, false, false);
+                            return Ok(plaintext);
+                        }
+                        Err(e) => {
+                            crate::log(&format!("[DECRYPT] dest_ratchet[{}] failed: {}", idx, e), crate::LOG_DEBUG, false, false);
+                        }
                     }
                 }
             }
         }
 
         // Try identity's own ratchet keys
-        for (_ratchet_id, ratchet_prv_bytes) in &self.ratchets {
+        for (ratchet_id, ratchet_prv_bytes) in &self.ratchets.clone() {
             let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
-            if let Ok(plaintext) = self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
-                return Ok(plaintext);
+            match self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
+                Ok(plaintext) => {
+                    crate::log(&format!("[DECRYPT] SUCCESS with identity_ratchet[{}]", hexrep(ratchet_id, false)), crate::LOG_DEBUG, false, false);
+                    return Ok(plaintext);
+                }
+                Err(e) => {
+                    crate::log(&format!("[DECRYPT] identity_ratchet[{}] failed: {}", hexrep(ratchet_id, false), e), crate::LOG_DEBUG, false, false);
+                }
             }
         }
 
         // Fall back to main encryption key
         let enc_prv = self.encryption_prv_key.as_ref().ok_or("Identity has no private key")?;
         crate::log(&format!("[DECRYPT] trying main key, token_data_len={}", token_data.len()), crate::LOG_NOTICE, false, false);
-        self.decrypt_with_key(enc_prv, &ephemeral_pub, token_data)
+        match self.decrypt_with_key(enc_prv, &ephemeral_pub, token_data) {
+            Ok(plaintext) => {
+                crate::log("[DECRYPT] SUCCESS with main key", crate::LOG_DEBUG, false, false);
+                Ok(plaintext)
+            }
+            Err(e) => {
+                crate::log(&format!("[DECRYPT] main key failed: {}", e), crate::LOG_NOTICE, false, false);
+                Err(e)
+            }
+        }
     }
 
     fn decrypt_with_key(
