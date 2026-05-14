@@ -513,7 +513,7 @@ impl Identity {
         }
 
         // Try identity's own ratchet keys
-        for (ratchet_id, ratchet_prv_bytes) in &self.ratchets.clone() {
+        for (ratchet_id, ratchet_prv_bytes) in &self.ratchets {
             let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
             match self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
                 Ok(plaintext) => {
