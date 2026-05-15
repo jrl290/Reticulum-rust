@@ -933,6 +933,24 @@ impl Transport {
         Some(packet.data[offset..].to_vec())
     }
 
+    fn extract_announce_ratchet(packet: &Packet) -> Option<Vec<u8>> {
+        if packet.context_flag != crate::packet::FLAG_SET {
+            return None;
+        }
+
+        let pubkey_len = crate::identity::KEYSIZE / 8;
+        let name_hash_len = crate::identity::NAME_HASH_LENGTH / 8;
+        let random_hash_len = 10usize;
+        let ratchet_len = crate::identity::RATCHETSIZE / 8;
+        let start = pubkey_len + name_hash_len + random_hash_len;
+        let end = start + ratchet_len;
+        if packet.data.len() < end {
+            return None;
+        }
+
+        Some(packet.data[start..end].to_vec())
+    }
+
     fn extract_announce_identity(packet: &Packet) -> Option<Identity> {
         let pubkey_len = crate::identity::KEYSIZE / 8;
         if packet.data.len() < pubkey_len {
@@ -4473,6 +4491,9 @@ impl Transport {
                             &public_key,
                             app_data_for_remember,
                         );
+                        if let Some(ratchet) = Self::extract_announce_ratchet(&packet) {
+                            let _ = Identity::remember_ratchet(destination_hash, &ratchet);
+                        }
                     }
                 }
             }
@@ -6154,6 +6175,103 @@ mod tests {
         let dst_hash = crate::identity::truncated_hash(&pub_key);
         Identity::remember_destination_in_memory(&dst_hash, &pub_key);
         (identity, dst_hash)
+    }
+
+    #[test]
+    fn inbound_valid_ratcheted_announce_remembers_ratchet() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "ratchet_test".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("ratcheted announce destination");
+
+        let ratchet_file = std::env::temp_dir()
+            .join(format!(
+                "rns_test_inbound_announce_{}.ratchets",
+                crate::hexrep(&destination.hash, false)
+            ))
+            .to_string_lossy()
+            .to_string();
+        destination
+            .enable_ratchets(ratchet_file.clone())
+            .expect("enable ratchets");
+        destination.rotate_ratchets().expect("rotate ratchets");
+
+        let ratchet_prv = destination
+            .ratchets
+            .as_ref()
+            .and_then(|ratchets| ratchets.first())
+            .expect("generated ratchet private key")
+            .clone();
+        let ratchet_pub = Identity::ratchet_public_bytes(&ratchet_prv)
+            .expect("derive ratchet public key");
+        let identity = destination
+            .identity
+            .as_ref()
+            .expect("destination identity");
+        let public_key = identity.get_public_key().expect("destination public key");
+        let random_hash = [0x42; 10];
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&destination.hash);
+        signed_data.extend_from_slice(&public_key);
+        signed_data.extend_from_slice(&destination.name_hash);
+        signed_data.extend_from_slice(&random_hash);
+        signed_data.extend_from_slice(&ratchet_pub);
+        let signature = identity.sign(&signed_data);
+
+        let mut announce_data = Vec::new();
+        announce_data.extend_from_slice(&public_key);
+        announce_data.extend_from_slice(&destination.name_hash);
+        announce_data.extend_from_slice(&random_hash);
+        announce_data.extend_from_slice(&ratchet_pub);
+        announce_data.extend_from_slice(&signature);
+
+        let mut announce_packet = Packet::new(
+            Some(destination.clone()),
+            announce_data,
+            crate::packet::ANNOUNCE,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_SET,
+        );
+        announce_packet.pack().expect("pack announce packet");
+
+        let saved_shared_instance = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let saved = state.is_connected_to_shared_instance;
+            state.is_connected_to_shared_instance = true;
+            saved
+        };
+
+        let inbound_result = Transport::inbound(
+            announce_packet.raw.clone(),
+            Some("test-if".to_string()),
+        );
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.is_connected_to_shared_instance = saved_shared_instance;
+        }
+
+        assert!(inbound_result, "ratcheted announce should be accepted");
+        assert_eq!(
+            Identity::get_ratchet(&destination.hash),
+            Some(ratchet_pub.clone()),
+            "valid inbound ratcheted announce must seed the remembered ratchet"
+        );
+
+        Identity::forget_destination_in_memory(&destination.hash);
+        let _ = std::fs::remove_file(&ratchet_file);
     }
 
     /// Build valid LRPROOF proof_data (96 bytes, no signalling) for a given link_id,

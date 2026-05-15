@@ -270,6 +270,12 @@ impl Destination {
 	/// Recalls the public key from the known-destination store, handles the
 	/// X25519/Ed25519 key-order swap if needed, and returns a `Destination`
 	/// whose hash matches the requested `dest_hash`.
+	///
+	/// Failing closed here is critical: if a recalled public key does not
+	/// actually derive the requested destination hash, forcing the hash onto the
+	/// constructed `Destination` would emit ciphertext for one key while labeling
+	/// it as a different destination hash. The receiver then cannot decrypt the
+	/// message, but the propagated blob still looks well-formed on the wire.
 	pub fn from_destination_hash(
 		dest_hash: &[u8],
 		app_name: &str,
@@ -303,20 +309,12 @@ impl Destination {
 			}
 		}
 
-		// Fallback: construct with whatever identity we can, then force the hash.
-		let identity = Identity::from_public_key(&public_key)
-			.map_err(|e| format!("Failed to construct identity from recalled key: {}", e))?;
-		let mut dest = Self::new_outbound(
-			Some(identity),
-			DestinationType::Single,
-			app_name.to_string(),
-			aspects.iter().map(|s| s.to_string()).collect(),
-		)?;
-		if dest.hash != dest_hash {
-			dest.hash = dest_hash.to_vec();
-			dest.hexhash = dest.hash.iter().map(|b| format!("{:02x}", b)).collect();
-		}
-		Ok(dest)
+		Err(format!(
+			"Recalled public key did not match destination hash {} for {}.{}",
+			crate::hexrep(dest_hash, false),
+			app_name,
+			aspects.join(".")
+		))
 	}
 	
 	/// Create a new outbound destination
@@ -1212,5 +1210,55 @@ impl Destination {
 impl std::fmt::Display for Destination {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "<{}:{}>", self.name, self.hexhash)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::identity::Identity;
+
+	#[test]
+	fn from_destination_hash_rejects_mismatched_public_key() {
+		let wrong_identity = Identity::new(true);
+		let wrong_public_key = wrong_identity
+			.get_public_key()
+			.expect("wrong identity public key");
+		let dest_hash = [0x11u8; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+		let _ = Identity::remember_destination(&dest_hash, &wrong_public_key, None);
+
+		let result = Destination::from_destination_hash(&dest_hash, "lxmf", &["delivery"]);
+		assert!(
+			result.is_err(),
+			"resolver must fail instead of forcing a mismatched hash onto the destination"
+		);
+
+		Identity::forget_destination_in_memory(&dest_hash);
+	}
+
+	#[test]
+	fn from_destination_hash_accepts_swapped_public_key_order() {
+		let identity = Identity::new(true);
+		let destination = Destination::new_outbound(
+			Some(identity.clone()),
+			DestinationType::Single,
+			"lxmf".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("destination");
+
+		let mut swapped_public_key = identity.get_public_key().expect("public key");
+		let (left, right) = swapped_public_key.split_at_mut(32);
+		left.swap_with_slice(right);
+
+		let _ = Identity::remember_destination(&destination.hash, &swapped_public_key, None);
+
+		let resolved = Destination::from_destination_hash(&destination.hash, "lxmf", &["delivery"])
+			.expect("resolver should accept swapped key order");
+
+		assert_eq!(resolved.hash, destination.hash);
+
+		Identity::forget_destination_in_memory(&destination.hash);
 	}
 }
