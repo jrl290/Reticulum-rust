@@ -3209,6 +3209,31 @@ impl Transport {
             crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
                 packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
                 hops, outbound_interface_name, outbound_interface_exists), outbound_log_level, false, false);
+            if !outbound_interface_exists {
+                let next_hop = match entry.get(IDX_PT_NEXT_HOP) {
+                    Some(PathEntryValue::NextHop(next_hop)) => crate::hexrep(next_hop, false),
+                    _ => "none".to_string(),
+                };
+                let live_ifaces: Vec<String> = state.interfaces.iter().map(|iface| iface.name.clone()).collect();
+                let live_local_client_ifaces: Vec<String> = state
+                    .local_client_interfaces
+                    .iter()
+                    .map(|iface| iface.name.clone())
+                    .collect();
+                crate::log(
+                    &format!(
+                        "[OUTBOUND] missing interface for path dest={} next_hop={} expected_iface={:?} live_ifaces={:?} local_client_ifaces={:?}",
+                        crate::hexrep(dest_hash, false),
+                        next_hop,
+                        outbound_interface_name,
+                        live_ifaces,
+                        live_local_client_ifaces,
+                    ),
+                    crate::LOG_WARNING,
+                    false,
+                    false,
+                );
+            }
 
             if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
                 if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
@@ -3859,6 +3884,51 @@ impl Transport {
         } else {
             false
         }
+    }
+
+    /// Clone a live path-table entry from one destination hash to another.
+    ///
+    /// Used when sibling SINGLE destinations share the same owner identity and
+    /// next-hop, but only one aspect has been explicitly path-resolved this
+    /// session. This mirrors the rfed test harness strategy of seeding
+    /// `rfed.{channel,delivery,notify}` from a known `rfed.node`/
+    /// `lxmf.propagation` route.
+    pub fn clone_path(source_hash: &[u8], destination_hash: &[u8]) -> bool {
+        if source_hash.is_empty() || destination_hash.is_empty() || source_hash == destination_hash {
+            return false;
+        }
+
+        let mut cloned = false;
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let Some(entry) = state.path_table.get(source_hash).cloned() else {
+                return false;
+            };
+
+            match entry.get(IDX_PT_TIMESTAMP) {
+                Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => return false,
+                _ => {}
+            }
+
+            state.path_table.insert(destination_hash.to_vec(), entry);
+            state.path_table_dirty = true;
+
+            if state.path_verified_this_session.contains(source_hash) {
+                state.path_verified_this_session.insert(destination_hash.to_vec());
+            }
+
+            if let Some(path_state) = state.path_states.get(source_hash).copied() {
+                state.path_states.insert(destination_hash.to_vec(), path_state);
+            }
+
+            cloned = true;
+        }
+
+        if cloned {
+            notify_path_added();
+        }
+
+        cloned
     }
 
     /// Block the calling thread until either:

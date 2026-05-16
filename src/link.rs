@@ -1630,6 +1630,15 @@ impl Link {
             link.callbacks.link_established = Some(Arc::clone(cb));
         }
 
+        // Make any destination-level packet callback available immediately on
+        // the inbound link. The first plain DATA packet can arrive before the
+        // async link_established callback thread gets a chance to install a
+        // handler, and in that case we must not leave it stranded in the early
+        // packet queue.
+        if let Some(cb) = &owner.callbacks.packet {
+            link.callbacks.packet = Some(Arc::clone(cb));
+        }
+
         // Set link_id from packet
         link.set_link_id_from_packet(packet);
 
@@ -3374,6 +3383,22 @@ impl Link {
                 guard.as_ref().and_then(|g| g.as_ref()).cloned()
             };
             let remote_identity_ref = remote_identity_owned.as_ref();
+            let remote_identity_hash = remote_identity_ref
+                .and_then(|identity| identity.hash.as_ref().map(|hash| crate::hexrep(hash, false)))
+                .unwrap_or_else(|| "none".to_string());
+            crate::log(
+                &format!(
+                    "[REQ] resolved path='{}' request_id={} link_id={} remote_identity={}",
+                    handler.path,
+                    crate::hexrep(&request_id, false),
+                    crate::hexrep(&self.link_id, false),
+                    remote_identity_hash,
+                ),
+                crate::LOG_NOTICE,
+                false,
+                false,
+            );
+
             let allowed = match handler.allow_policy {
                 crate::destination::ALLOW_NONE => false,
                 crate::destination::ALLOW_ALL => true,
@@ -3403,6 +3428,7 @@ impl Link {
                 // deadlocking the actor on its own channel.
                 let link_handle = self.self_handle.as_ref().unwrap().clone();
                 let path_hex = crate::hexrep(&path_hash, false);
+                let handler_path = handler.path.clone();
                 let request_id_c = request_id.clone();
                 let request_data_c = request_data.clone();
                 // Clone the identity so the spawned thread owns it (avoids
@@ -3417,6 +3443,17 @@ impl Link {
                         &request_id_c,
                         identity_ref,
                         timestamp,
+                    );
+                    crate::log(
+                        &format!(
+                            "[REQ] callback completed path='{}' request_id={} response_len={}",
+                            handler_path,
+                            crate::hexrep(&request_id_c, false),
+                            response.len(),
+                        ),
+                        crate::LOG_NOTICE,
+                        false,
+                        false,
                     );
                     // send_response enqueues LinkMsg::SendResponse; the actor
                     // processes it after it has finished handling `Receive`.
@@ -3444,7 +3481,19 @@ impl Link {
         // NOT wrapped in a Binary container. Our handler returns pre-encoded msgpack bytes,
         // so we build the outer array manually: write array header, write request_id as Binary,
         // then append the raw response bytes directly (they are already valid msgpack).
-        crate::log(&format!("[REQ] handler returned {} bytes, building response", response.len()), crate::LOG_NOTICE, false, false);
+        let attached_interface = self.attached_interface.clone().unwrap_or_else(|| "<none>".to_string());
+        crate::log(
+            &format!(
+                "[REQ] handler returned {} bytes, building response request_id={} link_id={} iface={}",
+                response.len(),
+                crate::hexrep(request_id, false),
+                crate::hexrep(&self.link_id, false),
+                attached_interface,
+            ),
+            crate::LOG_NOTICE,
+            false,
+            false,
+        );
         let mut response_data = Vec::new();
         // 2-element array header
         rmp::encode::write_array_len(&mut response_data, 2).map_err(|e| e.to_string())?;
@@ -3492,9 +3541,31 @@ impl Link {
         };
 
         if !sent {
-            crate::log("[REQ] dispatch_outbound FAILED - response not sent!", crate::LOG_ERROR, false, false);
+            crate::log(
+                &format!(
+                    "[REQ] dispatch_outbound FAILED request_id={} link_id={} iface={} - response not sent!",
+                    crate::hexrep(request_id, false),
+                    crate::hexrep(&self.link_id, false),
+                    attached_interface,
+                ),
+                crate::LOG_ERROR,
+                false,
+                false,
+            );
         } else {
-            crate::log(&format!("[REQ] response SENT: {} bytes on wire (ciphertext={} bytes)", raw.len(), ciphertext.len()), crate::LOG_NOTICE, false, false);
+            crate::log(
+                &format!(
+                    "[REQ] response SENT request_id={} link_id={} iface={} wire_bytes={} ciphertext_bytes={}",
+                    crate::hexrep(request_id, false),
+                    crate::hexrep(&self.link_id, false),
+                    attached_interface,
+                    raw.len(),
+                    ciphertext.len(),
+                ),
+                crate::LOG_NOTICE,
+                false,
+                false,
+            );
         }
 
         self.had_outbound(false);
@@ -3533,9 +3604,23 @@ impl Link {
         if rmpv_write_value(&mut response_bytes, &elements[1]).is_err() {
             return Ok(());
         }
+        crate::log(
+            &format!(
+                "[RESP] response value {} bytes preview={:02x?}",
+                response_bytes.len(),
+                &response_bytes[..response_bytes.len().min(32)]
+            ),
+            crate::LOG_NOTICE,
+            false,
+            false,
+        );
 
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
-        crate::log(&format!("[RESP] pending_requests count={}, looking for id={}", pending.len(), crate::hexrep(&request_id, false)), crate::LOG_NOTICE, false, false);
+        let pending_ids: Vec<String> = pending
+            .iter()
+            .map(|request| crate::hexrep(&request.request_id, false))
+            .collect();
+        crate::log(&format!("[RESP] pending_requests count={}, looking for id={} pending_ids={:?}", pending.len(), crate::hexrep(&request_id, false), pending_ids), crate::LOG_NOTICE, false, false);
         if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
             crate::log(&format!("[RESP] found pending request, spawning callback thread"), crate::LOG_NOTICE, false, false);
             let request = pending.remove(index);
@@ -3555,7 +3640,7 @@ impl Link {
                 thread::spawn(move || { callback(receipt); });
             }
         } else {
-            crate::log(&format!("[RESP] NO matching pending request found for id={}", crate::hexrep(&request_id, false)), crate::LOG_NOTICE, false, false);
+            crate::log(&format!("[RESP] NO matching pending request found for id={} pending_ids={:?}", crate::hexrep(&request_id, false), pending_ids), crate::LOG_NOTICE, false, false);
         }
 
         Ok(())
