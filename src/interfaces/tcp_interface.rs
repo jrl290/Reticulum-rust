@@ -347,70 +347,163 @@ impl TcpClientInterface {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
         use std::os::unix::io::AsRawFd;
-        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
+        use libc::{SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
 
-        let optlen = std::mem::size_of::<i32>();
-        unsafe {
-            let fd = stream.as_raw_fd();
-            let keepalive: i32 = 1;
+        let fd = stream.as_raw_fd();
+        let keepalive: i32 = 1;
 
-            let (user_timeout_secs, keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
-                (Self::TCP_USER_TIMEOUT, Self::TCP_PROBE_AFTER, Self::TCP_PROBE_INTERVAL, Self::TCP_PROBES)
-            } else {
-                (Self::I2P_USER_TIMEOUT, Self::I2P_PROBE_AFTER, Self::I2P_PROBE_INTERVAL, Self::I2P_PROBES)
-            };
+        let (user_timeout_secs, keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
+            (Self::TCP_USER_TIMEOUT, Self::TCP_PROBE_AFTER, Self::TCP_PROBE_INTERVAL, Self::TCP_PROBES)
+        } else {
+            (Self::I2P_USER_TIMEOUT, Self::I2P_PROBE_AFTER, Self::I2P_PROBE_INTERVAL, Self::I2P_PROBES)
+        };
 
-            let user_timeout = (user_timeout_secs * 1000) as i32;
-            let keepidle = keepidle as i32;
-            let keepintvl = keepintvl as i32;
-            let keepcnt = keepcnt as i32;
+        let user_timeout_ms = (user_timeout_secs * 1000) as i32;
+        let keepidle_i = keepidle as i32;
+        let keepintvl_i = keepintvl as i32;
+        let keepcnt_i = keepcnt as i32;
 
-            setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
-            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
-        }
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, user_timeout_ms, "TCP_USER_TIMEOUT");
+        Self::set_sockopt_i32(fd, SOL_SOCKET, SO_KEEPALIVE, keepalive, "SO_KEEPALIVE");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPIDLE, keepidle_i, "TCP_KEEPIDLE");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPINTVL, keepintvl_i, "TCP_KEEPINTVL");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPCNT, keepcnt_i, "TCP_KEEPCNT");
+
+        Self::verify_keepalive(
+            fd,
+            &[
+                (IPPROTO_TCP, TCP_USER_TIMEOUT, user_timeout_ms, "TCP_USER_TIMEOUT(ms)"),
+                (SOL_SOCKET,  SO_KEEPALIVE,     keepalive,        "SO_KEEPALIVE"),
+                (IPPROTO_TCP, TCP_KEEPIDLE,     keepidle_i,       "TCP_KEEPIDLE(s)"),
+                (IPPROTO_TCP, TCP_KEEPINTVL,    keepintvl_i,      "TCP_KEEPINTVL(s)"),
+                (IPPROTO_TCP, TCP_KEEPCNT,      keepcnt_i,        "TCP_KEEPCNT"),
+            ],
+        );
     }
 
     #[cfg(target_os = "macos")]
     fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
         use std::os::unix::io::AsRawFd;
-        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
+        use libc::{SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
 
+        // Apple-private TCP options. These constants match the values in
+        // <netinet/tcp.h> on Darwin and are stable across macOS / iOS.
         const TCP_KEEPALIVE: i32 = 0x10;
         const TCP_KEEPINTVL: i32 = 0x101;
         const TCP_KEEPCNT: i32 = 0x102;
 
-        unsafe {
-            let fd = stream.as_raw_fd();
-            let keepalive: i32 = 1;
+        let fd = stream.as_raw_fd();
+        let keepalive: i32 = 1;
 
-            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+        let (keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
+            (
+                Self::TCP_PROBE_AFTER as i32,
+                Self::TCP_PROBE_INTERVAL as i32,
+                Self::TCP_PROBES as i32,
+            )
+        } else {
+            (
+                Self::I2P_PROBE_AFTER as i32,
+                Self::I2P_PROBE_INTERVAL as i32,
+                Self::I2P_PROBES as i32,
+            )
+        };
 
-            let (keepidle, keepintvl, keepcnt) = if !i2p_tunneled {
-                (
-                    Self::TCP_PROBE_AFTER as i32,
-                    Self::TCP_PROBE_INTERVAL as i32,
-                    Self::TCP_PROBES as i32,
-                )
-            } else {
-                (
-                    Self::I2P_PROBE_AFTER as i32,
-                    Self::I2P_PROBE_INTERVAL as i32,
-                    Self::I2P_PROBES as i32,
-                )
-            };
+        Self::set_sockopt_i32(fd, SOL_SOCKET,  SO_KEEPALIVE,  keepalive, "SO_KEEPALIVE");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPALIVE, keepidle,  "TCP_KEEPALIVE");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPINTVL, keepintvl, "TCP_KEEPINTVL");
+        Self::set_sockopt_i32(fd, IPPROTO_TCP, TCP_KEEPCNT,   keepcnt,   "TCP_KEEPCNT");
 
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-        }
+        Self::verify_keepalive(
+            fd,
+            &[
+                (SOL_SOCKET,  SO_KEEPALIVE,  keepalive, "SO_KEEPALIVE"),
+                (IPPROTO_TCP, TCP_KEEPALIVE, keepidle,  "TCP_KEEPALIVE(s)"),
+                (IPPROTO_TCP, TCP_KEEPINTVL, keepintvl, "TCP_KEEPINTVL(s)"),
+                (IPPROTO_TCP, TCP_KEEPCNT,   keepcnt,   "TCP_KEEPCNT"),
+            ],
+        );
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) {
         // No platform-specific keepalive support compiled in.
+    }
+
+    /// setsockopt(SOL_*, opt, &i32) with error logging. Used by
+    /// `apply_keepalive` so a silent setsockopt failure is visible in the
+    /// log instead of being swallowed (which would leave us thinking
+    /// keepalive was active when the kernel ignored the request).
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn set_sockopt_i32(fd: libc::c_int, level: libc::c_int, opt: libc::c_int, value: i32, name: &str) {
+        let optlen = std::mem::size_of::<i32>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                &value as *const _ as *const _,
+                optlen,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            crate::log(
+                &format!("TCP keepalive setsockopt({}, fd={}) FAILED: {} — peer drops may not be detected promptly", name, fd, err),
+                crate::LOG_ERROR, false, false,
+            );
+        }
+    }
+
+    /// Re-read each keepalive option via getsockopt and warn if the kernel
+    /// stored a value different from what we asked for. This surfaces both
+    /// outright failures (which `set_sockopt_i32` already logs) AND silent
+    /// clamping (e.g. some kernels round TCP_KEEPCNT to a minimum). One
+    /// `[KEEPALIVE]` line is logged per fresh socket on success so we can
+    /// confirm in production logs that keepalive really is active.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn verify_keepalive(fd: libc::c_int, expected: &[(libc::c_int, libc::c_int, i32, &str)]) {
+        let mut summary = String::new();
+        let mut all_ok = true;
+        for (level, opt, want, name) in expected {
+            let mut got: i32 = 0;
+            let mut len: libc::socklen_t = std::mem::size_of::<i32>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    *level,
+                    *opt,
+                    &mut got as *mut _ as *mut _,
+                    &mut len,
+                )
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                crate::log(
+                    &format!("TCP keepalive getsockopt({}, fd={}) FAILED: {}", name, fd, err),
+                    crate::LOG_WARNING, false, false,
+                );
+                all_ok = false;
+                continue;
+            }
+            if got != *want {
+                crate::log(
+                    &format!("TCP keepalive {} fd={} requested={} actual={} — kernel did not honor request", name, fd, want, got),
+                    crate::LOG_WARNING, false, false,
+                );
+                all_ok = false;
+            }
+            if !summary.is_empty() { summary.push(' '); }
+            summary.push_str(&format!("{}={}", name, got));
+        }
+        if all_ok {
+            crate::log(
+                &format!("[KEEPALIVE] fd={} active — {}", fd, summary),
+                crate::LOG_NOTICE, false, false,
+            );
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
