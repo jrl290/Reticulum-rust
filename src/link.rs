@@ -3442,6 +3442,7 @@ impl Link {
                         &request_data_c,
                         &request_id_c,
                         identity_ref,
+                        Some(&link_handle),
                         timestamp,
                     );
                     crate::log(

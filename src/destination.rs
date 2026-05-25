@@ -56,7 +56,7 @@ impl Default for DestinationType {
 pub type PacketCallback = Box<dyn Fn(&[u8], &Packet) + Send>;
 pub type LinkEstablishedCallback = Box<dyn Fn(&crate::link::Link) + Send>;
 pub type ProofRequestedCallback = Box<dyn Fn(&Packet) -> bool + Send>;
-pub type RequestHandlerCallback = Arc<dyn Fn(&str, &[u8], &[u8], Option<&Identity>, f64) -> Vec<u8> + Send + Sync>;
+pub type RequestHandlerCallback = Arc<dyn Fn(&str, &[u8], &[u8], Option<&Identity>, Option<&crate::link::LinkHandle>, f64) -> Vec<u8> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct RequestHandler {
@@ -767,11 +767,10 @@ impl Destination {
 		let callback = handler.callback.clone();
 		let path_hex = crate::hexrep(&path_hash, false);
 		let destination = packet.destination.clone();
-
 		thread::spawn(move || {
 			let response = if let Some(callback) = callback {
 				let remote_identity: Option<&Identity> = None;
-				callback(&path_hex, &request_data, &request_id, remote_identity, payload.0)
+				callback(&path_hex, &request_data, &request_id, remote_identity, None, payload.0)
 			} else {
 				Vec::new()
 			};
