@@ -269,6 +269,11 @@ pub fn transport_has_path(dest_hash: &[u8]) -> bool {
     Transport::has_path(dest_hash)
 }
 
+/// Check whether the known path was freshly verified in this process.
+pub fn transport_is_path_verified_this_session(dest_hash: &[u8]) -> bool {
+    Transport::is_path_verified_this_session(dest_hash)
+}
+
 /// Check whether the destination's identity (public key) is in the
 /// known-destinations table. Outbound link/packet construction needs
 /// the identity to encrypt — `transport_has_path` is not sufficient.

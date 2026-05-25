@@ -14,7 +14,11 @@
 //!      single summary line every `FLUSH_INTERVAL_SECS` seconds.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use once_cell::sync::Lazy;
 
 /// Hardcoded whitelist of 16-byte destination hashes (lowercase hex) that
 /// should ALWAYS produce announce/path log lines. Everything else is counted
@@ -42,6 +46,8 @@ static ANNOUNCES_INVALID: AtomicU64 = AtomicU64::new(0);
 static ANNOUNCES_DEDUP_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PATHS_ADDED: AtomicU64 = AtomicU64::new(0);
 static LAST_FLUSH_SECS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_WATCH_HEX: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[inline]
 fn now_secs() -> u64 {
@@ -60,6 +66,39 @@ pub fn is_whitelisted(dest_hash: Option<&[u8]>) -> bool {
     };
     let hex = crate::hexrep(h, false);
     WHITELIST_HEX.iter().any(|w| *w == hex)
+        || RUNTIME_WATCH_HEX
+            .lock()
+            .map(|watch| watch.contains_key(&hex))
+            .unwrap_or(false)
+}
+
+/// Temporarily enable announce/path log lines for `dest_hash`.
+///
+/// Multiple callers may watch the same destination concurrently; logging stays
+/// enabled until the final matching [`unwatch_destination`] call.
+pub fn watch_destination(dest_hash: &[u8]) {
+    let hex = crate::hexrep(dest_hash, false);
+    if let Ok(mut watch) = RUNTIME_WATCH_HEX.lock() {
+        *watch.entry(hex).or_insert(0) += 1;
+    }
+}
+
+/// Remove one temporary announce/path log watch for `dest_hash`.
+pub fn unwatch_destination(dest_hash: &[u8]) {
+    let hex = crate::hexrep(dest_hash, false);
+    if let Ok(mut watch) = RUNTIME_WATCH_HEX.lock() {
+        let remove = match watch.get_mut(&hex) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            watch.remove(&hex);
+        }
+    }
 }
 
 pub fn count_inbound_announce() {
@@ -143,4 +182,19 @@ pub fn flush_if_due() {
         false,
         false,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_whitelisted, unwatch_destination, watch_destination};
+
+    #[test]
+    fn runtime_watchlist_toggles_destination_logging() {
+        let dest = [0x42u8; 16];
+        assert!(!is_whitelisted(Some(&dest)));
+        watch_destination(&dest);
+        assert!(is_whitelisted(Some(&dest)));
+        unwatch_destination(&dest);
+        assert!(!is_whitelisted(Some(&dest)));
+    }
 }

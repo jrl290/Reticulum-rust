@@ -1136,14 +1136,18 @@ impl Transport {
         // network on every reconnect.  When the published set is empty
         // (legacy callers), fall back to the historical "all IN/SINGLE"
         // behaviour for backwards compatibility.
-        let (destinations, published_filter) = {
+        let (destinations, published_filter, published_app_data) = {
             let state = TRANSPORT.lock().unwrap();
             let filter: Option<HashSet<Vec<u8>>> = if state.published_destinations.is_empty() {
                 None
             } else {
                 Some(state.published_destinations.keys().cloned().collect())
             };
-            (state.destinations.clone(), filter)
+            let app_data_map: HashMap<Vec<u8>, Option<Vec<u8>>> = state.published_destinations
+                .iter()
+                .map(|(h, e)| (h.clone(), e.app_data.clone()))
+                .collect();
+            (state.destinations.clone(), filter, app_data_map)
         };
         let iface = interface_name.to_string();
         let mut announced: Vec<Vec<u8>> = Vec::new();
@@ -1157,7 +1161,15 @@ impl Transport {
                 &format!("Re-announcing {} to interface {}", crate::hexrep(&dest.hash, true), iface),
                 LOG_NOTICE, false, false,
             );
-            if dest.announce(None, false, Some(iface.clone()), None, true).is_ok() {
+            // Carry the app_data the application registered via
+            // `publish_destination` so interface-up re-announces stay
+            // consistent with the periodic-refresh schedule (which also
+            // uses this app_data).  Falls back to the destination's
+            // default_app_data when `None`.
+            let app_data_ref = published_app_data
+                .get(&dest.hash)
+                .and_then(|o| o.as_deref());
+            if dest.announce(app_data_ref, false, Some(iface.clone()), None, true).is_ok() {
                 announced.push(dest.hash.clone());
             }
         }
@@ -1822,6 +1834,15 @@ impl Transport {
             .position(|dest| dest.hash == destination_hash);
         if let Some(idx) = local_dest_index {
             if let Some(mut dest) = state.destinations.get(idx).cloned() {
+                // Use the application's published app_data (set via
+                // `publish_destination`) so path responses carry the same
+                // announce payload as live broadcasts.  Falls back to the
+                // destination's default_app_data when not in the published
+                // set.
+                let app_data = state
+                    .published_destinations
+                    .get(&destination_hash)
+                    .and_then(|p| p.app_data.clone());
                 drop(state);
                 log(
                     &format!(
@@ -1830,7 +1851,7 @@ impl Transport {
                     ),
                     LOG_NOTICE, false, false,
                 );
-                let _ = dest.announce(None, true, attached_interface, tag, true);
+                let _ = dest.announce(app_data.as_deref(), true, attached_interface, tag, true);
                 let mut state = TRANSPORT.lock().unwrap();
                 if idx < state.destinations.len() {
                     state.destinations[idx] = dest;
@@ -4776,8 +4797,20 @@ impl Transport {
                     if random_blobs.len() > MAX_RANDOM_BLOBS {
                         random_blobs.truncate(MAX_RANDOM_BLOBS);
                     }
-                    // Update if: no existing entry, OR new path is at least as good, OR existing path expired
-                    let should_update_path = !has_existing || packet.hops <= existing_hops || is_expired;
+                    // Cached paths loaded from disk are provisional until a
+                    // live announce verifies them in this process. Do not let
+                    // an unverified cold-start entry block the first real path
+                    // we hear on the wire, even if the cached hop count was
+                    // numerically better.
+                    let existing_verified_this_session = has_existing
+                        && state.path_verified_this_session.contains(destination_hash);
+                    // Update if: no existing entry, OR the existing entry is
+                    // still unverified this session, OR the new path is at
+                    // least as good, OR the existing path expired.
+                    let should_update_path = !has_existing
+                        || !existing_verified_this_session
+                        || packet.hops <= existing_hops
+                        || is_expired;
 
                     let received_from = packet.transport_id.clone().unwrap_or_else(|| destination_hash.clone());
                     let expires = now() + DESTINATION_TIMEOUT;
@@ -6342,6 +6375,99 @@ mod tests {
 
         Identity::forget_destination_in_memory(&destination.hash);
         let _ = std::fs::remove_file(&ratchet_file);
+    }
+
+    #[test]
+    fn inbound_live_announce_replaces_unverified_cached_path_even_when_hops_worse() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let saved_path_table;
+        let saved_verified;
+        let saved_interfaces;
+        let saved_drop_announces;
+        let saved_watchlist;
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            saved_path_table = std::mem::take(&mut state.path_table);
+            saved_verified = std::mem::take(&mut state.path_verified_this_session);
+            saved_interfaces = std::mem::take(&mut state.interfaces);
+            saved_drop_announces = state.drop_announces;
+            saved_watchlist = std::mem::take(&mut state.announce_watchlist);
+            state.drop_announces = false;
+        }
+
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "path_quality_test".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("announce destination");
+        let dest_hash = destination.hash.clone();
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.insert(
+                dest_hash.clone(),
+                vec![
+                    PathEntryValue::Timestamp(now()),
+                    PathEntryValue::NextHop(vec![0xCD; crate::reticulum::TRUNCATED_HASHLENGTH / 8]),
+                    PathEntryValue::Hops(2),
+                    PathEntryValue::Expires(now() + 3600.0),
+                    PathEntryValue::RandomBlobs(Vec::new()),
+                    PathEntryValue::ReceivingInterface(Some("dead-iface".to_string())),
+                    PathEntryValue::PacketHash(vec![0xAB; crate::identity::HASHLENGTH / 8]),
+                ],
+            );
+        }
+
+        let mut announce_packet = destination
+            .announce(None, false, None, None, false)
+            .expect("build announce")
+            .expect("announce packet");
+        announce_packet.hops = 3;
+        let expected_hops = announce_packet.hops.saturating_add(1);
+        announce_packet.pack().expect("pack announce");
+
+        assert!(
+            Transport::inbound(announce_packet.raw.clone(), Some("live-iface".to_string())),
+            "live announce should be accepted"
+        );
+
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let entry = state.path_table.get(&dest_hash).expect("path entry must exist");
+            let hops = match entry.get(IDX_PT_HOPS) {
+                Some(PathEntryValue::Hops(hops)) => *hops,
+                other => panic!("unexpected hops entry: {:?}", other),
+            };
+            let iface = match entry.get(IDX_PT_RVCD_IF) {
+                Some(PathEntryValue::ReceivingInterface(name)) => name.clone(),
+                other => panic!("unexpected iface entry: {:?}", other),
+            };
+
+            assert_eq!(
+                hops,
+                expected_hops,
+                "live announce must replace provisional cached hop count"
+            );
+            assert_eq!(iface.as_deref(), Some("live-iface"));
+            assert!(
+                state.path_verified_this_session.contains(&dest_hash),
+                "live announce must mark the path session-verified"
+            );
+        }
+
+        Identity::forget_destination_in_memory(&dest_hash);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table = saved_path_table;
+            state.path_verified_this_session = saved_verified;
+            state.interfaces = saved_interfaces;
+            state.drop_announces = saved_drop_announces;
+            state.announce_watchlist = saved_watchlist;
+        }
     }
 
     /// Build valid LRPROOF proof_data (96 bytes, no signalling) for a given link_id,
