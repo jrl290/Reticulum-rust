@@ -203,6 +203,10 @@ pub struct InterfaceStub {
     /// warning emitted for this interface. Used to throttle the warning
     /// to once per minute so a sustained wedge doesn't fill the log.
     pub last_inbound_warn_at: f64,
+    /// Wall-clock seconds of the most recent offline-send warning emitted
+    /// for this interface. Used to suppress repeated "dropping send"
+    /// log spam while an interface remains offline.
+    pub last_offline_warn_at: f64,
     /// Full string representation of the interface (e.g.
     /// `TCPInterface[London/132.145.75.143:4242]`). Stored at
     /// registration time and used by `synthesize_tunnel_all_tcp` to
@@ -3177,6 +3181,14 @@ impl Transport {
         true
     }
 
+    fn should_emit_offline_drop_warning(iface: &mut InterfaceStub, now_secs: f64) -> bool {
+        if now_secs - iface.last_offline_warn_at > 60.0 {
+            iface.last_offline_warn_at = now_secs;
+            return true;
+        }
+        false
+    }
+
     pub fn outbound(packet: &mut Packet) -> bool {
         // Step 2 of the transport refactor (TRANSPORT_REFACTOR_PLAN.md):
         //
@@ -3453,21 +3465,27 @@ impl Transport {
         let mut offline_drops: Vec<String> = Vec::new();
         let mut silent_warnings: Vec<(String, f64)> = Vec::new();
         for (iface_name, raw) in transmissions.into_iter() {
-            let iface_online = state
-                .interfaces
-                .iter()
+            let mut iface_online = false;
+            let mut should_warn_offline = false;
+            if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == iface_name) {
+                iface_online = iface.online;
+                if !iface_online {
+                    should_warn_offline = Self::should_emit_offline_drop_warning(iface, now_secs);
+                }
+            } else if let Some(iface) = state
+                .local_client_interfaces
+                .iter_mut()
                 .find(|i| i.name == iface_name)
-                .map(|i| i.online)
-                .or_else(|| {
-                    state
-                        .local_client_interfaces
-                        .iter()
-                        .find(|i| i.name == iface_name)
-                        .map(|i| i.online)
-                })
-                .unwrap_or(false);
+            {
+                iface_online = iface.online;
+                if !iface_online {
+                    should_warn_offline = Self::should_emit_offline_drop_warning(iface, now_secs);
+                }
+            }
             if !iface_online {
-                offline_drops.push(iface_name);
+                if should_warn_offline {
+                    offline_drops.push(iface_name);
+                }
                 continue;
             }
 
@@ -3495,7 +3513,7 @@ impl Transport {
         for name in &offline_drops {
             crate::log(
                 &format!(
-                    "[OUTBOUND] dropping send: interface {} is offline (sent=false)",
+                    "[OUTBOUND] dropping send: interface {} is offline (sent=false, further drops suppressed for 60s)",
                     name
                 ),
                 crate::LOG_WARNING,
@@ -7272,6 +7290,17 @@ mod tests {
         };
 
         assert!(Transport::inbound_silence_warning_enforced(&iface));
+    }
+
+    #[test]
+    fn offline_drop_warning_is_throttled_per_interface() {
+        let mut iface = InterfaceStub::default();
+
+        assert!(Transport::should_emit_offline_drop_warning(&mut iface, 100.0));
+        assert_eq!(iface.last_offline_warn_at, 100.0);
+        assert!(!Transport::should_emit_offline_drop_warning(&mut iface, 150.0));
+        assert!(Transport::should_emit_offline_drop_warning(&mut iface, 161.0));
+        assert_eq!(iface.last_offline_warn_at, 161.0);
     }
 
     /// Snapshot/restore guard for `state.interfaces` so a test that mutates

@@ -5,7 +5,8 @@ use crate::transport::Transport as RnsTransport;
 use if_addrs::{get_if_addrs, IfAddr};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -259,6 +260,7 @@ impl BackboneInterface {
                         name: spawned_guard.base.name.clone().unwrap_or_default(),
                         mode: spawned_guard.base.mode as u8,
                         out: true,
+                        online: Some(spawned_guard.base.online && !spawned_guard.detached),
                         bitrate: Some(spawned_guard.base.bitrate),
                         announce_cap: Some(spawned_guard.base.announce_cap),
                         announce_rate_target: spawned_guard.base.announce_rate_target,
@@ -375,14 +377,19 @@ pub struct BackboneClientInterface {
     socket: Option<Arc<Mutex<TcpStream>>>,
     frame_buffer: Vec<u8>,
     transmit_buffer: Arc<Mutex<Vec<u8>>>,
+    force_read_exit: Arc<AtomicBool>,
+    pub heartbeat_running: bool,
 }
 
 impl BackboneClientInterface {
     pub const HW_MTU: usize = BackboneInterface::HW_MTU;
     pub const BITRATE_GUESS: u64 = 100_000_000; // 100 Mbps
     pub const DEFAULT_IFAC_SIZE: usize = 16;
-    pub const RECONNECT_WAIT: u64 = 5;
+    pub const RECONNECT_WAIT_BASE: u64 = 5;
+    pub const RECONNECT_WAIT_MAX: u64 = 300;
     pub const INITIAL_CONNECT_TIMEOUT: u64 = 5;
+    pub const READ_WAKE_INTERVAL: u64 = 2;
+    pub const HEARTBEAT_INTERVAL: u64 = 60;
 
     pub const TCP_USER_TIMEOUT: u64 = 24;
     pub const TCP_PROBE_AFTER: u64 = 5;
@@ -430,6 +437,8 @@ impl BackboneClientInterface {
             socket: Some(Arc::new(Mutex::new(stream))),
             frame_buffer: Vec::new(),
             transmit_buffer: Arc::new(Mutex::new(Vec::new())),
+            force_read_exit: Arc::new(AtomicBool::new(false)),
+            heartbeat_running: false,
         })
     }
 
@@ -468,6 +477,8 @@ impl BackboneClientInterface {
             socket: None,
             frame_buffer: Vec::new(),
             transmit_buffer: Arc::new(Mutex::new(Vec::new())),
+            force_read_exit: Arc::new(AtomicBool::new(false)),
+            heartbeat_running: false,
         };
 
         interface.initial_connect()?;
@@ -495,10 +506,19 @@ impl BackboneClientInterface {
         Ok(())
     }
 
+    fn resolve_target_addr(target_ip: &str, target_port: u16) -> Result<SocketAddr, String> {
+        let addr_str = format!("{}:{}", target_ip, target_port);
+        addr_str
+            .to_socket_addrs()
+            .map_err(|e| format!("Failed to resolve {}: {}", addr_str, e))?
+            .next()
+            .ok_or_else(|| format!("No addresses found for {}", addr_str))
+    }
+
     fn connect(&mut self, _initial: bool) -> Result<(), String> {
-        let addr = format!("{}:{}", self.target_ip, self.target_port);
+        let addr = Self::resolve_target_addr(&self.target_ip, self.target_port)?;
         let stream = TcpStream::connect_timeout(
-            &addr.parse::<SocketAddr>().map_err(|e| format!("Invalid address {}: {}", addr, e))?,
+            &addr,
             Duration::from_secs(self.connect_timeout),
         ).map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -509,9 +529,78 @@ impl BackboneClientInterface {
 
         self.socket = Some(Arc::new(Mutex::new(stream)));
         self.base.online = true;
+        self.force_read_exit.store(false, Ordering::Relaxed);
+        if let Some(name) = &self.base.name {
+            crate::transport::Transport::set_interface_online(name, true);
+        }
         self.never_connected = false;
 
         Ok(())
+    }
+
+    fn reconnect_until_success(iface: &Arc<Mutex<BackboneClientInterface>>) -> bool {
+        let mut attempts = 0u32;
+        loop {
+            let (detached, max_tries) = {
+                let guard = iface.lock().unwrap();
+                (guard.detached, guard.max_reconnect_tries)
+            };
+
+            if detached {
+                crate::log(
+                    "Backbone reconnect: interface detached, giving up",
+                    crate::LOG_NOTICE,
+                    false,
+                    false,
+                );
+                return false;
+            }
+
+            if let Some(max) = max_tries {
+                if attempts as usize >= max {
+                    crate::log(
+                        &format!("Backbone reconnect: max attempts ({}) reached, giving up", max),
+                        crate::LOG_ERROR,
+                        false,
+                        false,
+                    );
+                    return false;
+                }
+            }
+
+            let shift = attempts.min(6) as u64;
+            let wait_secs = (Self::RECONNECT_WAIT_BASE << shift).min(Self::RECONNECT_WAIT_MAX);
+            thread::sleep(Duration::from_secs(wait_secs));
+            attempts += 1;
+
+            crate::log(
+                &format!("Backbone reconnect attempt {}...", attempts),
+                crate::LOG_NOTICE,
+                false,
+                false,
+            );
+            let ok = {
+                let mut guard = iface.lock().unwrap();
+                guard.connect(false).is_ok()
+            };
+
+            if ok {
+                crate::log(
+                    "Backbone reconnected successfully, restarting read loop",
+                    crate::LOG_NOTICE,
+                    false,
+                    false,
+                );
+                return true;
+            }
+
+            crate::log(
+                &format!("Backbone reconnect attempt {} failed", attempts),
+                crate::LOG_WARNING,
+                false,
+                false,
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -566,61 +655,168 @@ impl BackboneClientInterface {
     pub fn set_tcp_keepalive(&self, _probe_after_secs: u64) {}
 
     pub fn start_read_loop(iface: Arc<Mutex<BackboneClientInterface>>) {
+        {
+            let mut guard = iface.lock().unwrap();
+            if guard.reconnecting {
+                crate::log(
+                    "Backbone start_read_loop: loop already active for this interface, ignoring duplicate call",
+                    crate::LOG_WARNING,
+                    false,
+                    false,
+                );
+                return;
+            }
+            guard.reconnecting = true;
+        }
+
         thread::spawn(move || {
-            loop {
-                let socket = {
-                    let guard = iface.lock().unwrap();
-                    guard.socket.clone()
+            let mut first_iter = true;
+
+            'running: loop {
+                let socket_result = {
+                    let (socket_ref, interface_name, is_initiator, force_read_exit) = {
+                        let guard = iface.lock().unwrap();
+                        match guard.socket.as_ref().cloned() {
+                            Some(socket_ref) => (
+                                socket_ref,
+                                guard.base.name.clone(),
+                                guard.initiator,
+                                Arc::clone(&guard.force_read_exit),
+                            ),
+                            None => {
+                                crate::log(
+                                    "Backbone read loop: no socket, entering reconnect",
+                                    crate::LOG_NOTICE,
+                                    false,
+                                    false,
+                                );
+                                if Self::reconnect_until_success(&iface) {
+                                    continue 'running;
+                                }
+                                break 'running;
+                            }
+                        }
+                    };
+
+                    let cloned_socket = match socket_ref.lock().unwrap().try_clone() {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            crate::log(
+                                &format!("Backbone read loop: socket clone failed: {}", e),
+                                crate::LOG_WARNING,
+                                false,
+                                false,
+                            );
+                            continue 'running;
+                        }
+                    };
+
+                    Some((cloned_socket, interface_name, is_initiator, force_read_exit))
                 };
 
-                let socket = match socket {
-                    Some(s) => s,
-                    None => {
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                };
+                let (mut socket, interface_name, is_initiator, force_read_exit) =
+                    socket_result.unwrap();
 
-                let mut buf = [0u8; 65536];
-                let read_result = {
-                    let mut stream_guard = socket.lock().unwrap();
-                    stream_guard.read(&mut buf)
-                };
-
-                match read_result {
-                    Ok(0) => {
-                        let mut guard = iface.lock().unwrap();
-                        guard.base.online = false;
-                        guard.socket = None;
-                        log(
-                            &format!("The socket for {} was closed", guard),
-                            crate::LOG_WARNING,
-                            false,
-                            false,
-                        );
-                        break;
-                    }
-                    Ok(n) => {
-                        let mut guard = iface.lock().unwrap();
-                        guard.receive(&buf[..n]);
-                    }
-                    Err(e) => {
-                        log(
-                            &format!("Read error on {}: {}", iface.lock().unwrap(), e),
-                            crate::LOG_ERROR,
-                            false,
-                            false,
-                        );
-                        break;
+                if is_initiator {
+                    if first_iter {
+                        first_iter = false;
+                    } else if let Some(name) = interface_name.as_ref() {
+                        let interface_repr = iface.lock().unwrap().to_string();
+                        crate::transport::Transport::synthesize_tunnel(name, &interface_repr);
                     }
                 }
+
+                if let Err(e) = socket.set_read_timeout(Some(Duration::from_secs(Self::READ_WAKE_INTERVAL))) {
+                    crate::log(
+                        &format!("Backbone read loop: set_read_timeout failed: {}", e),
+                        crate::LOG_WARNING,
+                        false,
+                        false,
+                    );
+                }
+
+                let mut buf = [0u8; 65536];
+
+                'reading: loop {
+                    match socket.read(&mut buf) {
+                        Ok(0) => {
+                            crate::log(
+                                "Backbone read loop: connection closed (read 0)",
+                                crate::LOG_NOTICE,
+                                false,
+                                false,
+                            );
+                            break 'reading;
+                        }
+                        Ok(n) => {
+                            let mut guard = iface.lock().unwrap();
+                            guard.receive(&buf[..n]);
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            if force_read_exit.load(Ordering::Relaxed) {
+                                crate::log(
+                                    "Backbone read loop: force_read_exit set by writer — exiting to reconnect",
+                                    crate::LOG_WARNING,
+                                    false,
+                                    false,
+                                );
+                                break 'reading;
+                            }
+                        }
+                        Err(e) => {
+                            crate::log(
+                                &format!("Read error on {}: {}", iface.lock().unwrap(), e),
+                                crate::LOG_ERROR,
+                                false,
+                                false,
+                            );
+                            break 'reading;
+                        }
+                    }
+                }
+
+                {
+                    let mut guard = iface.lock().unwrap();
+                    guard.base.online = false;
+                    if let Some(name) = &guard.base.name {
+                        crate::transport::Transport::set_interface_online(name, false);
+                    }
+                    guard.socket = None;
+                }
+
+                if !is_initiator {
+                    let iface_name = iface.lock().unwrap().base.name.clone();
+                    if let Some(ref name) = iface_name {
+                        crate::transport::Transport::deregister_interface_stub(name);
+                        crate::transport::Transport::unregister_outbound_handler(name);
+                        crate::log(
+                            &format!("Backbone server client disconnected, deregistered interface {}", name),
+                            crate::LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                    }
+                    break 'running;
+                }
+
+                if !Self::reconnect_until_success(&iface) {
+                    break 'running;
+                }
             }
+
+            iface.lock().unwrap().reconnecting = false;
         });
     }
 
     fn receive(&mut self, data: &[u8]) {
         if data.is_empty() {
             self.base.online = false;
+            if let Some(name) = &self.base.name {
+                crate::transport::Transport::set_interface_online(name, false);
+            }
             return;
         }
 
@@ -671,8 +867,8 @@ impl BackboneClientInterface {
     }
 
     pub fn process_outgoing(&mut self, data: Vec<u8>) -> Result<(), String> {
-        if !self.base.online {
-            return Ok(());
+        if !self.base.online || self.detached {
+            return Err("Interface offline or detached".to_string());
         }
 
         // Apply forced bitrate delay if set
@@ -687,14 +883,102 @@ impl BackboneClientInterface {
         let mut transmit = self.transmit_buffer.lock().unwrap();
         transmit.extend_from_slice(&framed);
 
-        if let Some(socket) = &self.socket {
+        let socket = self
+            .socket
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "No socket connection".to_string())?;
+
+        let write_result = {
             let mut stream_guard = socket.lock().unwrap();
-            let written = stream_guard.write(&transmit).unwrap_or(0);
-            self.base.txb += written as u64;
-            transmit.drain(..written);
+            match stream_guard.write(&transmit) {
+                Ok(written) => {
+                    self.base.txb += written as u64;
+                    transmit.drain(..written);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = stream_guard.shutdown(std::net::Shutdown::Both);
+                    Err(e)
+                }
+            }
+        };
+
+        if let Err(e) = write_result {
+            self.base.online = false;
+            if let Some(name) = &self.base.name {
+                crate::transport::Transport::set_interface_online(name, false);
+            }
+            self.force_read_exit.store(true, Ordering::Relaxed);
+            transmit.clear();
+            self.socket = None;
+            return Err(format!("Failed to send data: {}", e));
         }
 
         Ok(())
+    }
+
+    pub fn start_heartbeat_loop(interface: Arc<Mutex<BackboneClientInterface>>) {
+        {
+            let mut iface = interface.lock().unwrap();
+            if iface.heartbeat_running || !iface.initiator {
+                return;
+            }
+            iface.heartbeat_running = true;
+        }
+
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(Self::HEARTBEAT_INTERVAL));
+
+                let (detached, online, initiator, iname, irepr) = {
+                    let iface = match interface.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => break,
+                    };
+                    (
+                        iface.detached,
+                        iface.base.online,
+                        iface.initiator,
+                        iface.base.name.clone().unwrap_or_default(),
+                        iface.to_string(),
+                    )
+                };
+
+                if detached || !initiator {
+                    break;
+                }
+                if !online {
+                    continue;
+                }
+
+                crate::log(
+                    &format!("[HEARTBEAT] iface={} synthesize_tunnel", iname),
+                    crate::LOG_DEBUG,
+                    false,
+                    false,
+                );
+                crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+            }
+
+            if let Ok(mut iface) = interface.lock() {
+                iface.heartbeat_running = false;
+            }
+        });
+    }
+
+    pub fn detach(&mut self) {
+        self.base.online = false;
+        if let Some(name) = &self.base.name {
+            crate::transport::Transport::set_interface_online(name, false);
+        }
+        self.detached = true;
+        self.force_read_exit.store(true, Ordering::Relaxed);
+
+        if let Some(socket) = self.socket.as_ref().cloned() {
+            let _ = socket.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        }
+        self.socket = None;
     }
 
     pub fn to_string(&self) -> String {
@@ -725,4 +1009,24 @@ fn _now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackboneClientInterface;
+
+    #[test]
+    fn resolve_target_addr_accepts_ip_literals() {
+        let addr = BackboneClientInterface::resolve_target_addr("127.0.0.1", 4242)
+            .expect("resolve ip literal");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(addr.port(), 4242);
+    }
+
+    #[test]
+    fn resolve_target_addr_accepts_hostnames() {
+        let addr = BackboneClientInterface::resolve_target_addr("localhost", 4242)
+            .expect("resolve hostname");
+        assert_eq!(addr.port(), 4242);
+    }
 }

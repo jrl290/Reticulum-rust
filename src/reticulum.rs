@@ -1551,7 +1551,7 @@ impl Reticulum {
 
             // Extract address and port for TCP interfaces
             match typ {
-                "TCPClientInterface" => {
+                "TCPClientInterface" | "BackboneClientInterface" => {
                     stub_config.address = config_map.get("target_host").map(|h| h.to_string());
                     stub_config.port = config_map.get("target_port")
                         .and_then(|p| p.parse::<u16>().ok());
@@ -1914,6 +1914,9 @@ impl Reticulum {
                     match crate::interfaces::backbone_interface::BackboneClientInterface::new(&config_map) {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+                            stub_config.online = Some(interface.base.online && !interface.detached);
+                            let is_online = interface.base.online;
+                            let interface_repr = interface.to_string();
                             let interface = Arc::new(Mutex::new(interface));
                             let handler_iface = Arc::clone(&interface);
                             let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
@@ -1925,6 +1928,15 @@ impl Reticulum {
                                 }),
                             );
                             crate::interfaces::backbone_interface::BackboneClientInterface::start_read_loop(Arc::clone(&interface));
+                            crate::interfaces::backbone_interface::BackboneClientInterface::start_heartbeat_loop(Arc::clone(&interface));
+                            stub_config.repr = Some(interface_repr.clone());
+                            // Match the TCP client ordering: the transport stub
+                            // must exist before tunnel synthesis so the packet
+                            // can route to this interface on the initial connect.
+                            crate::transport::Transport::register_interface_stub_config(stub_config.clone());
+                            if is_online {
+                                crate::transport::Transport::synthesize_tunnel(&name, &interface_repr);
+                            }
                             self.system_interfaces.push(SystemInterface::BackboneClient(interface));
                         }
                         Err(err) => {
@@ -1939,7 +1951,6 @@ impl Reticulum {
                             }
                         }
                     }
-                    crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
                 "AutoInterface" => {
                     let ai_group_id = config.get("group_id").map(|s| s.to_string());
