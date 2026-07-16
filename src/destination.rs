@@ -122,6 +122,12 @@ pub struct Destination {
 	// GROUP destination fields
 	pub prv_bytes: Option<Vec<u8>>,  // Symmetric key for GROUP destinations
 	pub token: Arc<Mutex<Option<Token>>>,  // Token for GROUP encryption
+	/// Wall-clock (Unix seconds) of the last re-announce triggered by a
+	/// decrypt failure.  Rate-limited: at most one re-announce per 60 s.
+	/// When a sender encrypts with a stale ratchet we no longer hold,
+	/// re-announcing gives them our current ratchet so the next message
+	/// decrypts successfully.
+	pub last_ratchet_announce_on_failure: u64,
 }
 
 impl Clone for Destination {
@@ -154,6 +160,7 @@ impl Clone for Destination {
 			links: self.links.clone(),
 			prv_bytes: self.prv_bytes.clone(),
 			token: Arc::clone(&self.token),
+			last_ratchet_announce_on_failure: self.last_ratchet_announce_on_failure,
 		}
 	}
 }
@@ -202,6 +209,7 @@ impl Default for Destination {
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
+			last_ratchet_announce_on_failure: 0,
 		}
 	}
 }
@@ -397,6 +405,7 @@ impl Destination {
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
+			last_ratchet_announce_on_failure: 0,
 		})
 	}
 
@@ -480,6 +489,7 @@ impl Destination {
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
+			last_ratchet_announce_on_failure: 0,
 		})
 	}
 	
@@ -1152,12 +1162,35 @@ impl Destination {
 				}
 				let dest_ratchets_clone = self.ratchets.clone();
 				crate::log(&format!("[RATCHET] after reload: {} ratchets", dest_ratchets_clone.as_ref().map(|r| r.len()).unwrap_or(0)), crate::LOG_NOTICE, false, false);
-				if let Some(identity) = self.identity.as_mut() {
+				let retry_result = if let Some(identity) = self.identity.as_mut() {
 					let dr = dest_ratchets_clone.as_ref().map(|r| r.as_slice());
 					identity.decrypt_with_ratchets(ciphertext, dr)
 				} else {
-					Err("No identity for decryption".to_string())
+					return Err("No identity for decryption".to_string());
+				};
+
+				if retry_result.is_err() {
+					// Both attempts failed — the sender used a ratchet we no longer
+					// hold.  Re-announce ourselves so the sender picks up our
+					// current ratchet.  Rate-limit to at most one re-announce
+					// per 60 seconds to avoid spam from malformed packets.
+					let now = SystemTime::now()
+						.duration_since(UNIX_EPOCH)
+						.map(|d| d.as_secs())
+						.unwrap_or(0);
+					if now.saturating_sub(self.last_ratchet_announce_on_failure) >= 60 {
+						self.last_ratchet_announce_on_failure = now;
+						crate::log(&format!(
+							"[DEST-RX] decrypt failed — re-announcing to update sender ratchets dest={}",
+							crate::hexrep(&self.hash, false)
+						), crate::LOG_NOTICE, false, false);
+						// send=true: actually broadcast the announce so senders
+						// receive our current ratchet via the network.
+						let _ = self.announce(None, false, None, None, true);
+					}
 				}
+
+				retry_result
 			}
 			DestinationType::Group => {
 				if let Ok(token_guard) = self.token.lock() {

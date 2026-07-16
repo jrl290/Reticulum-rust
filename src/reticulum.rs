@@ -357,29 +357,24 @@ impl Reticulum {
     fn get_path_table_local(max_hops: Option<u8>) -> Vec<HashMap<String, String>> {
         let snapshot = crate::transport::get_state_snapshot();
         let mut out = Vec::new();
-        for (hash, entry) in snapshot.path_table {
-            if let Some(limit) = max_hops {
-                if let Some(crate::transport::PathEntryValue::Hops(hops)) = entry.get(crate::transport::IDX_PT_HOPS) {
-                    if *hops > limit {
+        for (hash, deque) in snapshot.path_table {
+            for entry in deque {
+                if let Some(limit) = max_hops {
+                    if entry.hops > limit {
                         continue;
                     }
                 }
+                let mut map = HashMap::new();
+                map.insert("hash".to_string(), crate::hexrep(&hash, false));
+                map.insert("timestamp".to_string(), entry.timestamp.to_string());
+                map.insert("via".to_string(), crate::hexrep(&entry.next_hop, false));
+                map.insert("hops".to_string(), entry.hops.to_string());
+                map.insert("expires".to_string(), entry.expires.to_string());
+                if let Some(ref iface) = entry.receiving_interface {
+                    map.insert("interface".to_string(), iface.clone());
+                }
+                out.push(map);
             }
-            let mut map = HashMap::new();
-            map.insert("hash".to_string(), crate::hexrep(&hash, false));
-            if let Some(crate::transport::PathEntryValue::Timestamp(ts)) = entry.get(crate::transport::IDX_PT_TIMESTAMP) {
-                map.insert("timestamp".to_string(), ts.to_string());
-            }
-            if let Some(crate::transport::PathEntryValue::NextHop(next)) = entry.get(crate::transport::IDX_PT_NEXT_HOP) {
-                map.insert("via".to_string(), crate::hexrep(next, false));
-            }
-            if let Some(crate::transport::PathEntryValue::Hops(hops)) = entry.get(crate::transport::IDX_PT_HOPS) {
-                map.insert("hops".to_string(), hops.to_string());
-            }
-            if let Some(crate::transport::PathEntryValue::Expires(expires)) = entry.get(crate::transport::IDX_PT_EXPIRES) {
-                map.insert("expires".to_string(), expires.to_string());
-            }
-            out.push(map);
         }
         out
     }
@@ -401,11 +396,12 @@ impl Reticulum {
     fn drop_all_via_local(transport_hash: &[u8]) -> usize {
         let snapshot = crate::transport::get_state_snapshot();
         let mut dropped = 0;
-        for (dest_hash, entry) in snapshot.path_table {
-            if let Some(crate::transport::PathEntryValue::NextHop(next)) = entry.get(crate::transport::IDX_PT_NEXT_HOP) {
-                if next == transport_hash {
+        for (dest_hash, deque) in snapshot.path_table {
+            for entry in deque {
+                if entry.next_hop == transport_hash {
                     if crate::transport::Transport::expire_path(&dest_hash) {
                         dropped += 1;
+                        break; // expire_path removes the entire dest, no need to check remaining entries
                     }
                 }
             }

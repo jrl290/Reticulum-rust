@@ -5,7 +5,7 @@ use crate::identity::Identity;
 use crate::packet::{Packet, ANNOUNCE, DATA, LINKREQUEST, PROOF, CACHE_REQUEST};
 use crate::{log, LOG_DEBUG, LOG_ERROR, LOG_EXTREME, LOG_NOTICE, LOG_WARNING};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -88,9 +88,31 @@ pub const MAX_RECEIPTS: usize = 1024;
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
 pub const PERSIST_RANDOM_BLOBS: usize = 32;
 pub const MAX_RANDOM_BLOBS: usize = 64;
+/// Max number of alternative paths stored per destination in the
+/// multi-entry path table.  N=3 gives diversity without ballooning
+/// memory (≈ 3× the old single-entry cost, offset by halving the
+/// global blob cap from 64 → 16 since blobs are now purely anti-replay).
+pub const MAX_PATHS_PER_DEST: usize = 3;
+/// Max entries in the global anti-replay blob set.  Decoupled from
+/// per-path storage; 16 entries is sufficient for pure replay rejection
+/// (previously 64 was needed because blobs double-tracked freshness).
+pub const MAX_GLOBAL_BLOBS: usize = 16;
 pub const LOCAL_CLIENT_CACHE_MAXSIZE: usize = 512;
 
-// Table entry indices
+/// Maximum age of a path entry's announce timestamp before the path is
+/// considered stale and a hedge-duplicate is sent on an alternative path
+/// (if one exists).  Set to 1/10 of the link staleness threshold so that
+/// a path that hasn't heard a fresh announce in >72 s is treated as
+/// suspicious *before* the link-layer timeout fires.  Only applied to
+/// multi-hop transport paths (hops ≥ 2) where silent path failure is
+/// undetectable by intermediate nodes.
+///
+/// See DESIGN_PRINCIPLES.md §1 — the hedge guarantees delivery latency
+/// stays within the 5 s send budget even when the primary path is
+/// black-holing.
+pub const PATH_STALE_THRESHOLD: f64 = crate::link::STALE_TIME / 10.0; // 72 s
+
+// ── Legacy table entry indices (deprecated — kept for tunnel paths) ────────
 pub const IDX_PT_TIMESTAMP: usize = 0;
 pub const IDX_PT_NEXT_HOP: usize = 1;
 pub const IDX_PT_HOPS: usize = 2;
@@ -324,7 +346,10 @@ pub struct TransportState {
     pub validated_announce_hashes_prev: HashSet<Vec<u8>>,
     pub receipts: Vec<crate::packet::PacketReceipt>,
     pub announce_table: HashMap<Vec<u8>, Vec<AnnounceEntryValue>>,
-    pub path_table: HashMap<Vec<u8>, Vec<PathEntryValue>>,
+    /// Multi-path table: each destination hash maps to a bounded deque of
+    /// `PathEntry` (max N=3), newest-first. See `PathEntry::score()` for
+    /// the selection priority formula (bitrate / (hops + 1)).
+    pub path_table: HashMap<Vec<u8>, VecDeque<PathEntry>>,
     pub reverse_table: HashMap<Vec<u8>, Vec<ReverseEntryValue>>,
     pub link_table: HashMap<Vec<u8>, Vec<LinkEntryValue>>,
     pub held_announces: HashMap<Vec<u8>, Vec<AnnounceEntryValue>>,
@@ -332,7 +357,10 @@ pub struct TransportState {
     pub tunnels: HashMap<Vec<u8>, Vec<TunnelEntryValue>>,
     pub announce_rate_table: HashMap<Vec<u8>, AnnounceRateEntry>,
     pub path_requests: HashMap<Vec<u8>, f64>,
-    pub path_states: HashMap<Vec<u8>, u8>,
+    /// Global anti-replay blob set — decoupled from individual path entries.
+    /// Each announce carries a 10-byte random blob; we track seen blobs here
+    /// to reject replays regardless of which path they arrived on.
+    pub global_blobs: HashSet<Vec<u8>>,
     pub blackholed_identities: HashMap<Vec<u8>, BlackholeEntry>,
     pub discovery_path_requests: HashMap<Vec<u8>, DiscoveryPathRequest>,
     /// FIFO queue of recently-seen path-request tags (for eviction order).
@@ -455,6 +483,41 @@ pub enum AnnounceEntryValue {
     AttachedInterface(Option<String>),
 }
 
+/// A single learned path to a destination. Replaces the old sparse-vector
+/// `Vec<PathEntryValue>` encoding. Each destination now stores a bounded
+/// `VecDeque<PathEntry>` (max N=3), ordered newest-first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathEntry {
+    /// Wall-clock timestamp when this path was learned (Unix seconds).
+    pub timestamp: f64,
+    /// Transport identity hash of the next-hop node.
+    pub next_hop: Vec<u8>,
+    /// Number of hops to the destination via this path.
+    pub hops: u8,
+    /// Absolute expiry wall-clock (timestamp + DESTINATION_TIMEOUT).
+    pub expires: f64,
+    /// Name of the interface that received the announcing packet.
+    pub receiving_interface: Option<String>,
+    /// Packet hash of the announce that established this path.
+    pub packet_hash: Vec<u8>,
+}
+
+impl PathEntry {
+    /// Quality score: higher is better.  Uses `bitrate / (hops + 1)` so
+    /// fast interfaces with few hops win.  Falls back to a nominal
+    /// 1000 bps when the interface bitrate is unknown (still hop-aware).
+    pub fn score(&self, interface_bitrate: Option<f64>) -> f64 {
+        let br = interface_bitrate.unwrap_or(1000.0);
+        br / (self.hops as f64 + 1.0)
+    }
+
+    /// True when this entry's expiry has elapsed.
+    pub fn is_expired(&self, now: f64) -> bool {
+        now >= self.expires
+    }
+}
+
+// ── Legacy sparse-vector type — kept during migration for tunnel paths ──────
 #[derive(Clone, Debug)]
 pub enum PathEntryValue {
     Timestamp(f64),
@@ -702,7 +765,7 @@ static OUTBOUND_HANDLERS: Lazy<Mutex<HashMap<String, OutboundHandler>>> =
 #[derive(Clone, Debug)]
 pub struct TransportSnapshot {
     pub interfaces: Vec<InterfaceStub>,
-    pub path_table: HashMap<Vec<u8>, Vec<PathEntryValue>>,
+    pub path_table: HashMap<Vec<u8>, VecDeque<PathEntry>>,
     pub announce_rate_table: HashMap<Vec<u8>, AnnounceRateEntry>,
     pub link_table_len: usize,
     pub local_client_rssi_cache: Vec<(Vec<u8>, f64)>,
@@ -1017,56 +1080,86 @@ impl Transport {
                 if let Ok(mut file) = File::open(&dest_table_path) {
                     let mut buf = Vec::new();
                     if file.read_to_end(&mut buf).is_ok() {
-                        if let Ok(entries) = from_slice::<Vec<SerializedPathEntry>>(&buf) {
-                            let now_ts = now();
-                            let mut loaded = 0usize;
-                            let mut loaded_dests: Vec<String> = Vec::new();
-                            for entry in entries {
-                                // Skip expired paths
-                                if entry.expires > 0.0 && entry.expires < now_ts {
-                                    continue;
+                        let now_ts = now();
+                        let mut loaded = 0usize;
+                        let mut loaded_dests: Vec<String> = Vec::new();
+
+                        // Try new format first: Vec<(Vec<u8>, Vec<PathEntry>)>
+                        let loaded_entries: Option<Vec<(Vec<u8>, Vec<PathEntry>)>> =
+                            from_slice(&buf).ok();
+
+                        if let Some(entries) = loaded_entries {
+                            for (dest_hash, path_entries) in entries {
+                                let mut deque: VecDeque<PathEntry> = VecDeque::new();
+                                for entry in path_entries {
+                                    if entry.is_expired(now_ts) {
+                                        continue;
+                                    }
+                                    deque.push_back(entry);
                                 }
-                                let interface_name = if entry.interface_hash.is_empty() {
-                                    None
-                                } else {
-                                    Some(String::from_utf8_lossy(&entry.interface_hash).to_string())
-                                };
-                                let path_entry = vec![
-                                    PathEntryValue::Timestamp(entry.timestamp),
-                                    PathEntryValue::NextHop(entry.received_from),
-                                    PathEntryValue::Hops(entry.hops),
-                                    PathEntryValue::Expires(entry.expires),
-                                    PathEntryValue::RandomBlobs(entry.random_blobs),
-                                    PathEntryValue::ReceivingInterface(interface_name),
-                                    PathEntryValue::PacketHash(entry.packet_hash),
-                                ];
-                                if loaded_dests.len() < 32 {
-                                    loaded_dests.push(crate::hexrep(
-                                        &entry.destination_hash[..entry.destination_hash.len().min(4)],
-                                        false,
-                                    ));
+                                if !deque.is_empty() {
+                                    if loaded_dests.len() < 32 {
+                                        loaded_dests.push(crate::hexrep(
+                                            &dest_hash[..dest_hash.len().min(4)],
+                                            false,
+                                        ));
+                                    }
+                                    state.path_table.insert(dest_hash, deque);
+                                    loaded += 1;
                                 }
-                                state.path_table.insert(entry.destination_hash, path_entry);
-                                loaded += 1;
                             }
-                            // Loaded entries are by definition already
-                            // on disk — clear the dirty flag so the
-                            // first opportunistic save isn't a no-op
-                            // round trip.
-                            state.path_table_dirty = false;
-                            state.path_table_last_saved = now_ts;
-                            log(
-                                &format!(
-                                    "Loaded {} cached path entries from disk: [{}]{}",
-                                    loaded,
-                                    loaded_dests.join(","),
-                                    if loaded > loaded_dests.len() { ",…" } else { "" },
-                                ),
-                                LOG_NOTICE,
-                                false,
-                                false,
-                            );
+                        } else {
+                            // Fallback: try old SerializedPathEntry format
+                            if let Ok(old_entries) = from_slice::<Vec<SerializedPathEntry>>(&buf) {
+                                for entry in old_entries {
+                                    if entry.expires > 0.0 && entry.expires < now_ts {
+                                        continue;
+                                    }
+                                    let interface_name = if entry.interface_hash.is_empty() {
+                                        None
+                                    } else {
+                                        Some(String::from_utf8_lossy(&entry.interface_hash).to_string())
+                                    };
+                                    let pe = PathEntry {
+                                        timestamp: entry.timestamp,
+                                        next_hop: entry.received_from,
+                                        hops: entry.hops,
+                                        expires: entry.expires,
+                                        receiving_interface: interface_name,
+                                        packet_hash: entry.packet_hash,
+                                    };
+                                    if loaded_dests.len() < 32 {
+                                        loaded_dests.push(crate::hexrep(
+                                            &entry.destination_hash[..entry.destination_hash.len().min(4)],
+                                            false,
+                                        ));
+                                    }
+                                    let mut deque = VecDeque::new();
+                                    deque.push_back(pe);
+                                    state.path_table.insert(entry.destination_hash, deque);
+                                    loaded += 1;
+                                }
+                            }
                         }
+                        // END fallback
+
+                        // Loaded entries are by definition already
+                        // on disk — clear the dirty flag so the
+                        // first opportunistic save isn't a no-op
+                        // round trip.
+                        state.path_table_dirty = false;
+                        state.path_table_last_saved = now_ts;
+                        log(
+                            &format!(
+                                "Loaded {} cached path entries from disk: [{}]{}",
+                                loaded,
+                                loaded_dests.join(","),
+                                if loaded > loaded_dests.len() { ",…" } else { "" },
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
                     }
                 }
             }
@@ -1810,10 +1903,9 @@ impl Transport {
         }
 
         if !state.local_client_interfaces.is_empty() {
-            if let Some(path_entry) = state.path_table.get(&destination_hash) {
-                if let Some(PathEntryValue::ReceivingInterface(Some(name))) =
-                    path_entry.get(IDX_PT_RVCD_IF)
-                {
+            let now_ts = now();
+            if let Some((_, best)) = Self::select_path(&state.path_table, &state.interfaces, &destination_hash, now_ts) {
+                if let Some(ref name) = best.receiving_interface {
                     if Transport::is_local_client_interface_locked(&state, name) {
                         if let Some(attached_name) = attached_interface.as_ref() {
                             let matched_intf = state
@@ -1864,38 +1956,14 @@ impl Transport {
             return;
         }
 
-        if (state.transport_enabled || is_from_local_client)
-            && state.path_table.contains_key(&destination_hash)
-        {
-            let path_entry = match state.path_table.get(&destination_hash).cloned() {
-                Some(entry) => entry,
-                None => return,
-            };
-
-            let packet_hash = match path_entry.get(IDX_PT_PACKET) {
-                Some(PathEntryValue::PacketHash(hash)) => {
-                    hash.clone()
-                },
-                _ => {
-                    log("Could not retrieve packet hash from path table", LOG_ERROR, false, false);
-                    return;
-                }
-            };
-
-            let next_hop = match path_entry.get(IDX_PT_NEXT_HOP) {
-                Some(PathEntryValue::NextHop(nh)) => nh.clone(),
-                _ => Vec::new(),
-            };
-
-            let announce_hops = match path_entry.get(IDX_PT_HOPS) {
-                Some(PathEntryValue::Hops(h)) => *h,
-                _ => 0,
-            };
-
-            let received_from_intf = match path_entry.get(IDX_PT_RVCD_IF) {
-                Some(PathEntryValue::ReceivingInterface(intf)) => intf.clone(),
-                _ => None,
-            };
+        if state.transport_enabled || is_from_local_client {
+            let now_ts = now();
+            let selected = Self::select_path(&state.path_table, &state.interfaces, &destination_hash, now_ts);
+            if let Some((_, best)) = selected {
+            let packet_hash = best.packet_hash.clone();
+            let next_hop = best.next_hop.clone();
+            let announce_hops = best.hops;
+            let received_from_intf = best.receiving_interface.clone();
 
             if let Some(req_id) = &requestor_transport_id {
                 if req_id == &next_hop {
@@ -2084,6 +2152,9 @@ impl Transport {
             } else {
                 drop(state);
             }
+            } else {
+                drop(state);
+            }
             return;
         }
 
@@ -2197,12 +2268,8 @@ impl Transport {
     
     // Helper to check next hop interface without requiring mutable state
     fn next_hop_interface_locked(state: &TransportState, destination_hash: &[u8]) -> Option<String> {
-        if let Some(path_entry) = state.path_table.get(destination_hash) {
-            if let Some(PathEntryValue::ReceivingInterface(intf)) = path_entry.get(IDX_PT_RVCD_IF) {
-                return intf.clone();
-            }
-        }
-        None
+        Self::select_path(&state.path_table, &state.interfaces, destination_hash, now())
+            .and_then(|(_, e)| e.receiving_interface)
     }
     
     // Helper to check if interface is local client without requiring mutable state
@@ -2357,9 +2424,9 @@ impl Transport {
                     if !state.transport_enabled {
                         if let Ok(dest) = link.destination.lock() {
                             let dest_hash = dest.hash.clone();
-                            if let Some(entry) = state.path_table.get_mut(&dest_hash) {
-                                if let Some(PathEntryValue::Timestamp(ts)) = entry.get_mut(IDX_PT_TIMESTAMP) {
-                                    *ts = 0.0;
+                            if let Some(deque) = state.path_table.get_mut(&dest_hash) {
+                                if let Some(front) = deque.front_mut() {
+                                    front.timestamp = 0.0;
                                 }
                                 state.tables_last_culled = 0.0;
                             }
@@ -2725,13 +2792,6 @@ impl Transport {
                 .iter()
                 .map(|i| (i.name.clone(), i.mode))
                 .collect();
-            let mut stale_path_states = Vec::new();
-            for destination_hash in state.path_states.keys() {
-                if !state.path_table.contains_key(destination_hash) {
-                    stale_path_states.push(destination_hash.clone());
-                }
-            }
-
             let mut stale_reverse_entries = Vec::new();
             for (hash, entry) in state.reverse_table.iter() {
                 let timestamp = match entry.get(IDX_RT_TIMESTAMP) {
@@ -2810,14 +2870,9 @@ impl Transport {
                         let mut should_mark_unresponsive = false;
 
                         let has_path = state.path_table.contains_key(&dest_hash);
-                        let hops_to_dest = if let Some(entry) = state.path_table.get(&dest_hash) {
-                            match entry.get(IDX_PT_HOPS) {
-                                Some(PathEntryValue::Hops(h)) => *h,
-                                _ => 0,
-                            }
-                        } else {
-                            0
-                        };
+                        let hops_to_dest = Self::select_path(
+                            &state.path_table, &state.interfaces, &dest_hash, now(),
+                        ).map(|(_, e)| e.hops).unwrap_or(0);
 
                         // If path has been invalidated, try to rediscover it
                         if !has_path {
@@ -2857,9 +2912,10 @@ impl Transport {
                         }
 
                         if path_request_conditions {
+                            let blocked = blocked_if_name.clone();
                             path_rediscovery_tasks.push((
                                 dest_hash.clone(),
-                                blocked_if_name,
+                                blocked,
                                 should_mark_unresponsive,
                                 !state.transport_enabled,
                             ));
@@ -2870,13 +2926,14 @@ impl Transport {
 
             // Process path rediscovery tasks (may need to drop/reacquire lock)
             for (dest_hash, blocked_if_name, mark_unresponsive, should_expire) in path_rediscovery_tasks {
+                let blocked_clone = blocked_if_name.clone();
                 if !path_requests.contains_key(&dest_hash) {
                     path_requests.insert(dest_hash.clone(), blocked_if_name);
                 }
 
                 if mark_unresponsive {
                     drop(state);
-                    Transport::mark_path_unresponsive(&dest_hash);
+                    Transport::mark_path_unresponsive(&dest_hash, blocked_clone.as_deref());
                     state = TRANSPORT.lock().unwrap();
                 }
 
@@ -2888,93 +2945,51 @@ impl Transport {
             }
 
             let mut stale_paths = Vec::new();
-            for (destination_hash, entry) in state.path_table.iter() {
-                let timestamp = match entry.get(IDX_PT_TIMESTAMP) {
-                    Some(PathEntryValue::Timestamp(ts)) => *ts,
-                    _ => 0.0,
-                };
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1, §2
-                //
-                // Use the stored `Expires` field, not `timestamp + DESTINATION_TIMEOUT`.
-                //
-                // expire_path() sets timestamp=0 ("soft-expire") to signal that
-                // race_path() must issue a fresh PATH_REQUEST before using this entry.
-                // It intentionally leaves the `Expires` field untouched so the PATH
-                // QUALITY GATE (below, in the announce handler) can still reject worse
-                // inbound paths — i.e., if we had a good 2-hop path cached and
-                // expire_path is called, the gate will not overwrite it with a 12-hop
-                // stale PATH_RESPONSE from a remote node.
-                //
-                // If we compute `destination_expiry = timestamp + DESTINATION_TIMEOUT`
-                // (the old code), a soft-expired entry gives:
-                //   `0.0 + 604800 ≈ 7 days in Unix seconds << now() (≈ 1.7 × 10⁹ s)`
-                // … so EVERY soft-expired entry is immediately culled here, destroying
-                // the cached hop-count before the quality gate can compare it.
-                // After the entry is gone, the next PATH_RESPONSE is always accepted
-                // unconditionally (has_existing=false), even if it is much worse.
-                //
-                // The fix: use the stored `Expires` value.  expire_path() does NOT
-                // change that field, so a recently-stored path (expires = now+7 days)
-                // survives the cull while still being "soft-expired" for has_path().
-                // A path is only culled when its `Expires` timestamp has genuinely
-                // elapsed (7 days after the path was last verified by a live announce
-                // or PATH_RESPONSE).
-                let stored_expires = match entry.get(IDX_PT_EXPIRES) {
-                    Some(PathEntryValue::Expires(e)) if *e > 0.0 => *e,
-                    _ => timestamp + DESTINATION_TIMEOUT,
-                };
-                let mut destination_expiry = stored_expires;
-                let attached = match entry.get(IDX_PT_RVCD_IF) {
-                    Some(PathEntryValue::ReceivingInterface(name)) => name.clone(),
-                    _ => None,
-                };
-                if let Some(name) = &attached {
-                    if let Some(mode) = interface_modes.get(name) {
-                        if *mode == InterfaceStub::MODE_ACCESS_POINT {
-                            destination_expiry = timestamp + AP_PATH_TIME;
-                        } else if *mode == InterfaceStub::MODE_ROAMING {
-                            destination_expiry = timestamp + ROAMING_PATH_TIME;
+            // Multi-entry culling: iterate each dest's deque, evict expired
+            // entries, remove the dest entirely when its deque is empty.
+            let now_ts = now();
+            let mut cull_dirty = false;
+            for (destination_hash, entries) in state.path_table.iter_mut() {
+                // Evict individual expired entries
+                let before = entries.len();
+                entries.retain(|e| !e.is_expired(now_ts));
+                if entries.is_empty() {
+                    stale_paths.push(destination_hash.clone());
+                } else if entries.len() != before {
+                    cull_dirty = true;
+                }
+            }
+            // Apply mode-adjusted expiry for access-point / roaming
+            // interfaces: re-check each remaining entry's attached interface
+            // and remove those that have outlived their mode-specific expiry.
+            let mut ap_roam_stale: Vec<Vec<u8>> = Vec::new();
+            for (destination_hash, entries) in state.path_table.iter_mut() {
+                let before = entries.len();
+                entries.retain(|e| {
+                    let mut expiry = e.expires;
+                    if let Some(ref name) = e.receiving_interface {
+                        if let Some(mode) = interface_modes.get(name) {
+                            if *mode == InterfaceStub::MODE_ACCESS_POINT {
+                                expiry = e.timestamp + AP_PATH_TIME;
+                            } else if *mode == InterfaceStub::MODE_ROAMING {
+                                expiry = e.timestamp + ROAMING_PATH_TIME;
+                            }
                         }
                     }
-                    // NOTE: We deliberately do NOT stale-mark a path
-                    // whose attached interface is unknown to the
-                    // current `interface_modes` snapshot.
-                    //
-                    // Reasoning (DESIGN_PRINCIPLES.md §4 — strict
-                    // ordering of dependent operations):
-                    //
-                    // `Transport::start()` loads the cached path
-                    // table from disk BEFORE `load_system_interfaces()`
-                    // pushes interface stubs into `state.interfaces`.
-                    // The jobloop spawned by `start()` runs every
-                    // `job_interval` (250 ms) and the table cull
-                    // fires unconditionally on its first tick because
-                    // `tables_last_culled` defaults to 0.0.
-                    //
-                    // The previous behaviour ("attached not in
-                    // interface_modes → stale_paths.push") therefore
-                    // wiped every disk-cached path on cold start
-                    // before the upstream rnsd had a chance to route
-                    // an announce that would re-populate them. The
-                    // observable failure was a 60+ second cold-start
-                    // stall on iOS / Android, where every essential
-                    // destination had to be re-resolved over the
-                    // wire even though a perfectly good cached entry
-                    // had been on disk seconds earlier.
-                    //
-                    // The legitimate "interface was removed" case is
-                    // (and must be) handled at deregistration time,
-                    // not lazily by this cull. DESTINATION_TIMEOUT
-                    // (1 week) bounds the worst-case staleness for
-                    // entries whose interface vanished without a
-                    // proper deregister call.
-                    //
-                    // NEVER REMOVE EVER — re-introducing the eager
-                    // eviction would re-introduce the cold-start
-                    // stall.
+                    now_ts < expiry
+                });
+                if entries.is_empty() && before > 0 {
+                    ap_roam_stale.push(destination_hash.clone());
+                } else if entries.len() != before {
+                    cull_dirty = true;
                 }
-                if now() > destination_expiry {
-                    stale_paths.push(destination_hash.clone());
+            }
+            if cull_dirty {
+                state.path_table_dirty = true;
+            }
+            for hash in ap_roam_stale {
+                if !stale_paths.contains(&hash) {
+                    stale_paths.push(hash);
                 }
             }
 
@@ -3023,10 +3038,6 @@ impl Transport {
             for destination_hash in stale_paths {
                 state.path_table.remove(&destination_hash);
                 state.path_table_dirty = true;
-            }
-
-            for destination_hash in stale_path_states {
-                state.path_states.remove(&destination_hash);
             }
 
             for destination_hash in stale_discovery {
@@ -3210,108 +3221,95 @@ impl Transport {
 
         let destination_hash = packet.destination_hash.clone().or_else(|| packet.destination.as_ref().map(|d| d.hash.clone()));
 
-        if packet.packet_type != ANNOUNCE
+        // Determine if we have a path-routed packet (non-ANNOUNCE, non-Plain, non-Group)
+        let path_routable = packet.packet_type != ANNOUNCE
             && packet.destination_type != Some(crate::destination::DestinationType::Plain)
             && packet.destination_type != Some(crate::destination::DestinationType::Group)
-            && destination_hash.is_some()
-            && state.path_table.contains_key(destination_hash.as_ref().unwrap())
-        {
+            && destination_hash.is_some();
+
+        let mut all_paths: Vec<(usize, f64, PathEntry)> = Vec::new();
+        if path_routable {
             let dest_hash = destination_hash.as_ref().unwrap();
-            let entry = state.path_table.get(dest_hash).unwrap();
-            let outbound_interface_name = match entry.get(IDX_PT_RVCD_IF) {
-                Some(PathEntryValue::ReceivingInterface(Some(name))) => Some(name.clone()),
-                _ => None,
-            };
-            let outbound_interface_exists = outbound_interface_name
-                .as_ref()
-                .map(|name| state.interfaces.iter().any(|i| &i.name == name))
-                .unwrap_or(false);
+            all_paths = Self::select_all_paths(&state.path_table, &state.interfaces, dest_hash, outbound_time);
+        }
 
-            let hops = match entry.get(IDX_PT_HOPS) {
-                Some(PathEntryValue::Hops(hops)) => *hops,
-                _ => 0,
-            };
+        // ── Path-routed packet: multi-path hedging ──────────────────────────
+        // Walk paths in score order (best first).  Every path gets the packet;
+        // if the path is stale (multi-hop transport only, hops ≥ 2) we fire a
+        // path_request to refresh it AND continue to the next-best path so
+        // delivery isn't gated on a dead route.  The first fresh path stops
+        // the hedge.
+        //
+        // Stale paths also get their expiry shortened to
+        // now + PATH_STALE_THRESHOLD so that truly-dead paths are culled
+        // quickly instead of duplicating traffic for up to 7 days.
+        // Never lengthen an existing expiry (e.g. don't override a shorter
+        // roaming-path timeout).
+        let mut stale_deferred: Vec<(Vec<u8>, Option<String>)> = Vec::new();
+        if !all_paths.is_empty() {
+            let dest_hash = destination_hash.as_ref().unwrap();
+            mark_packet_sent(packet, outbound_time);
 
-            // LINKREQUEST (2) and PROOF (3) are rare and critical for diagnosing
-            // link establishment.  Log them at NOTICE so they appear in production logs.
-            let outbound_log_level = if packet.packet_type == LINKREQUEST || packet.packet_type == PROOF {
-                crate::LOG_NOTICE
-            } else {
-                crate::LOG_VERBOSE
-            };
-            crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
-                packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                hops, outbound_interface_name, outbound_interface_exists), outbound_log_level, false, false);
-            if !outbound_interface_exists {
-                let next_hop = match entry.get(IDX_PT_NEXT_HOP) {
-                    Some(PathEntryValue::NextHop(next_hop)) => crate::hexrep(next_hop, false),
-                    _ => "none".to_string(),
+            for (_idx, _score, entry) in &all_paths {
+                let hops = entry.hops;
+                let outbound_interface_name = entry.receiving_interface.clone();
+                let outbound_interface_exists = outbound_interface_name
+                    .as_ref()
+                    .map(|name| state.interfaces.iter().any(|i| &i.name == name))
+                    .unwrap_or(false);
+
+                // LINKREQUEST (2) and PROOF (3) are rare and critical for
+                // diagnosing link establishment.  Log at NOTICE.
+                let outbound_log_level = if packet.packet_type == LINKREQUEST || packet.packet_type == PROOF {
+                    crate::LOG_NOTICE
+                } else {
+                    crate::LOG_VERBOSE
                 };
-                let live_ifaces: Vec<String> = state.interfaces.iter().map(|iface| iface.name.clone()).collect();
-                let live_local_client_ifaces: Vec<String> = state
-                    .local_client_interfaces
-                    .iter()
-                    .map(|iface| iface.name.clone())
-                    .collect();
-                crate::log(
-                    &format!(
-                        "[OUTBOUND] missing interface for path dest={} next_hop={} expected_iface={:?} live_ifaces={:?} local_client_ifaces={:?}",
-                        crate::hexrep(dest_hash, false),
-                        next_hop,
-                        outbound_interface_name,
-                        live_ifaces,
-                        live_local_client_ifaces,
-                    ),
-                    crate::LOG_WARNING,
-                    false,
-                    false,
-                );
-            }
-
-            if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
-                if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
-                    if let PathEntryValue::NextHop(next_hop) = next_hop {
-                        // If next_hop == destination_hash, this path was learned from a
-                        // HEADER_1 announce (no transport relay).  The transport node we're
-                        // directly connected to can route it, so send as HEADER_1 directly
-                        // instead of wrapping in HEADER_2 with an invalid transport_id.
-                        if next_hop == dest_hash {
-                            crate::log(&format!("[OUTBOUND] hops>1 next_hop==dest: HEADER_1 direct, raw[0..4]={:02x?}",
-                                &packet.raw[..packet.raw.len().min(4)]), crate::LOG_VERBOSE, false, false);
-                            mark_packet_sent(packet, outbound_time);
-                            if outbound_interface_exists {
-                                if let Some(iface_name) = outbound_interface_name.clone() {
-                                    transmissions.push((iface_name, packet.raw.clone()));
-                                }
-                                sent = true;
-                            }
-                        } else {
-                            let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
-                            let mut new_raw = vec![new_flags, packet.hops];
-                            new_raw.extend_from_slice(next_hop);
-                            if packet.raw.len() > 2 {
-                                new_raw.extend_from_slice(&packet.raw[2..]);
-                            }
-                            mark_packet_sent(packet, outbound_time);
-                            if outbound_interface_exists {
-                                if let Some(iface_name) = outbound_interface_name.clone() {
-                                    transmissions.push((iface_name, new_raw));
-                                }
-                                sent = true;
-                            }
-                        }
-                    }
+                crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
+                    packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    hops, outbound_interface_name, outbound_interface_exists), outbound_log_level, false, false);
+                if !outbound_interface_exists {
+                    let next_hop = crate::hexrep(&entry.next_hop, false);
+                    let live_ifaces: Vec<String> = state.interfaces.iter().map(|iface| iface.name.clone()).collect();
+                    let live_local_client_ifaces: Vec<String> = state
+                        .local_client_interfaces
+                        .iter()
+                        .map(|iface| iface.name.clone())
+                        .collect();
+                    crate::log(
+                        &format!(
+                            "[OUTBOUND] missing interface for path dest={} next_hop={} expected_iface={:?} live_ifaces={:?} local_client_ifaces={:?}",
+                            crate::hexrep(dest_hash, false),
+                            next_hop,
+                            outbound_interface_name,
+                            live_ifaces,
+                            live_local_client_ifaces,
+                        ),
+                        crate::LOG_WARNING,
+                        false,
+                        false,
+                    );
                 }
-            } else if hops == 1 && state.is_connected_to_shared_instance && packet.header_type == crate::packet::HEADER_1 {
-                if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
-                    if let PathEntryValue::NextHop(next_hop) = next_hop {
+
+                // ── Build raw bytes for this path entry ─────────────────────
+                if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
+                    let next_hop = &entry.next_hop;
+                    if next_hop == dest_hash {
+                        crate::log(&format!("[OUTBOUND] hops>1 next_hop==dest: HEADER_1 direct, raw[0..4]={:02x?}",
+                            &packet.raw[..packet.raw.len().min(4)]), crate::LOG_VERBOSE, false, false);
+                        if outbound_interface_exists {
+                            if let Some(iface_name) = outbound_interface_name.clone() {
+                                transmissions.push((iface_name, packet.raw.clone()));
+                            }
+                            sent = true;
+                        }
+                    } else {
                         let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
                         let mut new_raw = vec![new_flags, packet.hops];
                         new_raw.extend_from_slice(next_hop);
                         if packet.raw.len() > 2 {
                             new_raw.extend_from_slice(&packet.raw[2..]);
                         }
-                        mark_packet_sent(packet, outbound_time);
                         if outbound_interface_exists {
                             if let Some(iface_name) = outbound_interface_name.clone() {
                                 transmissions.push((iface_name, new_raw));
@@ -3319,15 +3317,77 @@ impl Transport {
                             sent = true;
                         }
                     }
-                }
-            } else {
-                mark_packet_sent(packet, outbound_time);
-                if outbound_interface_exists {
-                    if let Some(iface_name) = outbound_interface_name.clone() {
-                        transmissions.push((iface_name, packet.raw.clone()));
+                } else if hops == 1 && state.is_connected_to_shared_instance && packet.header_type == crate::packet::HEADER_1 {
+                    let next_hop = &entry.next_hop;
+                    let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
+                    let mut new_raw = vec![new_flags, packet.hops];
+                    new_raw.extend_from_slice(next_hop);
+                    if packet.raw.len() > 2 {
+                        new_raw.extend_from_slice(&packet.raw[2..]);
                     }
-                    sent = true;
+                    if outbound_interface_exists {
+                        if let Some(iface_name) = outbound_interface_name.clone() {
+                            transmissions.push((iface_name, new_raw));
+                        }
+                        sent = true;
+                    }
+                } else {
+                    if outbound_interface_exists {
+                        if let Some(iface_name) = outbound_interface_name.clone() {
+                            transmissions.push((iface_name, packet.raw.clone()));
+                        }
+                        sent = true;
+                    }
                 }
+
+                // ── Staleness check: multi-hop transport paths only (hops ≥ 2) ──
+                let is_stale = hops >= 2
+                    && (outbound_time - entry.timestamp) > PATH_STALE_THRESHOLD;
+
+                if is_stale {
+                    // Defer path_request to after we release the TRANSPORT lock
+                    stale_deferred.push((dest_hash.clone(), entry.receiving_interface.clone()));
+
+                    // Shorten expiry so dead paths don't duplicate forever.
+                    // Only shorten — never lengthen (e.g. roaming-path expiry).
+                    if let Some(deque) = state.path_table.get_mut(dest_hash) {
+                        if let Some(mut_entry) = deque.iter_mut().find(|e| e.packet_hash == entry.packet_hash) {
+                            let shortened = outbound_time + PATH_STALE_THRESHOLD;
+                            if shortened < mut_entry.expires {
+                                mut_entry.expires = shortened;
+                                state.path_table_dirty = true;
+                            }
+                        }
+                    }
+
+                    // Continue to next-best path (hedge)
+                } else {
+                    // Fresh path — delivery covered, stop hedging
+                    break;
+                }
+            }
+
+            // Fire deferred path_requests outside the TRANSPORT lock.
+            // request_path() acquires the lock internally; we must
+            // drop ours first to avoid deadlock.
+            if !stale_deferred.is_empty() {
+                let dest_hash_for_log = dest_hash.clone();
+                let n_stale = stale_deferred.len();
+                drop(state);
+                for (dh, iface) in stale_deferred {
+                    Transport::request_path(&dh, None, iface, None, None);
+                }
+                state = TRANSPORT.lock().unwrap();
+                crate::log(
+                    &format!(
+                        "[OUTBOUND] hedge: fired {} path_request(s) for stale paths to {}",
+                        n_stale,
+                        crate::hexrep(&dest_hash_for_log, false)
+                    ),
+                    crate::LOG_DEBUG,
+                    false,
+                    false,
+                );
             }
         } else {
             if packet.packet_type != ANNOUNCE {
@@ -3553,14 +3613,9 @@ impl Transport {
                     .as_ref()
                     .or_else(|| packet.destination.as_ref().map(|d| &d.hash))
                 {
-                    if let Some(entry) = state.path_table.get(dest_hash) {
-                        match entry.get(IDX_PT_HOPS) {
-                            Some(PathEntryValue::Hops(h)) => *h,
-                            _ => 0,
-                        }
-                    } else {
-                        0
-                    }
+                    Self::select_path(&state.path_table, &state.interfaces, dest_hash, now())
+                        .map(|(_, e)| e.hops)
+                        .unwrap_or(0)
                 } else {
                     0
                 };
@@ -3674,9 +3729,9 @@ impl Transport {
 
         let mut active_paths: HashSet<Vec<u8>> = HashSet::new();
         let state = TRANSPORT.lock().unwrap();
-        for entry in state.path_table.values() {
-            if let Some(PathEntryValue::PacketHash(hash)) = entry.get(IDX_PT_PACKET) {
-                active_paths.insert(hash.clone());
+        for deque in state.path_table.values() {
+            for entry in deque {
+                active_paths.insert(entry.packet_hash.clone());
             }
         }
 
@@ -3714,48 +3769,13 @@ impl Transport {
         if state.is_connected_to_shared_instance {
             return;
         }
-        let mut entries: Vec<SerializedPathEntry> = Vec::new();
-        for (dest, entry) in &state.path_table {
-            let timestamp = match entry.get(IDX_PT_TIMESTAMP) {
-                Some(PathEntryValue::Timestamp(ts)) => *ts,
-                _ => continue,
-            };
-            let received_from = match entry.get(IDX_PT_NEXT_HOP) {
-                Some(PathEntryValue::NextHop(next)) => next.clone(),
-                _ => continue,
-            };
-            let hops = match entry.get(IDX_PT_HOPS) {
-                Some(PathEntryValue::Hops(hops)) => *hops,
-                _ => continue,
-            };
-            let expires = match entry.get(IDX_PT_EXPIRES) {
-                Some(PathEntryValue::Expires(expires)) => *expires,
-                _ => continue,
-            };
-            let random_blobs = match entry.get(IDX_PT_RANDBLOBS) {
-                Some(PathEntryValue::RandomBlobs(blobs)) => blobs.clone(),
-                _ => Vec::new(),
-            };
-            let packet_hash = match entry.get(IDX_PT_PACKET) {
-                Some(PathEntryValue::PacketHash(hash)) => hash.clone(),
-                _ => Vec::new(),
-            };
-            let interface_hash = match entry.get(IDX_PT_RVCD_IF) {
-                Some(PathEntryValue::ReceivingInterface(Some(name))) => name.as_bytes().to_vec(),
-                _ => Vec::new(),
-            };
-
-            entries.push(SerializedPathEntry {
-                destination_hash: dest.clone(),
-                timestamp,
-                received_from,
-                hops,
-                expires,
-                random_blobs,
-                interface_hash,
-                packet_hash,
-            });
-        }
+        // Serialize as Vec<(dest_hash, Vec<PathEntry>)> — each dest can
+        // have up to MAX_PATHS_PER_DEST entries.  On load we convert
+        // the Vec to VecDeque.
+        let entries: Vec<(Vec<u8>, Vec<PathEntry>)> = state.path_table
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .collect();
         let path = crate::reticulum::storage_path().join("destination_table");
         if let Ok(data) = to_vec_named(&entries) {
             if let Ok(mut file) = File::create(path) {
@@ -3849,84 +3869,33 @@ impl Transport {
         Transport::save_tunnel_table();
     }
 
-    pub fn announce_emitted(packet: &Packet) -> u64 {
-        let start = crate::identity::KEYSIZE / 8 + crate::identity::NAME_HASH_LENGTH / 8;
-        let end = start + 10;
-        if packet.data.len() >= end {
-            let random_blob = &packet.data[start..end];
-            return Transport::timebase_from_random_blob(random_blob);
-        }
-        0
-    }
+    // ── timebase/blob functions removed — anti-replay is now purely
+    //     via the global_blobs set, decoupled from path entries.
 
-    pub fn timebase_from_random_blob(random_blob: &[u8]) -> u64 {
-        if random_blob.len() >= 10 {
-            let bytes = &random_blob[5..10];
-            let mut arr = [0u8; 8];
-            arr[3..].copy_from_slice(bytes);
-            u64::from_be_bytes(arr)
-        } else {
-            0
-        }
-    }
-
-    pub fn timebase_from_random_blobs(random_blobs: &[Vec<u8>]) -> u64 {
-        let mut timebase = 0;
-        for blob in random_blobs {
-            let emitted = Transport::timebase_from_random_blob(blob);
-            if emitted > timebase {
-                timebase = emitted;
-            }
-        }
-        timebase
-    }
-
+    /// Hop count to `destination_hash` via the best available path.
+    /// Returns `LINK_UNKNOWN_HOP_COUNT` when no path is known.
     pub fn hops_to(destination_hash: &[u8]) -> u8 {
-        let state = TRANSPORT.lock().unwrap();
-        if let Some(entry) = state.path_table.get(destination_hash) {
-            if let Some(PathEntryValue::Hops(hops)) = entry.get(IDX_PT_HOPS) {
-                *hops
-            } else {
-                // Path exists but hop count unavailable — assume direct
-                1
-            }
-        } else {
-            // No path known; use a reasonable default instead of PATHFINDER_M (128)
-            // which causes multi-minute timeouts on slow links like LoRa
-            LINK_UNKNOWN_HOP_COUNT
-        }
+        Self::select_path_for(destination_hash)
+            .map(|(_, e)| e.hops)
+            .unwrap_or(LINK_UNKNOWN_HOP_COUNT)
     }
 
+    /// Transport-identity hash of the next-hop node for the best path
+    /// to `destination_hash`.
     pub fn next_hop(destination_hash: &[u8]) -> Option<Vec<u8>> {
-        let state = TRANSPORT.lock().unwrap();
-        state.path_table.get(destination_hash).and_then(|entry| {
-            if let Some(PathEntryValue::NextHop(hop)) = entry.get(IDX_PT_NEXT_HOP) {
-                Some(hop.clone())
-            } else {
-                None
-            }
-        })
+        Self::select_path_for(destination_hash)
+            .map(|(_, e)| e.next_hop)
     }
 
-    pub fn has_path(destination_hash: &[u8]) -> bool {
-        let lock_wait_start = Instant::now();
+    /// Interface name for the best path to `destination_hash`.
+    pub fn next_hop_interface(destination_hash: &[u8]) -> Option<String> {
         let state = TRANSPORT.lock().unwrap();
-        let waited_ms = lock_wait_start.elapsed().as_millis();
-        if waited_ms > 250 {
-        }
-        // Check both existence and that the path hasn't been soft-expired (timestamp=0)
-        if let Some(entry) = state.path_table.get(destination_hash) {
-            match entry.get(IDX_PT_TIMESTAMP) {
-                Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => false,
-                _ => true,
-            }
-        } else {
-            false
-        }
+        let now_ts = now();
+        Self::select_path(&state.path_table, &state.interfaces, destination_hash, now_ts)
+            .and_then(|(_, e)| e.receiving_interface)
     }
 
-    /// Clone a live path-table entry from one destination hash to another.
-    ///
+    /// Clone the best live path entry from `source_hash` to `destination_hash`.
     /// Used when sibling SINGLE destinations share the same owner identity and
     /// next-hop, but only one aspect has been explicitly path-resolved this
     /// session. This mirrors the rfed test harness strategy of seeding
@@ -3936,38 +3905,22 @@ impl Transport {
         if source_hash.is_empty() || destination_hash.is_empty() || source_hash == destination_hash {
             return false;
         }
-
-        let mut cloned = false;
-        {
-            let mut state = TRANSPORT.lock().unwrap();
-            let Some(entry) = state.path_table.get(source_hash).cloned() else {
-                return false;
-            };
-
-            match entry.get(IDX_PT_TIMESTAMP) {
-                Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => return false,
-                _ => {}
-            }
-
-            state.path_table.insert(destination_hash.to_vec(), entry);
-            state.path_table_dirty = true;
-
-            if state.path_verified_this_session.contains(source_hash) {
-                state.path_verified_this_session.insert(destination_hash.to_vec());
-            }
-
-            if let Some(path_state) = state.path_states.get(source_hash).copied() {
-                state.path_states.insert(destination_hash.to_vec(), path_state);
-            }
-
-            cloned = true;
+        let mut state = TRANSPORT.lock().unwrap();
+        let now_ts = now();
+        let Some((_, best)) = Self::select_path(&state.path_table, &state.interfaces, source_hash, now_ts) else {
+            return false;
+        };
+        state.path_table
+            .entry(destination_hash.to_vec())
+            .or_insert_with(VecDeque::new)
+            .push_front(best);
+        state.path_table_dirty = true;
+        if state.path_verified_this_session.contains(source_hash) {
+            state.path_verified_this_session.insert(destination_hash.to_vec());
         }
-
-        if cloned {
-            notify_path_added();
-        }
-
-        cloned
+        drop(state);
+        notify_path_added();
+        true
     }
 
     /// Block the calling thread until either:
@@ -4084,25 +4037,6 @@ impl Transport {
     }
 
     /// Hop count for the currently-cached path to `destination_hash`, or
-    /// `None` if no live path entry exists. Live = present in path_table
-    /// AND not soft-expired (timestamp != 0). Used by `app_links` to
-    /// decide whether a fresh announce is worth racing a new LR over the
-    /// already-in-flight racers (only spawn a racer if its path is
-    /// strictly shorter than every existing racer).
-    pub fn path_hops(destination_hash: &[u8]) -> Option<u8> {
-        let state = TRANSPORT.lock().unwrap();
-        let entry = state.path_table.get(destination_hash)?;
-        let live = match entry.get(IDX_PT_TIMESTAMP) {
-            Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => false,
-            _ => true,
-        };
-        if !live { return None; }
-        match entry.get(IDX_PT_HOPS) {
-            Some(PathEntryValue::Hops(h)) => Some(*h),
-            _ => None,
-        }
-    }
-
     pub fn add_packet_hash(packet_hash: Vec<u8>) {
         let mut state = TRANSPORT.lock().unwrap();
         if !state.is_connected_to_shared_instance {
@@ -4120,15 +4054,93 @@ impl Transport {
         state.path_verified_this_session.contains(destination_hash)
     }
 
-    pub fn next_hop_interface(destination_hash: &[u8]) -> Option<String> {
-        let state = TRANSPORT.lock().unwrap();
-        state.path_table.get(destination_hash).and_then(|entry| {
-            if let Some(PathEntryValue::ReceivingInterface(name)) = entry.get(IDX_PT_RVCD_IF) {
-                name.clone()
-            } else {
-                None
+    // ── Path selection helper ────────────────────────────────────────────────
+
+    /// Select the best non-expired `PathEntry` for `destination_hash`.
+    /// Iterates the deque (newest-first), skips expired entries, and
+    /// returns the one with the highest `score()` (bitrate / (hops+1)).
+    /// Returns `None` when the deque is empty or all entries are expired.
+    fn select_path(
+        table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
+        interfaces: &[InterfaceStub],
+        destination_hash: &[u8],
+        now: f64,
+    ) -> Option<(usize, PathEntry)> {
+        let entries = table.get(destination_hash)?;
+        let mut best: Option<(usize, f64, PathEntry)> = None;
+        for (idx, entry) in entries.iter().enumerate() {
+            if entry.is_expired(now) {
+                continue;
             }
-        })
+            let bitrate = entry.receiving_interface.as_ref()
+                .and_then(|name| interfaces.iter().find(|i| &i.name == name))
+                .and_then(|i| i.bitrate);
+            let score = entry.score(bitrate);
+            match best {
+                Some((_, best_score, _)) if score <= best_score => {},
+                _ => { best = Some((idx, score, entry.clone())); }
+            }
+        }
+        best.map(|(idx, _, e)| (idx, e))
+    }
+
+    /// Select the best path entry for a destination (convenience wrapper).
+    fn select_path_for(
+        destination_hash: &[u8],
+    ) -> Option<(usize, PathEntry)> {
+        let state = TRANSPORT.lock().unwrap();
+        let now_ts = now();
+        let interfaces = state.interfaces.clone();
+        Self::select_path(&state.path_table, &interfaces, destination_hash, now_ts)
+    }
+
+    /// Return all non-expired path entries for `destination_hash`, sorted
+    /// by `score()` descending (best first).  Used by outbound hedging:
+    /// each stale entry triggers a fallback send on the next-best entry,
+    /// stopping at the first fresh one.
+    fn select_all_paths(
+        table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
+        interfaces: &[InterfaceStub],
+        destination_hash: &[u8],
+        now: f64,
+    ) -> Vec<(usize, f64, PathEntry)> {
+        let entries = match table.get(destination_hash) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let mut scored: Vec<(usize, f64, PathEntry)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.is_expired(now))
+            .map(|(idx, e)| {
+                let bitrate = e
+                    .receiving_interface
+                    .as_ref()
+                    .and_then(|name| interfaces.iter().find(|i| &i.name == name))
+                    .and_then(|i| i.bitrate);
+                let score = e.score(bitrate);
+                (idx, score, e.clone())
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored
+    }
+
+    pub fn has_path(destination_hash: &[u8]) -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        let now_ts = now();
+        Self::select_path(&state.path_table, &state.interfaces, destination_hash, now_ts).is_some()
+    }
+
+    /// Hop count for the currently-cached path to `destination_hash`, or
+    /// `None` if no live path entry exists.
+    pub fn path_hops(destination_hash: &[u8]) -> Option<u8> {
+        let state = TRANSPORT.lock().unwrap();
+        let now_ts = now();
+        Self::select_path(&state.path_table, &state.interfaces, destination_hash, now_ts)
+            .map(|(_, e)| e.hops)
     }
 
     pub fn next_hop_interface_hw_mtu(destination_hash: &[u8]) -> Option<usize> {
@@ -4173,36 +4185,16 @@ impl Transport {
         0.0
     }
 
+    /// Remove ALL path entries for `destination_hash`.  In the multi-entry
+    /// model there is no soft-expire hack — we just drop the entire deque.
+    /// Returns true if any entry existed.
     pub fn expire_path(destination_hash: &[u8]) -> bool {
         let mut state = TRANSPORT.lock().unwrap();
-        if let Some(entry) = state.path_table.get_mut(destination_hash) {
-            if let Some(PathEntryValue::Timestamp(ts)) = entry.get_mut(IDX_PT_TIMESTAMP) {
-                *ts = 0.0;
-            }
-            // NEVER REMOVE EVER — do NOT set tables_last_culled = 0.0 here.
-            //
-            // Setting tables_last_culled = 0.0 triggers an immediate cull on the
-            // next jobs() tick.  The cull's stale-path check computed
-            // `destination_expiry = timestamp + DESTINATION_TIMEOUT`.  With
-            // timestamp=0 that gives `0 + 604800 ≈ 7 days` in Unix seconds, which
-            // is always << now() (~1.7 × 10⁹), so the entry is immediately deleted.
-            //
-            // Deleting the entry defeats the whole point of soft-expiry: the path
-            // QUALITY GATE uses the existing entry's hop count to reject worse
-            // PATH_RESPONSES.  With has_existing=false (entry gone), any incoming
-            // PATH_RESPONSE — including one with hops=12 when the cached entry was
-            // hops=2 — is accepted unconditionally.
-            //
-            // The cull is now fixed to use the stored `Expires` field (set to
-            // original_timestamp + DESTINATION_TIMEOUT, i.e., now+7 days for a
-            // recently-stored entry), so a soft-expired entry is NOT culled until its
-            // expiry legitimately elapses.  `tables_last_culled = 0.0` here would
-            // still force an immediate cull cycle, which is wasteful and was the
-            // original source of the deletion.  Leave tables_last_culled alone.
-            true
-        } else {
-            false
+        let existed = state.path_table.remove(destination_hash).is_some();
+        if existed {
+            state.path_table_dirty = true;
         }
+        existed
     }
 
     pub fn drop_announce_queues() -> usize {
@@ -4233,43 +4225,47 @@ impl Transport {
         state.blackholed_identities.remove(&identity_hash).is_some()
     }
 
-    pub fn mark_path_unresponsive(destination_hash: &[u8]) -> bool {
+    /// Remove path entries for `destination_hash` whose `receiving_interface`
+    /// matches `blocked_interface`.  When `blocked_interface` is `None`,
+    /// removes ALL entries for the destination (backward compat with
+    /// external callers like `drop_path`).
+    pub fn mark_path_unresponsive(destination_hash: &[u8], blocked_interface: Option<&str>) -> bool {
         let mut state = TRANSPORT.lock().unwrap();
-        if state.path_table.contains_key(destination_hash) {
-            state.path_states.insert(destination_hash.to_vec(), STATE_UNRESPONSIVE);
-            true
-        } else {
-            false
+        let mut removed = false;
+        let mut is_empty = false;
+        if let Some(deque) = state.path_table.get_mut(destination_hash) {
+            let before = deque.len();
+            if let Some(iface) = blocked_interface {
+                deque.retain(|e| e.receiving_interface.as_deref() != Some(iface));
+            } else {
+                deque.clear();
+            }
+            removed = before > deque.len();
+            is_empty = deque.is_empty();
         }
+        if is_empty {
+            state.path_table.remove(destination_hash);
+        }
+        if removed {
+            state.path_table_dirty = true;
+        }
+        removed
     }
 
-    pub fn mark_path_responsive(destination_hash: &[u8]) -> bool {
-        let mut state = TRANSPORT.lock().unwrap();
-        if state.path_table.contains_key(destination_hash) {
-            state.path_states.insert(destination_hash.to_vec(), STATE_RESPONSIVE);
-            true
-        } else {
-            false
-        }
+    /// No-op in the multi-entry model (path_states dict is removed).
+    pub fn mark_path_responsive(_destination_hash: &[u8]) -> bool {
+        true
     }
 
-    pub fn mark_path_unknown_state(destination_hash: &[u8]) -> bool {
-        let mut state = TRANSPORT.lock().unwrap();
-        if state.path_table.contains_key(destination_hash) {
-            state.path_states.insert(destination_hash.to_vec(), STATE_UNKNOWN);
-            true
-        } else {
-            false
-        }
+    /// No-op in the multi-entry model (path_states dict is removed).
+    pub fn mark_path_unknown_state(_destination_hash: &[u8]) -> bool {
+        true
     }
 
-    pub fn path_is_unresponsive(destination_hash: &[u8]) -> bool {
-        let state = TRANSPORT.lock().unwrap();
-        if let Some(state_val) = state.path_states.get(destination_hash) {
-            *state_val == STATE_UNRESPONSIVE
-        } else {
-            false
-        }
+    /// Always returns false in the multi-entry model (path_states dict
+    /// is removed).  Callers should use `!has_path()` instead.
+    pub fn path_is_unresponsive(_destination_hash: &[u8]) -> bool {
+        false
     }
 
     pub fn await_path(destination_hash: &[u8], timeout: Option<f64>, on_interface: Option<String>) -> bool {
@@ -4764,90 +4760,42 @@ impl Transport {
                         None
                     };
 
-                    // ── FIX: PATH QUALITY GATE ──────────────────────────────────────────────────
-                    // DO NOT REVERT THIS BLOCK.
+                    // ── MULTI-ENTRY PATH INSERTION ───────────────────────────────────────
+                    // New model (replaces the old 80-line / 11-leaf decision tree):
                     //
-                    // Bug (pre-fix): path_table.insert() was called unconditionally, so any
-                    // high-hop announce flooding in after a good low-hop path was established
-                    // would silently overwrite the better entry.  Result: successive send
-                    // attempts used progressively worse paths (6 hops → 11 → 15 → 50),
-                    // causing link establishment timeouts that grew from 42 s to 306 s and
-                    // messages that appeared to send but never delivered.
+                    //   1. Track seen blobs in global_blobs (anti-replay, decoupled).
+                    //   2. Always prepend the new path entry (newest-first).
+                    //   3. Dedup by packet_hash within the same destination.
+                    //   4. Cap at MAX_PATHS_PER_DEST (=3).
+                    //   5. No quality gate — multiple paths coexist; select_path()
+                    //      picks the best at forwarding time via bitrate/hops score.
                     //
-                    // Fix: mirror Python's Transport.receive_announce() logic —
-                    //   • only replace a *fresh* (non-expired) path entry when the new
-                    //     announce has fewer or equal hops than the existing entry.
-                    //   • always replace when there is no existing entry, or when the
-                    //     existing entry has passed its DESTINATION_TIMEOUT expiry.
-                    //
-                    // Reference: Reticulum-master/RNS/Transport.py, should_add check
-                    //   (packet.hops <= Transport.path_table[hash][IDX_PT_HOPS]).
-                    //
-                    // Also accumulate random_blobs from the existing entry so that replay
-                    // detection state is preserved across path updates.
-                    // ────────────────────────────────────────────────────────────────────────
-                    let (has_existing, existing_hops, existing_expires, existing_blobs) =
-                        if let Some(existing) = state.path_table.get(destination_hash) {
-                            let h = match existing.get(IDX_PT_HOPS) {
-                                Some(PathEntryValue::Hops(h)) => *h,
-                                _ => u8::MAX,
-                            };
-                            let e = match existing.get(IDX_PT_EXPIRES) {
-                                Some(PathEntryValue::Expires(t)) => *t,
-                                _ => 0.0,
-                            };
-                            let b: Vec<Vec<u8>> = match existing.get(IDX_PT_RANDBLOBS) {
-                                Some(PathEntryValue::RandomBlobs(blobs)) => blobs.clone(),
-                                _ => Vec::new(),
-                            };
-                            (true, h, e, b)
-                        } else {
-                            (false, 0u8, 0.0_f64, Vec::new())
-                        };
+                    // This eliminates:
+                    //   • Convergence race (fast-WiFi 3-hop vs slow-LoRa 2-hop)
+                    //   • Deadlock (UNRESPONSIVE poison blocking better paths)
+                    //   • Silent discard of backup topology
+                    // ──────────────────────────────────────────────────────────────────────
 
-                    let is_expired = has_existing && now() >= existing_expires;
-                    let mut random_blobs = existing_blobs;
+                    // Anti-replay via global blob set (decoupled from path entries)
                     if let Some(ref blob) = new_blob {
-                        if !random_blobs.contains(blob) {
-                            random_blobs.push(blob.clone());
+                        state.global_blobs.insert(blob.clone());
+                        // Keep global set bounded
+                        while state.global_blobs.len() > MAX_GLOBAL_BLOBS {
+                            // Remove an arbitrary element — HashSet iteration is
+                            // non-deterministic but fine for eviction.
+                            if let Some(evict) = state.global_blobs.iter().next().cloned() {
+                                state.global_blobs.remove(&evict);
+                            } else {
+                                break;
+                            }
                         }
                     }
-                    if random_blobs.len() > MAX_RANDOM_BLOBS {
-                        random_blobs.truncate(MAX_RANDOM_BLOBS);
-                    }
-                    // Cached paths loaded from disk are provisional until a
-                    // live announce verifies them in this process. Do not let
-                    // an unverified cold-start entry block the first real path
-                    // we hear on the wire, even if the cached hop count was
-                    // numerically better.
-                    let existing_verified_this_session = has_existing
-                        && state.path_verified_this_session.contains(destination_hash);
-                    // Update if: no existing entry, OR the existing entry is
-                    // still unverified this session, OR the new path is at
-                    // least as good, OR the existing path expired.
-                    let should_update_path = !has_existing
-                        || !existing_verified_this_session
-                        || packet.hops <= existing_hops
-                        || is_expired;
 
-                    let received_from = packet.transport_id.clone().unwrap_or_else(|| destination_hash.clone());
+                    let received_from = packet.transport_id.clone()
+                        .unwrap_or_else(|| destination_hash.clone());
                     let expires = now() + DESTINATION_TIMEOUT;
-                    // ── FIX: SKIP OWN-DESTINATION ECHO ──────────────────────────────────────
-                    // DO NOT REVERT.
-                    //
-                    // Bug: when our own announce reaches a directly-connected peer and is
-                    // rebroadcast, it comes back to us as a remote announce for our own
-                    // destination hash.  Without this filter we would install a "remote"
-                    // path for our own destination — meaning subsequent inbound
-                    // LINK_REQUEST packets addressed to that destination get *forwarded*
-                    // back out the mesh instead of being delivered locally to the
-                    // destination handler.  Clients (e.g. Retichat) then see every link
-                    // request silently time out at 50+ s with no PROOF.
-                    //
-                    // Mirrors Python Reticulum's `Transport.receive_announce`, which
-                    // skips path-table updates for any destination_hash present in its
-                    // own `Transport.destinations` list.
-                    // ────────────────────────────────────────────────────────────────────────
+
+                    // ── Own-destination echo skip (unchanged) ──────────────────────────
                     let is_own_destination = state
                         .destinations
                         .iter()
@@ -4863,83 +4811,40 @@ impl Transport {
                             false,
                             false,
                         );
-                    } else if should_update_path {
-                        // Detect path-quality improvement *before* we overwrite the entry
-                        // so we can cancel any in-flight link establishment that committed
-                        // to the old (worse) route. Without this, a client that learns a
-                        // bad 9-hop path first sits on a 60s timeout even after a 1-hop
-                        // announce arrives 10s later.
-                        let path_improved = has_existing && packet.hops < existing_hops;
+                    } else {
+                        let packet_hash = packet.packet_hash.clone().unwrap_or_default();
+                        let new_entry = PathEntry {
+                            timestamp: now(),
+                            next_hop: received_from.clone(),
+                            hops: packet.hops,
+                            expires,
+                            receiving_interface: packet.receiving_interface.clone(),
+                            packet_hash: packet_hash.clone(),
+                        };
 
-                        let entry = vec![
-                            PathEntryValue::Timestamp(now()),
-                            PathEntryValue::NextHop(received_from.clone()),
-                            PathEntryValue::Hops(packet.hops),
-                            PathEntryValue::Expires(expires),
-                            PathEntryValue::RandomBlobs(random_blobs),
-                            PathEntryValue::ReceivingInterface(packet.receiving_interface.clone()),
-                            PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
-                        ];
-                        state.path_table.insert(destination_hash.clone(), entry);
-                        // Mark the on-disk copy stale so the periodic
-                        // saver in jobs() persists this fresh path
-                        // before the next cold start. Eliminates the
-                        // wire PATH_REQUEST round-trip on the warm-path
-                        // case.
+                        // Insert: get or create deque, dedup by packet_hash,
+                        // push_front, truncate.
+                        let deque = state.path_table
+                            .entry(destination_hash.clone())
+                            .or_insert_with(VecDeque::new);
+                        deque.retain(|e| e.packet_hash != packet_hash);
+                        deque.push_front(new_entry);
+                        deque.truncate(MAX_PATHS_PER_DEST);
+
                         state.path_table_dirty = true;
-                        // Mark this destination as having a
-                        // session-verified path. `app_links::establish()`
-                        // uses this to decide whether the first racer
-                        // should fire a parallel `request_path` to
-                        // hedge against a stale cached route.
-                        // NEVER REMOVE EVER — see field doc on
-                        // `path_verified_this_session`.
                         state.path_verified_this_session.insert(destination_hash.clone());
-                        // Wake any race_path waiter that is blocked on this
-                        // exact destination. This must happen AFTER both
-                        // `path_table` and `path_verified_this_session` have
-                        // been updated so verified-path waiters see a coherent
-                        // server-response event.
-                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
                         crate::transport::notify_path_added();
                         crate::announce_log::count_path_added();
                         if crate::announce_log::is_whitelisted(Some(destination_hash.as_slice())) {
-                            crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
+                            crate::log(&format!("Path added dest={} hops={} table_size={}",
+                                crate::hexrep(destination_hash, false),
+                                packet.hops,
+                                state.path_table.len()),
+                                crate::LOG_NOTICE, false, false);
                         }
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
-                        // ── Path improvement: NO eager teardown ──────────────────────────────
-                        // DO NOT REVERT to teardown_pending_links_to_destination here.
-                        //
-                        // Earlier behaviour: when an announce strictly improved the hop
-                        // count for a destination, Transport tore down every in-flight
-                        // outbound link to that destination on the assumption a fresh LR
-                        // would re-establish via the new path. That assumption was
-                        // brittle: the announce handler that would re-trigger
-                        // establishment can run BEFORE the teardown completes and bail
-                        // out because status is still ESTABLISHING, leaving the
-                        // destination idle until the next announce.
-                        //
-                        // New behaviour: Transport leaves the pending link alone and
-                        // updates the path table. The application layer (e.g.
-                        // app_links::AppLinks) sees the improved announce via its
-                        // registered announce handler and spawns a *racer* LR down the
-                        // new path; whichever LR (existing or racer) reaches ACTIVE
-                        // first wins, and AppLinks tears down the loser. This keeps
-                        // the in-flight LR as a guaranteed fallback while we try the
-                        // improved path, and removes the "stranded destination" bug.
-                        //
-                        // Path/link policy is owned by the app layer; Transport just
-                        // routes packets and maintains the path table.
-                        // ──────────────────────────────────────────────────────────────────────
-                        let _ = path_improved; // explicitly unused — see comment above
-
-                        // Python Transport.py line 1838-1865:
-                        // If there is a waiting discovery path request for this destination,
-                        // immediately relay a PATH_RESPONSE announce back to the requesting
-                        // interface so it can reach the querying client (e.g. Meshchat).
-                        // Without this, discovery_path_requests entries only expire on timeout
-                        // and the requester never learns the path.
+                        // ── Discovery path request answer (unchanged) ──────────────────
                         if state.transport_enabled {
                             if let Some(discovery_entry) = state.discovery_path_requests.remove(destination_hash.as_slice()) {
                                 if let Some(ref requesting_iface) = discovery_entry.requesting_interface {
@@ -4976,12 +4881,7 @@ impl Transport {
                             }
                         }
 
-                        // Match Python Transport.py line 1741:
-                        // Insert into announce_table for rebroadcast when transport is enabled.
-                        // Python: (transport_enabled or from_local_client) and context != PATH_RESPONSE
-                        // Previous Rust code wrongly required transport_id.is_some(), which
-                        // excluded first-hop announces (HEADER_1, no transport_id) from ever
-                        // being rebroadcast to other interfaces.
+                        // ── Announce table + local client forwarding (unchanged) ───────
                         if state.transport_enabled && packet.context != crate::packet::PATH_RESPONSE {
                             let block_rebroadcasts = false;
                             let initial_timeout = now() + (rand::random::<f64>() * PATHFINDER_RW);
@@ -4994,20 +4894,11 @@ impl Transport {
                                 AnnounceEntryValue::Packet(packet.clone()),
                                 AnnounceEntryValue::LocalRebroadcasts(0),
                                 AnnounceEntryValue::BlockRebroadcasts(block_rebroadcasts),
-                                // Python line 1726: attached_interface = None
-                                // Must be None so outbound() broadcasts to ALL interfaces,
-                                // not just back to the receiving interface.
                                 AnnounceEntryValue::AttachedInterface(None),
                             ];
                             state.announce_table.insert(destination_hash.clone(), announce_entry);
                         }
 
-                        // Python Transport.py lines 1790-1833: immediately send
-                        // HEADER_2 copies of this announce to all local client
-                        // interfaces (except the one that sent us the announce).
-                        // Local clients are excluded from the announce_table /
-                        // jobs() retransmit path to avoid the burst that
-                        // triggers the client's ingress limiter.
                         if !state.local_client_interfaces.is_empty() {
                             let identity_hash_bytes = state.identity.as_ref()
                                 .and_then(|i| i.hash.clone())
@@ -5026,8 +4917,6 @@ impl Transport {
                                 | ANNOUNCE;
                             let dest_hash_bytes = packet.destination_hash.clone()
                                 .unwrap_or_else(|| destination_hash.clone());
-                            // Use NONE context for regular announces, PATH_RESPONSE
-                            // for path responses — matches Python logic.
                             let announce_context = if packet.context == crate::packet::PATH_RESPONSE {
                                 crate::packet::PATH_RESPONSE
                             } else {
@@ -5048,11 +4937,6 @@ impl Transport {
                                 .collect();
                             let now_ts = now();
                             for iface_name in local_iface_names {
-                                // Schedule this announce no sooner than LOCAL_CLIENT_ANNOUNCE_PACE
-                                // after the previous one for this interface.  For a brand-new
-                                // client (no entry yet) use now_ts - PACE as baseline so the
-                                // FIRST announce dispatches immediately (dispatch_at = now_ts).
-                                // Subsequent ones are queued at PACE intervals.
                                 let last = state.client_announce_pacing.get(&iface_name).copied()
                                     .unwrap_or(now_ts - LOCAL_CLIENT_ANNOUNCE_PACE);
                                 let dispatch_at = f64::max(now_ts, last + LOCAL_CLIENT_ANNOUNCE_PACE);
@@ -5064,8 +4948,6 @@ impl Transport {
                                 }
                             }
                         }
-                    } else {
-                        crate::log(&format!("Path not updated dest={} new_hops={} existing_hops={} (keeping better path)", crate::hexrep(destination_hash, false), packet.hops, existing_hops), crate::LOG_DEBUG, false, false);
                     }
                 }
             }
@@ -5080,23 +4962,10 @@ impl Transport {
                     .unwrap_or(false)
                 {
                     if let Some(destination_hash) = &packet.destination_hash {
-                        let (next_hop, remaining_hops, outbound_interface_name) = if let Some(entry) = state.path_table.get(destination_hash) {
-                            let next_hop = match entry.get(IDX_PT_NEXT_HOP) {
-                                Some(PathEntryValue::NextHop(next)) => next.clone(),
-                                _ => Vec::new(),
-                            };
-                            let remaining_hops = match entry.get(IDX_PT_HOPS) {
-                                Some(PathEntryValue::Hops(hops)) => *hops,
-                                _ => 0,
-                            };
-                            let outbound_interface_name = match entry.get(IDX_PT_RVCD_IF) {
-                                Some(PathEntryValue::ReceivingInterface(Some(name))) => Some(name.clone()),
-                                _ => None,
-                            };
-                            (next_hop, remaining_hops, outbound_interface_name)
-                        } else {
-                            (Vec::new(), 0, None)
-                        };
+                        let (next_hop, remaining_hops, outbound_interface_name) =
+                            Self::select_path(&state.path_table, &state.interfaces, destination_hash, now())
+                                .map(|(_, e)| (e.next_hop.clone(), e.hops, e.receiving_interface.clone()))
+                                .unwrap_or((Vec::new(), 0, None));
 
                         if !next_hop.is_empty() || state.path_table.contains_key(destination_hash) {
 
@@ -5219,8 +5088,11 @@ impl Transport {
                             } else {
                             }
 
-                            if let Some(PathEntryValue::Timestamp(ts)) = state.path_table.get_mut(destination_hash).and_then(|e| e.get_mut(IDX_PT_TIMESTAMP)) {
-                                *ts = now();
+                            // Refresh timestamp on the best path entry
+                            if let Some(deque) = state.path_table.get_mut(destination_hash) {
+                                if let Some(front) = deque.front_mut() {
+                                    front.timestamp = now();
+                                }
                             }
                         }
                     }
@@ -6426,18 +6298,16 @@ mod tests {
 
         {
             let mut state = TRANSPORT.lock().unwrap();
-            state.path_table.insert(
-                dest_hash.clone(),
-                vec![
-                    PathEntryValue::Timestamp(now()),
-                    PathEntryValue::NextHop(vec![0xCD; crate::reticulum::TRUNCATED_HASHLENGTH / 8]),
-                    PathEntryValue::Hops(2),
-                    PathEntryValue::Expires(now() + 3600.0),
-                    PathEntryValue::RandomBlobs(Vec::new()),
-                    PathEntryValue::ReceivingInterface(Some("dead-iface".to_string())),
-                    PathEntryValue::PacketHash(vec![0xAB; crate::identity::HASHLENGTH / 8]),
-                ],
-            );
+            let mut deque = VecDeque::new();
+            deque.push_back(PathEntry {
+                timestamp: now(),
+                next_hop: vec![0xCD; crate::reticulum::TRUNCATED_HASHLENGTH / 8],
+                hops: 2,
+                expires: now() + 3600.0,
+                receiving_interface: Some("dead-iface".to_string()),
+                packet_hash: vec![0xAB; crate::identity::HASHLENGTH / 8],
+            });
+            state.path_table.insert(dest_hash.clone(), deque);
         }
 
         let mut announce_packet = destination
@@ -6455,15 +6325,11 @@ mod tests {
 
         {
             let state = TRANSPORT.lock().unwrap();
-            let entry = state.path_table.get(&dest_hash).expect("path entry must exist");
-            let hops = match entry.get(IDX_PT_HOPS) {
-                Some(PathEntryValue::Hops(hops)) => *hops,
-                other => panic!("unexpected hops entry: {:?}", other),
-            };
-            let iface = match entry.get(IDX_PT_RVCD_IF) {
-                Some(PathEntryValue::ReceivingInterface(name)) => name.clone(),
-                other => panic!("unexpected iface entry: {:?}", other),
-            };
+            let entry = state.path_table.get(&dest_hash)
+                .and_then(|d| d.front())
+                .expect("path entry must exist");
+            let hops = entry.hops;
+            let iface = entry.receiving_interface.clone();
 
             assert_eq!(
                 hops,
@@ -6847,17 +6713,17 @@ mod tests {
             stub_in.out = true;
             state.interfaces.push(stub_in);
 
-            // Create path table entry for dest_hash (indices must match IDX_PT_* constants)
-            let path_entry = vec![
-                PathEntryValue::Timestamp(now()),                                    // IDX_PT_TIMESTAMP = 0
-                PathEntryValue::NextHop(next_hop.clone()),                           // IDX_PT_NEXT_HOP = 1
-                PathEntryValue::Hops(2),                                              // IDX_PT_HOPS = 2
-                PathEntryValue::Expires(now() + 3600.0),                             // IDX_PT_EXPIRES = 3
-                PathEntryValue::RandomBlobs(Vec::new()),                             // IDX_PT_RANDBLOBS = 4
-                PathEntryValue::ReceivingInterface(Some(outbound_iface_name.to_string())), // IDX_PT_RVCD_IF = 5
-                PathEntryValue::PacketHash(Vec::new()),                              // IDX_PT_PACKET = 6
-            ];
-            state.path_table.insert(dest_hash.clone(), path_entry);
+            // Create path table entry for dest_hash
+            let mut deque = VecDeque::new();
+            deque.push_back(PathEntry {
+                timestamp: now(),
+                next_hop: next_hop.clone(),
+                hops: 2,
+                expires: now() + 3600.0,
+                receiving_interface: Some(outbound_iface_name.to_string()),
+                packet_hash: Vec::new(),
+            });
+            state.path_table.insert(dest_hash.clone(), deque);
         }
         // Synthetic 2-hop entry was just installed; wake race_path waiters.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
