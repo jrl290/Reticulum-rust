@@ -115,6 +115,7 @@ pub struct PostInterface {
     pub max_packet_bytes: usize,
     pub idle_exchange_interval_ms: u64,
     pub outbound_queue: VecDeque<Vec<u8>>,
+    queue_lock: Arc<Mutex<()>>,
     batch_seq: u64,
     ack_batch_ids: Vec<String>,
     pub is_wake_mode: bool,
@@ -132,7 +133,8 @@ fn generate_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn requeue_packets(queue: &mut VecDeque<Vec<u8>>, packets: &mut Vec<Vec<u8>>) {
+fn requeue_packets(queue: &mut VecDeque<Vec<u8>>, packets: &mut Vec<Vec<u8>>, _lock: &Mutex<()>) {
+    let _guard = _lock.lock().unwrap();
     for raw in packets.drain(..).rev() {
         queue.push_front(raw);
     }
@@ -228,6 +230,7 @@ impl PostInterface {
             max_packet_bytes: Self::DEFAULT_MAX_PACKET_BYTES,
             idle_exchange_interval_ms: 1000,
             outbound_queue: VecDeque::new(),
+            queue_lock: Arc::new(Mutex::new(())),
             batch_seq: 0,
             ack_batch_ids: Vec::new(),
             is_wake_mode,
@@ -381,22 +384,25 @@ impl PostInterface {
 
         let exchange_url = format!("{}/v1/interfaces/exchange", node_url);
 
-        // Collect packets from front of queue (up to max_batch)
+        // Collect packets from queue (under queue_lock, not the main lock)
         let mut raw_packets: Vec<Vec<u8>> = Vec::new();
         let mut b64_packets: Vec<String> = Vec::new();
-        for _ in 0..max_batch {
-            match self.outbound_queue.pop_front() {
-                Some(raw) if raw.len() <= max_bytes => {
-                    b64_packets.push(base64::engine::general_purpose::STANDARD.encode(&raw));
-                    raw_packets.push(raw);
+        {
+            let _lock = self.queue_lock.lock().unwrap();
+            for _ in 0..max_batch {
+                match self.outbound_queue.pop_front() {
+                    Some(raw) if raw.len() <= max_bytes => {
+                        b64_packets.push(base64::engine::general_purpose::STANDARD.encode(&raw));
+                        raw_packets.push(raw);
+                    }
+                    Some(raw) => {
+                        log(
+                            &format!("PostInterface dropped oversized outbound packet ({} > {} bytes)", raw.len(), max_bytes),
+                            crate::LOG_WARNING, false, false,
+                        );
+                    }
+                    None => break,
                 }
-                Some(raw) => {
-                    log(
-                        &format!("PostInterface dropped oversized outbound packet ({} > {} bytes)", raw.len(), max_bytes),
-                        crate::LOG_WARNING, false, false,
-                    );
-                }
-                None => break,
             }
         }
 
@@ -419,7 +425,7 @@ impl PostInterface {
 
         let body = serde_json::to_string(&request)
             .map_err(|e| {
-                requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+                requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
                 format!("Failed to serialize exchange request: {}", e)
             })?;
 
@@ -447,7 +453,7 @@ impl PostInterface {
         {
             Ok(r) => r,
             Err(e) => {
-                requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+                requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
                 return Err(format!("Exchange HTTP request failed: {}", e));
             }
         };
@@ -459,7 +465,7 @@ impl PostInterface {
         );
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+            requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
             log(
                 &format!("PostInterface session expired (HTTP {}), will re-register", status.as_u16()),
                 crate::LOG_WARNING, false, false,
@@ -476,26 +482,26 @@ impl PostInterface {
         let response_text = match response.text() {
             Ok(t) => t,
             Err(e) => {
-                requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+                requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
                 return Err(format!("Failed to read exchange response: {}", e));
             }
         };
 
         if !status.is_success() {
-            requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+            requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
             return Err(format!("Exchange failed (HTTP {}): {}", status.as_u16(), response_text));
         }
 
         let exchange_response: ExchangeResponse = match serde_json::from_str(&response_text) {
             Ok(r) => r,
             Err(e) => {
-                requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+                requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
                 return Err(format!("Failed to parse exchange response: {} (body: {})", e, response_text));
             }
         };
 
         if let Some(ref err) = exchange_response.error {
-            requeue_packets(&mut self.outbound_queue, &mut raw_packets);
+            requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
             return Err(format!("Exchange returned error: {}", err));
         }
 
@@ -569,10 +575,13 @@ impl PostInterface {
             return Err("PostInterface offline or detached".to_string());
         }
 
+        let _lock = self.queue_lock.lock().unwrap();
         const MAX_QUEUE_LEN: usize = 1024;
         if self.outbound_queue.len() >= MAX_QUEUE_LEN {
+            drop(_lock);
             log("PostInterface outbound queue full, dropping oldest packet",
                 crate::LOG_WARNING, false, false);
+            let _lock = self.queue_lock.lock().unwrap();
             self.outbound_queue.pop_front();
         }
 
