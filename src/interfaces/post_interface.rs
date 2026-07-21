@@ -323,7 +323,7 @@ impl PostInterface {
                 &register_response.interface_id[..8.min(register_response.interface_id.len())],
                 &register_response.session_token[..8.min(register_response.session_token.len())],
             ),
-            crate::LOG_DEBUG, false, false,
+            crate::LOG_NOTICE, false, false,
         );
 
         if register_response.status != "registered" {
@@ -430,13 +430,13 @@ impl PostInterface {
 
         log(
             &format!(
-                "PostInterface exchange: iface={} token={}... packets={} batch={:?}",
+                "PostInterface exchange req: iface={} token={}... packets={} batch={:?}",
                 &request.interface_id[..8.min(request.interface_id.len())],
                 &request.session_token[..8.min(request.session_token.len())],
                 request.packets.len(),
                 request.batch_id,
             ),
-            crate::LOG_DEBUG, false, false,
+            crate::LOG_NOTICE, false, false,
         );
 
         let response = match self.client
@@ -453,6 +453,10 @@ impl PostInterface {
         };
 
         let status = response.status();
+        log(
+            &format!("PostInterface exchange HTTP {}", status.as_u16()),
+            crate::LOG_NOTICE, false, false,
+        );
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             requeue_packets(&mut self.outbound_queue, &mut raw_packets);
