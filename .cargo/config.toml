@@ -1,2 +1,0 @@
-[target.x86_64-unknown-freebsd]
-linker = "/usr/local/opt/llvm/bin/ld.lld"
