@@ -618,6 +618,26 @@ impl PostInterface {
                         crate::LOG_ERROR, false, false,
                     );
                 }
+                // Register outbound handler so Transport::dispatch_outbound can reach us
+                if let Some(ref name) = guard.base.name {
+                    let iface_clone = Arc::clone(&iface);
+                    let name_clone = name.clone();
+                    crate::interface_writer::register(
+                        &name_clone,
+                        Arc::new(move |raw: &[u8]| -> bool {
+                            if let Ok(mut guard) = iface_clone.lock() {
+                                guard.process_outgoing(raw.to_vec()).is_ok()
+                            } else {
+                                false
+                            }
+                        }),
+                        256,
+                    );
+                    log(
+                        &format!("PostInterface registered outbound handler for {}", name_clone),
+                        crate::LOG_NOTICE, false, false,
+                    );
+                }
             }
 
             let mut consecutive_errors: u32 = 0;
