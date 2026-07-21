@@ -43,6 +43,8 @@ struct RegisterMetadata<'a> {
     client: &'a str,
     implementation: &'a str,
     mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_url: Option<&'a str>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -216,6 +218,7 @@ impl PostInterface {
                 client: "rns-post-interface",
                 implementation: "rnsd-rust",
                 mode: "full",
+                wake_url: self.wake_url.as_deref(),
             },
         };
 
