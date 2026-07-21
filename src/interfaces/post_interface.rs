@@ -73,12 +73,12 @@ struct RegisterResponse {
 struct ExchangeRequest {
     interface_id: String,
     session_token: String,
-    packets: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    batch_id: Option<String>,
     #[serde(default)]
     ack_batch_ids: Vec<String>,
     max_packets: usize,
+    packets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -411,10 +411,10 @@ impl PostInterface {
         let request = ExchangeRequest {
             interface_id,
             session_token,
-            packets: b64_packets,
-            batch_id: batch_id.clone(),
             ack_batch_ids: ack_ids,
             max_packets: max_batch,
+            packets: b64_packets,
+            batch_id: batch_id.clone(),
         };
 
         let body = serde_json::to_string(&request)
