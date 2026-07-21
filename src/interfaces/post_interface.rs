@@ -317,6 +317,15 @@ impl PostInterface {
         let register_response: RegisterResponse = serde_json::from_str(&response_text)
             .map_err(|e| format!("Failed to parse registration response: {} (body: {})", e, response_text))?;
 
+        log(
+            &format!(
+                "PostInterface registration response: iface={} token={}...",
+                &register_response.interface_id[..8.min(register_response.interface_id.len())],
+                &register_response.session_token[..8.min(register_response.session_token.len())],
+            ),
+            crate::LOG_DEBUG, false, false,
+        );
+
         if register_response.status != "registered" {
             return Err(format!(
                 "Registration returned unexpected status: {}",
@@ -413,6 +422,17 @@ impl PostInterface {
                 requeue_packets(&mut self.outbound_queue, &mut raw_packets);
                 format!("Failed to serialize exchange request: {}", e)
             })?;
+
+        log(
+            &format!(
+                "PostInterface exchange: iface={} token={}... packets={} batch={:?}",
+                &request.interface_id[..8.min(request.interface_id.len())],
+                &request.session_token[..8.min(request.session_token.len())],
+                request.packets.len(),
+                request.batch_id,
+            ),
+            crate::LOG_DEBUG, false, false,
+        );
 
         let response = match self.client
             .post(&exchange_url)
