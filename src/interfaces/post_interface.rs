@@ -634,9 +634,23 @@ impl PostInterface {
                     crate::interface_writer::register(
                         &name_clone,
                         Arc::new(move |raw: &[u8]| -> bool {
+                            log(
+                                &format!("PostInterface handler called: {} bytes", raw.len()),
+                                crate::LOG_NOTICE, false, false,
+                            );
                             if let Ok(mut guard) = iface_clone.lock() {
-                                guard.process_outgoing(raw.to_vec()).is_ok()
+                                match guard.process_outgoing(raw.to_vec()) {
+                                    Ok(()) => {
+                                        log("PostInterface handler enqueued packet", crate::LOG_NOTICE, false, false);
+                                        true
+                                    }
+                                    Err(e) => {
+                                        log(&format!("PostInterface handler enqueue failed: {}", e), crate::LOG_ERROR, false, false);
+                                        false
+                                    }
+                                }
                             } else {
+                                log("PostInterface handler lock failed", crate::LOG_ERROR, false, false);
                                 false
                             }
                         }),
