@@ -23,8 +23,10 @@ use crate::log;
 use crate::transport::Transport as RnsTransport;
 use base64::Engine;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -105,6 +107,9 @@ pub struct PostInterface {
     pub is_wake_mode: bool,
     pub running: Arc<AtomicBool>,
     client: reqwest::blocking::Client,
+    pub wake_listen_host: Option<String>,
+    pub wake_listen_port: Option<u16>,
+    wake_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl PostInterface {
@@ -158,6 +163,8 @@ impl PostInterface {
             .unwrap_or(Self::HW_MTU);
 
         let is_wake_mode = wake_url.is_some();
+        let wake_listen_host = config.get("wake_listen_host").map(|s| s.to_string());
+        let wake_listen_port = config.get("wake_listen_port").and_then(|p| p.parse::<u16>().ok());
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -192,6 +199,9 @@ impl PostInterface {
             is_wake_mode,
             running: Arc::new(AtomicBool::new(false)),
             client,
+            wake_listen_host,
+            wake_listen_port,
+            wake_signal: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -465,6 +475,24 @@ impl PostInterface {
             guard.running.store(true, Ordering::SeqCst);
             Arc::clone(&guard.running)
         };
+        let wake_signal = {
+            let guard = iface.lock().unwrap();
+            Arc::clone(&guard.wake_signal)
+        };
+
+        // Spawn wake HTTP server if configured
+        {
+            let guard = iface.lock().unwrap();
+            if guard.wake_listen_host.is_some() && guard.wake_listen_port.is_some() {
+                let host = guard.wake_listen_host.clone().unwrap();
+                let port = guard.wake_listen_port.unwrap();
+                let signal = Arc::clone(&guard.wake_signal);
+                let running_clone = Arc::clone(&guard.running);
+                thread::spawn(move || {
+                    Self::wake_server(host, port, signal, running_clone);
+                });
+            }
+        }
 
         thread::spawn(move || {
             {
@@ -539,18 +567,97 @@ impl PostInterface {
                     }
                 }
 
-                let sleep_secs = interval.min(1.0);
-                let iterations = (interval / sleep_secs).ceil() as u64;
-                for _ in 0..iterations {
-                    if !running.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs_f64(sleep_secs));
+                // Sleep using condvar so wake server can interrupt us.
+                // On wake signal we loop immediately; otherwise we wait
+                // for `interval` or until woken, whichever comes first.
+                let (lock, cvar) = &*wake_signal;
+                let mut woken = lock.lock().unwrap();
+                if *woken {
+                    *woken = false;
+                    // Wake was signaled — skip the sleep, loop to exchange
+                    continue;
                 }
+                // Wait up to interval, or until woken
+                let result = cvar.wait_timeout(woken, Duration::from_secs_f64(interval)).unwrap();
+                woken = result.0;
+                if *woken {
+                    *woken = false;
+                }
+                // drop the lock and loop
             }
 
             log("PostInterface poll loop shutting down", crate::LOG_NOTICE, false, false);
         });
+    }
+
+    /// Minimal HTTP server that listens for POST /v1/wake from the PHP node.
+    /// Signals the poll loop to do an immediate exchange.
+    fn wake_server(
+        host: String,
+        port: u16,
+        wake_signal: Arc<(Mutex<bool>, Condvar)>,
+        running: Arc<AtomicBool>,
+    ) {
+        let bind_addr = format!("{}:{}", host, port);
+        let listener = match TcpListener::bind(&bind_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                log(
+                    &format!("PostInterface wake server: failed to bind {}: {}", bind_addr, e),
+                    crate::LOG_ERROR, false, false,
+                );
+                return;
+            }
+        };
+
+        // Non-blocking so we can check the running flag
+        let _ = listener.set_nonblocking(true);
+
+        log(
+            &format!("PostInterface wake server listening on {}", bind_addr),
+            crate::LOG_NOTICE, false, false,
+        );
+
+        while running.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, addr)) => {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        // Match POST /v1/wake (minimal HTTP parsing)
+                        if request.starts_with("POST /v1/wake") || request.contains("POST /v1/wake") {
+                            // Signal the poll loop
+                            let (lock, cvar) = &*wake_signal;
+                            let mut woken = lock.lock().unwrap();
+                            *woken = true;
+                            cvar.notify_one();
+
+                            // Respond 200 OK
+                            let response = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+                            let _ = stream.write_all(response.as_bytes());
+
+                            log(
+                                &format!("PostInterface wake received from {}", addr),
+                                crate::LOG_DEBUG, false, false,
+                            );
+                        } else {
+                            // 404 for anything else
+                            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No connection waiting — sleep briefly to avoid busy-wait
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+
+        log("PostInterface wake server shutting down", crate::LOG_NOTICE, false, false);
     }
 
     pub fn shutdown(&self) {
