@@ -213,7 +213,7 @@ impl PostInterface {
             bitrate: self.base.bitrate,
             mtu: self.base.hw_mtu.unwrap_or(Self::HW_MTU),
             metadata: RegisterMetadata {
-                client: "reticulum-php",
+                client: "rns-post-interface",
                 implementation: "rnsd-rust",
                 mode: "full",
             },
