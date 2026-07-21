@@ -236,6 +236,8 @@ enum SystemInterface {
     I2PPeer(Arc<Mutex<crate::interfaces::i2p::I2PInterfacePeer>>),
     #[cfg(feature = "serial")]
     RNode(Arc<Mutex<RNodeInterface>>),
+    #[cfg(feature = "post-interface")]
+    Post(Arc<Mutex<crate::interfaces::post_interface::PostInterface>>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1992,6 +1994,50 @@ impl Reticulum {
                         }
                     }
                 }
+                #[cfg(feature = "post-interface")]
+                "PostInterface" => {
+                    match crate::interfaces::post_interface::PostInterface::new(&config_map) {
+                        Ok(mut interface) => {
+                            Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+                            stub_config.online = Some(interface.base.online);
+                            let interface = Arc::new(Mutex::new(interface));
+                            let handler_iface = Arc::clone(&interface);
+                            let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
+                            crate::transport::Transport::register_outbound_handler(
+                                &name,
+                                Arc::new(move |raw| {
+                                    let mut iface = handler_iface.lock().unwrap();
+                                    iface.process_outgoing(raw.to_vec()).is_ok()
+                                }),
+                            );
+                            crate::interfaces::post_interface::PostInterface::start_poll_loop(
+                                Arc::clone(&interface),
+                            );
+                            self.system_interfaces.push(SystemInterface::Post(interface));
+                        }
+                        Err(err) => {
+                            log(
+                                &format!("Failed to create PostInterface {}: {}", name, err),
+                                LOG_ERROR,
+                                false,
+                                false,
+                            );
+                            if instance_init && panic_on_interface_error_enabled() {
+                                panic!("Failed to create PostInterface");
+                            }
+                        }
+                    }
+                    crate::transport::Transport::register_interface_stub_config(stub_config);
+                }
+                #[cfg(not(feature = "post-interface"))]
+                "PostInterface" => {
+                    log(
+                        &format!("PostInterface not available — rebuild with `--features post-interface` to enable"),
+                        LOG_ERROR,
+                        false,
+                        false,
+                    );
+                }
                 _ => {
                     log(
                         &format!(
@@ -2349,6 +2395,8 @@ fn default_ifac_size_for_type(interface_type: &str) -> Option<usize> {
     match interface_type {
         "PipeInterface" | "SerialInterface" | "KISSInterface" => Some(8),
         "UDPInterface" | "TCPClientInterface" | "TCPServerInterface" | "AutoInterface" | "BackboneInterface" | "BackboneClientInterface" => Some(16),
+        #[cfg(feature = "post-interface")]
+        "PostInterface" => Some(16),
         _ => Some(16),
     }
 }

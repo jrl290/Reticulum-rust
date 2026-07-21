@@ -8,8 +8,9 @@ name = "rnsd"
 path = "src/bin/rnsd.rs"
 
 [features]
-default = ["serial"]
+default = ["serial", "post-interface"]
 serial = ["dep:serialport", "dep:btleplug", "dep:uuid", "dep:futures"]
+post-interface = ["dep:reqwest", "dep:base64", "dep:serde_json"]
 python-oracle-tests = []
 
 [dependencies]
@@ -41,8 +42,10 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "ti
 btleplug = { version = "0.11", optional = true }
 uuid = { version = "1.7", optional = true }
 futures = { version = "0.3", optional = true }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [dev-dependencies]
 data-encoding = "2.5"
-serde_json = "1.0"
 pyo3 = { version = "0.21", features = ["auto-initialize"] }

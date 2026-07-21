@@ -3201,6 +3201,11 @@ impl Transport {
     }
 
     pub fn outbound(packet: &mut Packet) -> bool {
+        crate::log(&format!("[OUTBOUND-ENTER] ptype={} dest={} attached={:?}",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            packet.attached_interface),
+            crate::LOG_NOTICE, false, false);
         // Step 2 of the transport refactor (TRANSPORT_REFACTOR_PLAN.md):
         //
         // Previously this function spinwaited on `state.jobs_running`,
@@ -3435,6 +3440,10 @@ impl Transport {
                     interface.out  // Regular packets only on outgoing interfaces
                 };
 
+                crate::log(&format!("[OUTBOUND-IFACE] ptype={} iface={} out={} should_send={}",
+                    packet.packet_type, interface.name, interface.out, should_send_on_interface),
+                    crate::LOG_NOTICE, false, false);
+
                 if should_send_on_interface {
                     let mut should_transmit = true;
 
@@ -3487,6 +3496,9 @@ impl Transport {
                     }
 
                     if should_transmit {
+                        crate::log(&format!("[OUTBOUND-BCAST] ptype={} iface={} raw_len={}",
+                            packet.packet_type, interface.name, packet.raw.len()),
+                            crate::LOG_NOTICE, false, false);
                         if packet.packet_hash.is_some() {
                             packet_hashes.push(packet.packet_hash.clone().unwrap());
                         }
@@ -3496,6 +3508,10 @@ impl Transport {
                         }
                         mark_packet_sent(packet, outbound_time);
                         sent = true;
+                    } else {
+                        crate::log(&format!("[OUTBOUND-SKIP] ptype={} iface={}",
+                            packet.packet_type, interface.name),
+                            crate::LOG_NOTICE, false, false);
                     }
                 }
             }
@@ -3543,6 +3559,10 @@ impl Transport {
                 }
             }
             if !iface_online {
+                if iface_name.contains("PostInterface") {
+                    crate::log(&format!("[OFFLINE-DROP] PostInterface is offline! online_flag={}", iface_online),
+                        crate::LOG_ERROR, false, false);
+                }
                 if should_warn_offline {
                     offline_drops.push(iface_name);
                 }
@@ -4435,22 +4455,24 @@ impl Transport {
         }
         let _trace_dest_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
         let _trace_is_target = _trace_dest_hex.starts_with("6b9f66014d9853");
-        packet.hops = packet.hops.saturating_add(1);
+        // Hops increment MUST happen AFTER the filter check.
+        // The filter uses hops to gate Plain/Group forwarding
+        // (hops <= 1), and incrementing first causes every
+        // backbone packet arriving with hops=1 to be rejected.
 
         // Inline packet_filter + control destination check in a single lock acquisition
         let (filter_pass, control_aspects) = {
             let state = TRANSPORT.lock().unwrap();
 
             // --- packet_filter logic (inlined to avoid separate lock) ---
-            // Must match Python's Transport.packet_filter() exactly
+            // The transport_id check only applies when rnsd is acting as
+            // a local shared instance serving multiple apps with different
+            // transport identities.  In standalone mode, every connected
+            // client (MeshChat via TCP, PostInterface backbone peers) has
+            // its own identity and must be accepted for forwarding.
             let filter_ok = if state.is_connected_to_shared_instance {
+                // Shared instance: the instance daemon handles filtering.
                 true
-            } else if packet.transport_id.is_some() && packet.packet_type != ANNOUNCE {
-                if let Some(identity) = &state.identity {
-                    identity.hash.as_ref().map(|hash| packet.transport_id.as_ref() == Some(hash)).unwrap_or(false)
-                } else {
-                    false
-                }
             } else if packet.context == crate::packet::KEEPALIVE
                 || packet.context == crate::packet::RESOURCE_REQ
                 || packet.context == crate::packet::RESOURCE_PRF
@@ -4514,9 +4536,25 @@ impl Transport {
             crate::log(&format!("Inbound FILTERED ptype={} ctx={}", packet.packet_type, packet.context), crate::LOG_NOTICE, false, false);
             return false;
         }
+        // Increment hops AFTER the filter — the filter uses hops to
+        // gate Plain/Group forwarding (hops <= 1). Python parity:
+        // RNS/Transport.py increments hops after packet_filter().
+        packet.hops = packet.hops.saturating_add(1);
+        crate::log(&format!("[POST-FILTER] ptype={} dest={} dtype={:?} ctx={} hops={} — filter passed",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            packet.destination_type,
+            packet.context,
+            packet.hops,
+        ), crate::LOG_NOTICE, false, false);
         if _trace_is_target { crate::log("[TRACE] target passed filter", crate::LOG_DEBUG, false, false); }
 
         // Handle control destination routing (lock already released)
+        crate::log(&format!("[PRE-CTRL] ptype={} dest={} ctrl_aspects={:?}",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            control_aspects.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+        ), crate::LOG_NOTICE, false, false);
         if let Some(ref aspects) = control_aspects {
             if _trace_is_target { crate::log(&format!("[TRACE] target HIT control aspects={:?}", aspects), crate::LOG_DEBUG, false, false); }
             match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
@@ -4604,6 +4642,11 @@ impl Transport {
             }
         }
 
+        crate::log(&format!("[POST-ANNOUNCE] ptype={} dest={} — made it past announce block",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+        ), crate::LOG_NOTICE, false, false);
+
         let interface_announce_callback = if packet.packet_type == ANNOUNCE && announce_should_add {
             let handler = {
                 let state = TRANSPORT.lock().unwrap();
@@ -4640,6 +4683,10 @@ impl Transport {
         };
 
         let inbound_lock_wait_started = Instant::now();
+        crate::log(&format!("[PRE-LOCK] ptype={} dest={} — about to acquire dispatch lock",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+        ), crate::LOG_NOTICE, false, false);
         let mut state = TRANSPORT.lock().unwrap();
         let inbound_wait_ms = inbound_lock_wait_started.elapsed().as_millis();
         if inbound_wait_ms > 250 {
@@ -4652,6 +4699,13 @@ impl Transport {
         let mut deferred_link_packets: Vec<Packet> = Vec::new();
 
         let mut remember_packet_hash = true;
+        crate::log(&format!("[INBOUND-DISPATCH] ptype={} dest={} dtype={:?} ctx={} hops={}",
+            packet.packet_type,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            packet.destination_type,
+            packet.context,
+            packet.hops,
+        ), crate::LOG_NOTICE, false, false);
         if let Some(destination_hash) = &packet.destination_hash {
             if state.link_table.contains_key(destination_hash) {
                 remember_packet_hash = false;
@@ -4930,6 +4984,7 @@ impl Transport {
                             announce_raw.push(announce_context);
                             announce_raw.extend_from_slice(&packet.data);
 
+                            // Forward to OTHER local client interfaces
                             let local_iface_names: Vec<String> = state.local_client_interfaces
                                 .iter()
                                 .filter(|i| packet.receiving_interface.as_deref() != Some(&i.name))
@@ -4945,6 +5000,28 @@ impl Transport {
                                     deferred_outbound.push((iface_name, announce_raw.clone()));
                                 } else {
                                     state.pending_local_announces.push((dispatch_at, iface_name, announce_raw.clone()));
+                                }
+                            }
+
+                            // ── Also forward to non-local outbound interfaces ──────
+                            // When a local client (MeshChat via TCP) announces its
+                            // destination, we must forward that announce to WAN-facing
+                            // interfaces (PostInterface, BackboneInterface) so the
+                            // wider mesh learns the path.  Without this, reverse-path
+                            // traffic (Browser → MeshChat) never reaches us.
+                            let local_names: std::collections::HashSet<String> = state
+                                .local_client_interfaces.iter().map(|i| i.name.clone()).collect();
+                            for iface in &state.interfaces {
+                                if iface.out
+                                    && !local_names.contains(&iface.name)
+                                    && packet.receiving_interface.as_deref() != Some(&iface.name)
+                                {
+                                    crate::log(
+                                        &format!("[ANNOUNCE-FWD] forwarding announce dest={} to non-local iface={}",
+                                            crate::hexrep(destination_hash, false), iface.name),
+                                        crate::LOG_NOTICE, false, false,
+                                    );
+                                    deferred_outbound.push((iface.name.clone(), announce_raw.clone()));
                                 }
                             }
                         }
@@ -5152,6 +5229,30 @@ impl Transport {
                             *ts = now();
                         }
                     }
+                } else {
+                    // ── No link_table entry: try path-table forwarding ──
+                    let forward: Option<(String, Vec<u8>)> = {
+                        if let Some(entries) = state.path_table.get(destination_hash) {
+                            let now_ts = now();
+                            entries.iter()
+                                .filter(|e| !e.is_expired(now_ts))
+                                .min_by_key(|e| e.hops)
+                                .and_then(|path| {
+                                    path.receiving_interface.as_ref().map(|out_iface| {
+                                        let mut new_raw = packet.raw.clone();
+                                        if new_raw.len() > 1 {
+                                            new_raw[1] = packet.hops;
+                                        }
+                                        (out_iface.clone(), new_raw)
+                                    })
+                                })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((out_iface, new_raw)) = forward {
+                        deferred_outbound.push((out_iface.clone(), new_raw));
+                    }
                 }
             }
         }
@@ -5167,9 +5268,17 @@ impl Transport {
         }
 
         if packet.packet_type == DATA {
+            let dest_hex = packet.destination_hash.as_ref()
+                .map(|h| crate::hexrep(h, false))
+                .unwrap_or_default();
+            crate::log(&format!("[DATA-IN] ptype=DATA dtype={:?} dest={} ctx={} hops={}",
+                packet.destination_type, dest_hex, packet.context, packet.hops),
+                crate::LOG_NOTICE, false, false);
             if _trace_is_target { crate::log(&format!("[TRACE] target reached DATA branch dtype={:?}", packet.destination_type), crate::LOG_NOTICE, false, false); }
             if packet.destination_type == Some(crate::destination::DestinationType::Link) {
                 if _trace_is_target { crate::log("[TRACE] target → deferred_link_packets", crate::LOG_NOTICE, false, false); }
+                crate::log(&format!("[DATA-LINK] dest={} pushed to deferred_link_packets", dest_hex),
+                    crate::LOG_NOTICE, false, false);
                 deferred_link_packets.push(packet.clone());
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
@@ -5181,6 +5290,76 @@ impl Transport {
                         }
                     }
                     if matched == 0 {
+                        // ── Path-table-based forwarding ────────────────────
+                        // If no local destination matched, try the path table.
+                        // This enables bridge/relay operation — packets from
+                        // the backbone (PostInterface) or local TCP clients
+                        // are forwarded toward their destination via the best
+                        // known path, even when the destination is not locally
+                        // registered.
+                        //
+                        // Python parity: RNS/Transport.py forwards non-ANNOUNCE
+                        // packets via path_table when transport_id matches.
+                        // In standalone bridge mode we accept all transport_ids
+                        // (filter bypass) so this forwarding applies to all
+                        // non-local DATA packets.
+
+                        // Extract best path info before any mutable borrow
+                        let forward: Option<(String, Vec<u8>)> = {
+                            if let Some(entries) = state.path_table.get(destination_hash) {
+                                let now_ts = crate::transport::now();
+                                entries.iter()
+                                    .filter(|e| !e.is_expired(now_ts))
+                                    .min_by_key(|e| e.hops)
+                                    .and_then(|path| {
+                                        path.receiving_interface.as_ref().map(|out_iface| {
+                                            crate::log(
+                                                &format!("[FWD-PATH] DATA dest={} via_iface={} hops={} pkt_hops={}",
+                                                    crate::hexrep(destination_hash, false),
+                                                    out_iface,
+                                                    path.hops,
+                                                    packet.hops,
+                                                ),
+                                                crate::LOG_NOTICE, false, false,
+                                            );
+                                            let mut new_raw = packet.raw.clone();
+                                            if new_raw.len() > 1 {
+                                                new_raw[1] = packet.hops;
+                                            }
+                                            (out_iface.clone(), new_raw)
+                                        })
+                                    })
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((out_iface, new_raw)) = forward {
+                            crate::log(
+                                &format!("[FWD-DATA] dispatching dest={} to iface={} raw_len={}",
+                                    crate::hexrep(destination_hash, false),
+                                    out_iface, new_raw.len(),
+                                ),
+                                crate::LOG_NOTICE, false, false,
+                            );
+                            deferred_outbound.push((out_iface.clone(), new_raw));
+                            // Refresh path timestamp
+                            if let Some(entries) = state.path_table.get_mut(destination_hash) {
+                                let now_ts = crate::transport::now();
+                                for e in entries.iter_mut() {
+                                    e.timestamp = now_ts;
+                                }
+                            }
+                        } else {
+                            crate::log(
+                                &format!("[FWD-NOPATH] DATA dest={} — no path entry found in path_table (table_size={})",
+                                    crate::hexrep(destination_hash, false),
+                                    state.path_table.len(),
+                                ),
+                                crate::LOG_NOTICE, false, false,
+                            );
+                        }
+
                         let registered: Vec<String> = state.destinations.iter()
                             .map(|d| format!("{}({:?})", crate::hexrep(&d.hash, false), d.dest_type))
                             .collect();
@@ -5317,6 +5496,8 @@ impl Transport {
         drop(state);
 
         for (iface_name, raw) in deferred_outbound {
+            crate::log(&format!("[DISPATCH-OUT] iface={} raw_len={}", iface_name, raw.len()),
+                crate::LOG_NOTICE, false, false);
             if !Transport::dispatch_outbound(&iface_name, &raw) {
                 crate::log(&format!("[DISPATCH] outbound failed for interface {} (disconnected?), {} bytes dropped",
                     iface_name, raw.len()), crate::LOG_WARNING, false, false);
@@ -5324,6 +5505,12 @@ impl Transport {
         }
 
         for (mut destination, destination_packet) in deferred_destination_receives {
+            crate::log(&format!("[DEST-DISPATCH] dest={} ptype={} dtype={:?} ctx={}",
+                crate::hexrep(&destination.hash, false),
+                destination_packet.packet_type,
+                destination_packet.destination_type,
+                destination_packet.context,
+            ), LOG_NOTICE, false, false);
             match destination.receive(&destination_packet) {
                 Ok(handled) => {
                     if handled {
@@ -5358,6 +5545,14 @@ impl Transport {
         for link_packet in deferred_link_packets {
             let is_link_proof = link_packet.packet_type == PROOF
                 && link_packet.destination_type == Some(crate::destination::DestinationType::Link);
+            crate::log(&format!("[LINK-DISPATCH] ptype={} dest={} dtype={:?} ctx={} len={} is_link_proof={}",
+                link_packet.packet_type,
+                link_packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                link_packet.destination_type,
+                link_packet.context,
+                link_packet.data.len(),
+                is_link_proof,
+            ), LOG_NOTICE, false, false);
             if is_link_proof {
                 let proof_hash_hex = if link_packet.data.len() >= 32 {
                     crate::hexrep(&link_packet.data[..32], false)
@@ -7539,5 +7734,187 @@ mod tests {
             "PROVE_ALL gate must evaluate TRUE for DATA (ptype={})",
             DATA
         );
+    }
+
+    // ── Regression: packet_filter must accept packets with foreign transport_id ──
+    //
+    // When rnsd runs in standalone mode (not connected to a shared instance),
+    // every connected client (TCP app, PostInterface peer) has its own
+    // transport identity.  The transport_id check must NOT apply — it is
+    // only meaningful in shared-instance mode where one daemon filters
+    // packets for multiple apps.
+    //
+    // Regression test for the fix applied 2026-07-19: removed transport_id
+    // check from standalone-mode packet_filter.
+    #[test]
+    fn plain_data_passes_filter_with_foreign_transport_id() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        // Ensure standalone mode
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.is_connected_to_shared_instance = false;
+            state.identity = Some(Identity::new(true));
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+        }
+
+        // Create a Plain destination (broadcast-like) and a packet with foreign transport_id
+        let dest = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "test_filter".to_string(),
+            vec!["data".to_string()],
+        )
+        .expect("Plain destination");
+        let dest_hash = dest.hash.clone();
+
+        let mut packet = Packet::new(
+            Some(dest),
+            b"filter-test".to_vec(),
+            DATA,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        packet.destination_hash = Some(dest_hash);
+        packet.destination_type = Some(DestinationType::Plain);
+        packet.transport_id = Some(vec![0xFF; 16]); // foreign transport_id
+        packet.pack().expect("pack test packet");
+
+        // The filter should accept this packet in standalone mode
+        let result = Transport::inbound(packet.raw.clone(), Some("PostInterface Bridge".to_string()));
+        assert!(
+            result,
+            "Plain DATA packet with foreign transport_id must pass filter in standalone mode. \
+             Regression: transport_id check was re-added to standalone-mode filter."
+        );
+    }
+
+    // ── Regression: announce from local client forwarded to non-local outbound interfaces ──
+    #[test]
+    fn announce_from_local_client_forwarded_to_non_local_interfaces() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().unwrap();
+
+        let local_iface_name = "Client on Local TCP [127.0.0.1:55555]".to_string();
+        let wan_iface_name = "PostInterface Bridge".to_string();
+
+        // Build a valid announce using the same pattern as
+        // inbound_valid_ratcheted_announce_remembers_ratchet
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "announce_fwd_test".to_string(),
+            vec!["announce".to_string()],
+        )
+        .expect("announce destination");
+
+        let ratchet_file = std::env::temp_dir()
+            .join(format!("rns_test_announce_fwd_{}.ratchets",
+                crate::hexrep(&destination.hash, false)))
+            .to_string_lossy().to_string();
+        destination.enable_ratchets(ratchet_file.clone()).expect("enable ratchets");
+        destination.rotate_ratchets().expect("rotate ratchets");
+
+        let ratchet_prv = destination.ratchets.as_ref()
+            .and_then(|r| r.first()).expect("ratchet key").clone();
+        let ratchet_pub = Identity::ratchet_public_bytes(&ratchet_prv).expect("ratchet pub");
+        let identity = destination.identity.as_ref().expect("dest identity");
+        let public_key = identity.get_public_key().expect("pubkey");
+        let random_hash = [0x42; 10];
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&destination.hash);
+        signed_data.extend_from_slice(&public_key);
+        signed_data.extend_from_slice(&destination.name_hash);
+        signed_data.extend_from_slice(&random_hash);
+        signed_data.extend_from_slice(&ratchet_pub);
+        let signature = identity.sign(&signed_data);
+
+        let mut announce_data = Vec::new();
+        announce_data.extend_from_slice(&public_key);
+        announce_data.extend_from_slice(&destination.name_hash);
+        announce_data.extend_from_slice(&random_hash);
+        announce_data.extend_from_slice(&ratchet_pub);
+        announce_data.extend_from_slice(&signature);
+
+        let mut announce_packet = Packet::new(
+            Some(destination.clone()),
+            announce_data,
+            crate::packet::ANNOUNCE,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_SET,
+        );
+        announce_packet.pack().expect("pack announce");
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.is_connected_to_shared_instance = false;
+            state.transport_enabled = true;
+            state.identity = Some(local_identity.clone());
+            state.announce_table.clear();
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+
+            let mut local_stub = InterfaceStub::default();
+            local_stub.name = local_iface_name.clone();
+            local_stub.out = true;
+            local_stub.online = true;
+            local_stub.mode = InterfaceStub::MODE_FULL;
+            state.local_client_interfaces.push(local_stub.clone());
+            state.interfaces.push(local_stub);
+
+            let mut wan_stub = InterfaceStub::default();
+            wan_stub.name = wan_iface_name.clone();
+            wan_stub.out = true;
+            wan_stub.online = true;
+            wan_stub.mode = InterfaceStub::MODE_FULL;
+            state.interfaces.push(wan_stub);
+        }
+
+        // Capture forwarded packets to WAN
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        Transport::register_outbound_handler(
+            &wan_iface_name,
+            Arc::new(move |raw| {
+                captured_clone.lock().unwrap().push(raw.to_vec());
+                true
+            }),
+        );
+
+        let result = Transport::inbound(announce_packet.raw.clone(), Some(local_iface_name.clone()));
+        assert!(result, "ANNOUNCE from local client must be accepted");
+
+        let forwarded = captured.lock().unwrap();
+        assert!(
+            !forwarded.is_empty(),
+            "ANNOUNCE from local client '{}' must be forwarded to WAN '{}'. Got {} packets. \
+             Regression: [ANNOUNCE-FWD] removed or broken.",
+            local_iface_name, wan_iface_name, forwarded.len(),
+        );
+
+        Transport::unregister_outbound_handler(&wan_iface_name);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.interfaces.clear();
+            state.local_client_interfaces.clear();
+        }
+        // Clean up ratchet file
+        let _ = std::fs::remove_file(&ratchet_file);
     }
 }
