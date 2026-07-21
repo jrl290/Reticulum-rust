@@ -177,7 +177,7 @@ impl PostInterface {
         let mut base = Interface::new();
         base.name = Some(name);
         base.in_enabled = true;
-        base.out_enabled = false;
+        base.out_enabled = true;
         base.hw_mtu = Some(mtu);
         base.bitrate = bitrate;
         base.online = false;
