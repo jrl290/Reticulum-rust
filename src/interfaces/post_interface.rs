@@ -35,16 +35,25 @@ struct RegisterRequest<'a> {
     name: &'a str,
     bitrate: u64,
     mtu: usize,
-    metadata: RegisterMetadata<'a>,
+    metadata: RegisterMetadata,
 }
 
 #[derive(serde::Serialize)]
-struct RegisterMetadata<'a> {
-    client: &'a str,
-    implementation: &'a str,
-    mode: &'a str,
+struct RegisterMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
-    wake_url: Option<&'a str>,
+    client: Option<&'static str>,
+    implementation: &'static str,
+    mode: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_interface_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_url: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -97,6 +106,8 @@ pub struct PostInterface {
     pub base: Interface,
     pub node_url: String,
     pub wake_url: Option<String>,
+    pub peer_interface_id: Option<String>,
+    pub peer_session_token: Option<String>,
     pub poll_interval_secs: f64,
     pub interface_id: Option<String>,
     pub session_token: Option<String>,
@@ -112,6 +123,13 @@ pub struct PostInterface {
     pub wake_listen_host: Option<String>,
     pub wake_listen_port: Option<u16>,
     wake_signal: Arc<(Mutex<bool>, Condvar)>,
+}
+
+fn generate_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; bytes];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 impl PostInterface {
@@ -168,6 +186,12 @@ impl PostInterface {
         let wake_listen_host = config.get("wake_listen_host").map(|s| s.to_string());
         let wake_listen_port = config.get("wake_listen_port").and_then(|p| p.parse::<u16>().ok());
 
+        let (peer_interface_id, peer_session_token) = if is_wake_mode {
+            (Some(generate_hex(16)), Some(generate_hex(32)))
+        } else {
+            (None, None)
+        };
+
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -189,6 +213,8 @@ impl PostInterface {
             base,
             node_url,
             wake_url,
+            peer_interface_id,
+            peer_session_token,
             poll_interval_secs,
             interface_id: None,
             session_token: None,
@@ -210,16 +236,42 @@ impl PostInterface {
     pub fn register_with_remote(&mut self) -> Result<(), String> {
         let register_url = format!("{}/v1/interfaces/register", self.node_url);
 
+        let metadata = if let Some(ref wake_url) = self.wake_url {
+            // Wake mode: register as PHP peer with pre-generated credentials
+            let peer_url = wake_url
+                .strip_suffix("/v1/wake")
+                .unwrap_or(wake_url)
+                .to_string();
+
+            RegisterMetadata {
+                client: Some("reticulum-php"),
+                implementation: "PostInterface",
+                mode: 6, // MODE_GATEWAY
+                transport: None,
+                peer_url: Some(peer_url),
+                peer_interface_id: self.peer_interface_id.clone(),
+                peer_session_token: self.peer_session_token.clone(),
+                wake_url: None,
+            }
+        } else {
+            // Poll mode: register as regular PostInterface client
+            RegisterMetadata {
+                client: Some("rns-post-interface"),
+                implementation: "PostInterface",
+                mode: 6,
+                transport: Some("tcp-backbone-gateway"),
+                peer_url: None,
+                peer_interface_id: None,
+                peer_session_token: None,
+                wake_url: None,
+            }
+        };
+
         let request = RegisterRequest {
-            name: self.base.name.as_deref().unwrap_or("post-interface"),
+            name: &format!("RNS PostInterface ({})", self.base.name.as_deref().unwrap_or("post-interface")),
             bitrate: self.base.bitrate,
             mtu: self.base.hw_mtu.unwrap_or(Self::HW_MTU),
-            metadata: RegisterMetadata {
-                client: "rns-post-interface",
-                implementation: "rnsd-rust",
-                mode: "full",
-                wake_url: self.wake_url.as_deref(),
-            },
+            metadata,
         };
 
         let body = serde_json::to_string(&request)
@@ -485,14 +537,18 @@ impl PostInterface {
 
         // Spawn wake HTTP server if configured
         {
-            let guard = iface.lock().unwrap();
-            if guard.wake_listen_host.is_some() && guard.wake_listen_port.is_some() {
-                let host = guard.wake_listen_host.clone().unwrap();
-                let port = guard.wake_listen_port.unwrap();
-                let signal = Arc::clone(&guard.wake_signal);
-                let running_clone = Arc::clone(&guard.running);
+            let (host, port, node_url) = {
+                let guard = iface.lock().unwrap();
+                (guard.wake_listen_host.clone(), guard.wake_listen_port, guard.node_url.clone())
+            };
+            if let (Some(h), Some(p)) = (host, port) {
+                let signal = {
+                    let guard = iface.lock().unwrap();
+                    Arc::clone(&guard.wake_signal)
+                };
+                let running_clone = Arc::clone(&running);
                 thread::spawn(move || {
-                    Self::wake_server(host, port, signal, running_clone);
+                    Self::wake_server(h, p, signal, running_clone, node_url);
                 });
             }
         }
@@ -509,82 +565,96 @@ impl PostInterface {
             }
 
             let mut consecutive_errors: u32 = 0;
+            let mut last_exchange: f64 = 0.0;
+            let min_interval = 3.0;
+            let wake_fallback_interval = 60.0;
+
             while running.load(Ordering::SeqCst) {
-                let (should_exchange, interval) = {
-                    let guard = iface.lock().unwrap();
-                    let registered = guard.interface_id.is_some();
-                    let has_outbound = !guard.outbound_queue.is_empty();
-                    let should_poll = true; // always poll; wake just makes it faster
-                    let secs = if !registered {
-                        5.0
-                    } else {
-                        guard.poll_interval_secs
-                    };
-                    (should_poll, secs)
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+
+                // Check for pending wake — triggers immediate exchange
+                let triggered = {
+                    let (lock, _cvar) = &*wake_signal;
+                    let mut woken = lock.lock().unwrap();
+                    let was_woken = *woken;
+                    *woken = false;
+                    was_woken
                 };
 
-                if should_exchange {
-                    {
-                        let mut guard = iface.lock().unwrap();
-                        if guard.interface_id.is_none() {
-                            match guard.register_with_remote() {
-                                Ok(()) => consecutive_errors = 0,
-                                Err(e) => {
-                                    consecutive_errors += 1;
-                                    log(&format!("PostInterface re-registration failed: {}", e),
-                                        crate::LOG_ERROR, false, false);
-                                }
-                            }
+                if !triggered {
+                    let interval = {
+                        let guard = iface.lock().unwrap();
+                        let registered = guard.interface_id.is_some();
+                        if !registered {
+                            5.0
+                        } else if guard.wake_url.is_some() {
+                            wake_fallback_interval
+                        } else if guard.poll_interval_secs > 0.0 {
+                            guard.poll_interval_secs.max(min_interval)
+                        } else {
+                            (guard.idle_exchange_interval_ms as f64 / 1000.0).max(min_interval)
                         }
-                    }
+                    };
 
-                    {
-                        let mut guard = iface.lock().unwrap();
-                        if guard.interface_id.is_some() {
-                            match guard.exchange() {
-                                Ok(result) => {
-                                    consecutive_errors = 0;
-                                    if result.sent_count > 0 || result.recv_count > 0 {
-                                        let name = guard.base.name.as_deref().unwrap_or("post");
-                                        log(
-                                            &format!("PostInterface({}): sent={} recv={}{}",
-                                                name, result.sent_count, result.recv_count,
-                                                if result.has_more { " (more)" } else { "" }),
-                                            crate::LOG_DEBUG, false, false,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    consecutive_errors += 1;
-                                    if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
-                                        log(
-                                            &format!("PostInterface exchange error ({} consecutive): {}", consecutive_errors, e),
-                                            crate::LOG_ERROR, false, false,
-                                        );
-                                    }
-                                }
+                    if now - last_exchange < interval {
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+
+                // Re-register if needed
+                {
+                    let mut guard = iface.lock().unwrap();
+                    if guard.interface_id.is_none() {
+                        match guard.register_with_remote() {
+                            Ok(()) => consecutive_errors = 0,
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                log(&format!("PostInterface re-registration failed: {}", e),
+                                    crate::LOG_ERROR, false, false);
                             }
                         }
                     }
                 }
 
-                // Sleep using condvar so wake server can interrupt us.
-                // On wake signal we loop immediately; otherwise we wait
-                // for `interval` or until woken, whichever comes first.
-                let (lock, cvar) = &*wake_signal;
-                let mut woken = lock.lock().unwrap();
-                if *woken {
-                    *woken = false;
-                    // Wake was signaled — skip the sleep, loop to exchange
-                    continue;
+                // Do exchange
+                {
+                    let mut guard = iface.lock().unwrap();
+                    if guard.interface_id.is_some() {
+                        match guard.exchange() {
+                            Ok(result) => {
+                                consecutive_errors = 0;
+                                last_exchange = now;
+                                if result.sent_count > 0 || result.recv_count > 0 {
+                                    let name = guard.base.name.as_deref().unwrap_or("post");
+                                    log(
+                                        &format!("PostInterface({}): sent={} recv={}{}",
+                                            name, result.sent_count, result.recv_count,
+                                            if result.has_more { " (more)" } else { "" }),
+                                        crate::LOG_DEBUG, false, false,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
+                                    log(
+                                        &format!("PostInterface exchange error ({} consecutive): {}", consecutive_errors, e),
+                                        crate::LOG_ERROR, false, false,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
-                // Wait up to interval, or until woken
-                let result = cvar.wait_timeout(woken, Duration::from_secs_f64(interval)).unwrap();
-                woken = result.0;
-                if *woken {
-                    *woken = false;
+
+                // No tight loop — already slept above if not triggered
+                if triggered {
+                    thread::sleep(Duration::from_millis(100));
                 }
-                // drop the lock and loop
             }
 
             log("PostInterface poll loop shutting down", crate::LOG_NOTICE, false, false);
@@ -598,6 +668,7 @@ impl PostInterface {
         port: u16,
         wake_signal: Arc<(Mutex<bool>, Condvar)>,
         running: Arc<AtomicBool>,
+        node_url: String,
     ) {
         let bind_addr = format!("{}:{}", host, port);
         let listener = match TcpListener::bind(&bind_addr) {
@@ -625,22 +696,46 @@ impl PostInterface {
                     let mut buf = [0u8; 4096];
                     if let Ok(n) = stream.read(&mut buf) {
                         let request = String::from_utf8_lossy(&buf[..n]);
-                        // Match POST /v1/wake (minimal HTTP parsing)
+                        // POST /v1/wake — PHP node waking us
                         if request.starts_with("POST /v1/wake") || request.contains("POST /v1/wake") {
-                            // Signal the poll loop
-                            let (lock, cvar) = &*wake_signal;
-                            let mut woken = lock.lock().unwrap();
-                            *woken = true;
-                            cvar.notify_one();
+                            // Extract body (after \r\n\r\n)
+                            let mut waker_url = String::new();
+                            if let Some(body_start) = request.find("\r\n\r\n") {
+                                let body = &request[body_start + 4..];
+                                // Simple JSON parse for waker_url
+                                if let Some(start) = body.find("\"waker_url\"") {
+                                    if let Some(colon) = body[start..].find(':') {
+                                        let val_start = start + colon + 1;
+                                        if let Some(q1) = body[val_start..].find('"') {
+                                            if let Some(q2) = body[val_start + q1 + 1..].find('"') {
+                                                waker_url = body[val_start + q1 + 1..val_start + q1 + 1 + q2].to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
-                            // Respond 200 OK
-                            let response = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+                            // Security: only accept wakes from our configured PHP node
+                            if !waker_url.is_empty() && waker_url.starts_with(&node_url) {
+                                let (lock, cvar) = &*wake_signal;
+                                let mut woken = lock.lock().unwrap();
+                                *woken = true;
+                                cvar.notify_one();
+
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+                                let _ = stream.write_all(response.as_bytes());
+
+                                log(
+                                    &format!("PostInterface wake received from {}", waker_url),
+                                    crate::LOG_NOTICE, false, false,
+                                );
+                            } else {
+                                let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                                let _ = stream.write_all(response.as_bytes());
+                            }
+                        } else if request.starts_with("GET /health") {
+                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"status\":\"ok\",\"mode\":\"wake\"}";
                             let _ = stream.write_all(response.as_bytes());
-
-                            log(
-                                &format!("PostInterface wake received from {}", addr),
-                                crate::LOG_DEBUG, false, false,
-                            );
                         } else {
                             // 404 for anything else
                             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
