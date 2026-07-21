@@ -514,11 +514,9 @@ impl PostInterface {
                     let guard = iface.lock().unwrap();
                     let registered = guard.interface_id.is_some();
                     let has_outbound = !guard.outbound_queue.is_empty();
-                    let should_poll = !guard.is_wake_mode || has_outbound;
+                    let should_poll = true; // always poll; wake just makes it faster
                     let secs = if !registered {
                         5.0
-                    } else if guard.is_wake_mode && !has_outbound {
-                        30.0
                     } else {
                         guard.poll_interval_secs
                     };
