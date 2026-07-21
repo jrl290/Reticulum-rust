@@ -424,6 +424,11 @@ impl PostInterface {
             })?;
 
         log(
+            &format!("PostInterface exchange body: {}", &body[..body.len().min(200)]),
+            crate::LOG_DEBUG, false, false,
+        );
+
+        log(
             &format!(
                 "PostInterface exchange: iface={} token={}... packets={} batch={:?}",
                 &request.interface_id[..8.min(request.interface_id.len())],
