@@ -371,9 +371,14 @@ impl PostInterface {
             Some(id) => id.clone(),
             None => return Err("PostInterface not registered".to_string()),
         };
-        let session_token = match &self.session_token {
-            Some(tok) => tok.clone(),
-            None => return Err("PostInterface not registered".to_string()),
+        // PHP peers: use peer_session_token for exchange auth
+        let session_token = if self.wake_url.is_some() {
+            self.peer_session_token.clone().unwrap_or_default()
+        } else {
+            match &self.session_token {
+                Some(tok) => tok.clone(),
+                None => return Err("PostInterface not registered".to_string()),
+            }
         };
         let node_url = self.node_url.clone();
         let max_batch = self.max_batch_packets;
