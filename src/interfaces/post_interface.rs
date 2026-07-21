@@ -696,8 +696,16 @@ impl PostInterface {
                     let mut buf = [0u8; 4096];
                     if let Ok(n) = stream.read(&mut buf) {
                         let request = String::from_utf8_lossy(&buf[..n]);
-                        // POST /v1/wake — PHP node waking us
-                        if request.starts_with("POST /v1/wake") || request.contains("POST /v1/wake") {
+                        // POST /v1/interfaces/exchange — PHP peer pushing exchange to us
+                        // We trigger an immediate poll loop iteration instead of handling inline.
+                        if request.starts_with("POST /v1/interfaces/exchange") || request.contains("POST /v1/interfaces/exchange") {
+                            let (lock, cvar) = &*wake_signal;
+                            let mut woken = lock.lock().unwrap();
+                            *woken = true;
+                            cvar.notify_one();
+                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"status\":\"ok\",\"mode\":\"wake\"}";
+                            let _ = stream.write_all(response.as_bytes());
+                        } else if request.starts_with("POST /v1/wake") || request.contains("POST /v1/wake") {
                             // Extract body (after \r\n\r\n)
                             let mut waker_url = String::new();
                             if let Some(body_start) = request.find("\r\n\r\n") {
