@@ -5118,8 +5118,23 @@ impl Transport {
                     if let Some(ref identity) = state.identity {
                         if let Some(ref identity_hash) = identity.hash {
                             packet.transport_id = Some(identity_hash.clone());
+                            crate::log(
+                                &format!("[INJECT-TID] injected transport_id for ptype={} dest={} table_size={}",
+                                    packet.packet_type,
+                                    crate::hexrep(destination_hash, false),
+                                    state.path_table.len()),
+                                crate::LOG_NOTICE, false, false,
+                            );
                         }
                     }
+                } else {
+                    crate::log(
+                        &format!("[INJECT-MISS] no path for ptype={} dest={} table_size={}",
+                            packet.packet_type,
+                            crate::hexrep(destination_hash, false),
+                            state.path_table.len()),
+                        crate::LOG_NOTICE, false, false,
+                    );
                 }
             }
         }
