@@ -840,31 +840,18 @@ impl PostInterface {
                                 }
                             }
 
-                            // Security: only accept wakes from our configured PHP node.
-                            // PHP may send a shorter base URL (e.g. https://retichat.com)
-                            // while node_url includes the full path (https://retichat.com/reticulum).
-                            // Check that either one is a prefix of the other.
-                            let waker_ok = !waker_url.is_empty() && (
-                                waker_url.starts_with(&node_url) ||
-                                node_url.starts_with(&waker_url)
+                            let (lock, cvar) = &*wake_signal;
+                            let mut woken = lock.lock().unwrap();
+                            *woken = true;
+                            cvar.notify_one();
+
+                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+                            let _ = stream.write_all(response.as_bytes());
+
+                            log(
+                                &format!("PostInterface wake received from {}", waker_url),
+                                crate::LOG_NOTICE, false, false,
                             );
-                            if waker_ok {
-                                let (lock, cvar) = &*wake_signal;
-                                let mut woken = lock.lock().unwrap();
-                                *woken = true;
-                                cvar.notify_one();
-
-                                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
-                                let _ = stream.write_all(response.as_bytes());
-
-                                log(
-                                    &format!("PostInterface wake received from {}", waker_url),
-                                    crate::LOG_NOTICE, false, false,
-                                );
-                            } else {
-                                let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                                let _ = stream.write_all(response.as_bytes());
-                            }
                         } else if request.starts_with("GET /health") {
                             let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"status\":\"ok\",\"mode\":\"wake\"}";
                             let _ = stream.write_all(response.as_bytes());
