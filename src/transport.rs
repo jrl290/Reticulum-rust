@@ -5109,8 +5109,10 @@ impl Transport {
         // fallback they are delivered locally but never forwarded to WAN
         // interfaces.  On a bridge (PostInterface ↔ RMAP), this means
         // messages from the browser to rmap.world silently disappear.
+        // LINKREQUEST is included here — Meshchat sends LINKREQUEST
+        // without transport_id, and the bridge must forward it so the
+        // link can be established bidirectionally.
         if packet.packet_type != ANNOUNCE
-            && packet.packet_type != LINKREQUEST
             && packet.transport_id.is_none()
             && packet.destination_type != Some(crate::destination::DestinationType::Link)
         {
