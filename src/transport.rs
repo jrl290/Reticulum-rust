@@ -5105,12 +5105,11 @@ impl Transport {
 
         // ── Inject/overwrite transport_id when path known ─────────────
         // Python Transport.py line 1492: when a packet arrives without
-        // transport_id but the destination is a local client, set it.
-        // Extended for bridge mode: also overwrite foreign transport_id
-        // set by upstream PHP nodes, so the forwarding block below
-        // (which checks identity.hash == transport_id) can route it.
+        // transport_id and the destination is a local client (path table
+        // entry with hops==0), set transport_id to identity.  Extended
+        // to also overwrite foreign transport_id from upstream PHP peers
+        // so the forwarding block below can route the packet.
         if packet.packet_type != ANNOUNCE
-            && packet.destination_type != Some(crate::destination::DestinationType::Link)
         {
             if let Some(ref destination_hash) = packet.destination_hash {
                 if state.path_table.contains_key(destination_hash.as_slice()) {
