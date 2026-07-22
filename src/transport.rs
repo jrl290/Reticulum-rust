@@ -2255,6 +2255,42 @@ impl Transport {
             return;
         }
 
+        // ── Fallback: forward to non-local outbound interfaces ───────────
+        // When there are no local clients, forward the path request to
+        // WAN-facing outbound interfaces (PostInterface, Backbone) instead
+        // of silently ignoring it.  Without this, bridges that only connect
+        // WAN interfaces (TCPClient to rmap.world + PostInterface to PHP)
+        // drop all path requests from the backbone.
+        if !is_from_local_client {
+            let non_local_outbound: Vec<String> = state
+                .interfaces
+                .iter()
+                .filter(|i| {
+                    i.out
+                        && !state.local_client_interfaces.iter().any(|lc| lc.name == i.name)
+                        && attached_interface.as_deref() != Some(&i.name)
+                })
+                .map(|i| i.name.clone())
+                .collect();
+            if !non_local_outbound.is_empty() {
+                drop(state);
+                log(
+                    &format!(
+                        "Forwarding path request for {}{} to non-local outbound interfaces",
+                        crate::hexrep(&destination_hash, true),
+                        interface_str
+                    ),
+                    LOG_DEBUG,
+                    false,
+                    false,
+                );
+                for name in non_local_outbound {
+                    Transport::request_path(&destination_hash, None, Some(name), None, None);
+                }
+                return;
+            }
+        }
+
         drop(state);
         log(
             &format!(
@@ -4985,38 +5021,44 @@ impl Transport {
                             state.announce_table.insert(destination_hash.clone(), announce_entry);
                         }
 
-                        if !state.local_client_interfaces.is_empty() {
-                            let identity_hash_bytes = state.identity.as_ref()
-                                .and_then(|i| i.hash.clone())
-                                .unwrap_or_default();
-                            let dest_type_bits: u8 = match packet.destination_type {
-                                Some(crate::destination::DestinationType::Single) => 0x00,
-                                Some(crate::destination::DestinationType::Group) => 0x01,
-                                Some(crate::destination::DestinationType::Plain) => 0x02,
-                                Some(crate::destination::DestinationType::Link) => 0x03,
-                                None => 0x00,
-                            };
-                            let flags: u8 = (crate::packet::HEADER_2 << 6)
-                                | ((packet.context_flag & 0x01) << 5)
-                                | (MODE_TRANSPORT << 4)
-                                | (dest_type_bits << 2)
-                                | ANNOUNCE;
-                            let dest_hash_bytes = packet.destination_hash.clone()
-                                .unwrap_or_else(|| destination_hash.clone());
-                            let announce_context = if packet.context == crate::packet::PATH_RESPONSE {
-                                crate::packet::PATH_RESPONSE
-                            } else {
-                                crate::packet::NONE
-                            };
-                            let mut announce_raw = Vec::with_capacity(2 + 16 + 16 + 1 + packet.data.len());
-                            announce_raw.push(flags);
-                            announce_raw.push(packet.hops);
-                            announce_raw.extend_from_slice(&identity_hash_bytes);
-                            announce_raw.extend_from_slice(&dest_hash_bytes);
-                            announce_raw.push(announce_context);
-                            announce_raw.extend_from_slice(&packet.data);
+                        // ── Build announce_raw for forwarding ──────────────────────
+                        // Always build the raw announce packet so we can forward
+                        // it to outbound interfaces (PostInterface, Backbone) even
+                        // when there are no local client interfaces.  Without this,
+                        // a bridge that only has WAN-facing interfaces silently
+                        // consumes announces without propagating them.
+                        let identity_hash_bytes = state.identity.as_ref()
+                            .and_then(|i| i.hash.clone())
+                            .unwrap_or_default();
+                        let dest_type_bits: u8 = match packet.destination_type {
+                            Some(crate::destination::DestinationType::Single) => 0x00,
+                            Some(crate::destination::DestinationType::Group) => 0x01,
+                            Some(crate::destination::DestinationType::Plain) => 0x02,
+                            Some(crate::destination::DestinationType::Link) => 0x03,
+                            None => 0x00,
+                        };
+                        let flags: u8 = (crate::packet::HEADER_2 << 6)
+                            | ((packet.context_flag & 0x01) << 5)
+                            | (MODE_TRANSPORT << 4)
+                            | (dest_type_bits << 2)
+                            | ANNOUNCE;
+                        let dest_hash_bytes = packet.destination_hash.clone()
+                            .unwrap_or_else(|| destination_hash.clone());
+                        let announce_context = if packet.context == crate::packet::PATH_RESPONSE {
+                            crate::packet::PATH_RESPONSE
+                        } else {
+                            crate::packet::NONE
+                        };
+                        let mut announce_raw = Vec::with_capacity(2 + 16 + 16 + 1 + packet.data.len());
+                        announce_raw.push(flags);
+                        announce_raw.push(packet.hops);
+                        announce_raw.extend_from_slice(&identity_hash_bytes);
+                        announce_raw.extend_from_slice(&dest_hash_bytes);
+                        announce_raw.push(announce_context);
+                        announce_raw.extend_from_slice(&packet.data);
 
-                            // Forward to OTHER local client interfaces
+                        // ── Forward to local client interfaces ─────────────────
+                        if !state.local_client_interfaces.is_empty() {
                             let local_iface_names: Vec<String> = state.local_client_interfaces
                                 .iter()
                                 .filter(|i| packet.receiving_interface.as_deref() != Some(&i.name))
@@ -5034,27 +5076,26 @@ impl Transport {
                                     state.pending_local_announces.push((dispatch_at, iface_name, announce_raw.clone()));
                                 }
                             }
+                        }
 
-                            // ── Also forward to non-local outbound interfaces ──────
-                            // When a local client (MeshChat via TCP) announces its
-                            // destination, we must forward that announce to WAN-facing
-                            // interfaces (PostInterface, BackboneInterface) so the
-                            // wider mesh learns the path.  Without this, reverse-path
-                            // traffic (Browser → MeshChat) never reaches us.
-                            let local_names: std::collections::HashSet<String> = state
-                                .local_client_interfaces.iter().map(|i| i.name.clone()).collect();
-                            for iface in &state.interfaces {
-                                if iface.out
-                                    && !local_names.contains(&iface.name)
-                                    && packet.receiving_interface.as_deref() != Some(&iface.name)
-                                {
-                                    crate::log(
-                                        &format!("[ANNOUNCE-FWD] forwarding announce dest={} to non-local iface={}",
-                                            crate::hexrep(destination_hash, false), iface.name),
-                                        crate::LOG_NOTICE, false, false,
-                                    );
-                                    deferred_outbound.push((iface.name.clone(), announce_raw.clone()));
-                                }
+                        // ── Forward to non-local outbound interfaces (ALWAYS) ──
+                        // This runs regardless of whether local clients exist.
+                        // Bridges that only connect WAN interfaces (TCPClient to
+                        // rmap.world + PostInterface to PHP) must forward announces
+                        // to all outbound interfaces so the wider mesh learns paths.
+                        let local_names: std::collections::HashSet<String> = state
+                            .local_client_interfaces.iter().map(|i| i.name.clone()).collect();
+                        for iface in &state.interfaces {
+                            if iface.out
+                                && !local_names.contains(&iface.name)
+                                && packet.receiving_interface.as_deref() != Some(&iface.name)
+                            {
+                                crate::log(
+                                    &format!("[ANNOUNCE-FWD] forwarding announce dest={} to non-local iface={}",
+                                        crate::hexrep(destination_hash, false), iface.name),
+                                    crate::LOG_NOTICE, false, false,
+                                );
+                                deferred_outbound.push((iface.name.clone(), announce_raw.clone()));
                             }
                         }
                     }
