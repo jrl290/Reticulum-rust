@@ -740,14 +740,19 @@ impl PostInterface {
                         match guard.exchange() {
                             Ok(result) => {
                                 consecutive_errors = 0;
-                                last_exchange = now;
-                                if result.sent_count > 0 || result.recv_count > 0 {
+                                // When PHP signals more packets are waiting,
+                                // do NOT update last_exchange so the next
+                                // poll iteration triggers immediately.
+                                if !result.has_more {
+                                    last_exchange = now;
+                                }
+                                if result.sent_count > 0 || result.recv_count > 0 || result.has_more {
                                     let name = guard.base.name.as_deref().unwrap_or("post");
                                     log(
                                         &format!("PostInterface({}): sent={} recv={}{}",
                                             name, result.sent_count, result.recv_count,
                                             if result.has_more { " (more)" } else { "" }),
-                                        crate::LOG_DEBUG, false, false,
+                                        crate::LOG_NOTICE, false, false,
                                     );
                                 }
                             }
