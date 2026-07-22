@@ -579,13 +579,32 @@ impl PostInterface {
             self.base.rxb += data.len() as u64;
             let mut data = data;
             // ── Hop fix for link packets from PHP ───────────────────────
-            // Matches Python PostInterface.py: browser-originated link
-            // packets forwarded by PHP arrive with hops=0.  RNS Transport
-            // adds 1, but link_table expects specific remaining_hops.
-            // Default: browser→PHP(1 hop) + PHP→bridge(1 hop) = 2 hops.
-            // Set to expected-1 so Transport.inbound's +1 gives expected.
+            // Python PostInterface.py lines 269-283: browser-originated
+            // link packets forwarded by PHP arrive with hops=0.  Look up
+            // expected remaining hops: link_table[3] → path_table[2] →
+            // fallback 2.  Set hops = expected-1 so Transport.inbound's
+            // +1 gives exact match for LRPROOF relay hop check.
             if data.len() >= 2 && data[1] == 0 {
-                data[1] = 1; // expected=2, -1 = 1
+                let expected: usize = if data.len() >= 18 {
+                    let dest_hash = data[2..18].to_vec();
+                    let state = crate::transport::TRANSPORT.lock().unwrap();
+                    if let Some(entry) = state.link_table.get(&dest_hash) {
+                        entry.get(crate::transport::IDX_LT_REM_HOPS)
+                            .and_then(|v| {
+                                if let crate::transport::LinkEntryValue::RemainingHops(h) = v {
+                                    Some(*h as usize)
+                                } else { None }
+                            })
+                            .unwrap_or(2)
+                    } else if let Some(entries) = state.path_table.get(&dest_hash) {
+                        entries.front().map(|e| e.hops as usize).unwrap_or(2)
+                    } else {
+                        2
+                    }
+                } else {
+                    2
+                };
+                data[1] = expected.saturating_sub(1) as u8;
             }
             let interface_name = self.base.name.clone();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
