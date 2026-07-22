@@ -5103,6 +5103,50 @@ impl Transport {
             }
         }
 
+        // ── Forward DATA without transport_id ───────────────────────────
+        // Packets arriving from non-transport sources (PHP PostInterface,
+        // browser clients) don't carry a transport_id.  Without this
+        // fallback they are delivered locally but never forwarded to WAN
+        // interfaces.  On a bridge (PostInterface ↔ RMAP), this means
+        // messages from the browser to rmap.world silently disappear.
+        if packet.packet_type != ANNOUNCE
+            && packet.packet_type != LINKREQUEST
+            && packet.transport_id.is_none()
+            && packet.destination_type != Some(crate::destination::DestinationType::Link)
+        {
+            if let Some(destination_hash) = &packet.destination_hash {
+                if !state.destinations.iter().any(|d| d.hash.as_slice() == destination_hash.as_slice()) {
+                    // Destination not local — try to forward via path table.
+                    let (_, _, outbound_iface) =
+                        Self::select_path(&state.path_table, &state.interfaces, destination_hash, now())
+                            .map(|(_, e)| (e.next_hop.clone(), e.hops, e.receiving_interface.clone()))
+                            .unwrap_or((Vec::new(), 0, None));
+                    if let Some(ref name) = outbound_iface {
+                        if packet.receiving_interface.as_deref() != Some(name.as_str()) {
+                            let mut new_raw = packet.raw.clone();
+                            if new_raw.len() > 1 {
+                                new_raw[1] = packet.hops;
+                            }
+                            crate::log(
+                                &format!("[DATA-FWD-FALLBACK] no transport_id, forwarding DATA dest={} to iface={}",
+                                    crate::hexrep(destination_hash, false), name),
+                                crate::LOG_NOTICE, false, false,
+                            );
+                            // Create a reverse-table entry so PROOFs can
+                            // find their way back.
+                            let rev_entry = vec![
+                                ReverseEntryValue::ReceivedInterface(packet.receiving_interface.clone()),
+                                ReverseEntryValue::OutboundInterface(Some(name.clone())),
+                                ReverseEntryValue::Timestamp(now()),
+                            ];
+                            state.reverse_table.insert(packet.get_truncated_hash(), rev_entry);
+                            deferred_outbound.push((name.clone(), new_raw));
+                        }
+                    }
+                }
+            }
+        }
+
         if packet.packet_type != ANNOUNCE && packet.transport_id.is_some() {
             if let Some(identity) = &state.identity {
                 if identity
