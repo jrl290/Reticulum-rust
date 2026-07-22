@@ -5103,23 +5103,24 @@ impl Transport {
             }
         }
 
-        // ── Inject transport_id for packets without one ───────────────
-        // Matches Python Transport.py line 1492: when a packet arrives
-        // without transport_id but we know a path to the destination,
-        // set transport_id to our identity so the normal forwarding
-        // path below handles it uniformly (DATA, LINKREQUEST, PROOF,
-        // etc. — no per-packet-type special cases needed).
+        // ── Inject/overwrite transport_id when path known ─────────────
+        // Python Transport.py line 1492: when a packet arrives without
+        // transport_id but the destination is a local client, set it.
+        // Extended for bridge mode: also overwrite foreign transport_id
+        // set by upstream PHP nodes, so the forwarding block below
+        // (which checks identity.hash == transport_id) can route it.
         if packet.packet_type != ANNOUNCE
-            && packet.transport_id.is_none()
             && packet.destination_type != Some(crate::destination::DestinationType::Link)
         {
             if let Some(ref destination_hash) = packet.destination_hash {
                 if state.path_table.contains_key(destination_hash.as_slice()) {
                     if let Some(ref identity) = state.identity {
                         if let Some(ref identity_hash) = identity.hash {
+                            let had_foreign = packet.transport_id.is_some();
                             packet.transport_id = Some(identity_hash.clone());
                             crate::log(
-                                &format!("[INJECT-TID] injected transport_id for ptype={} dest={} table_size={}",
+                                &format!("[INJECT-TID] {} transport_id for ptype={} dest={} table_size={}",
+                                    if had_foreign { "overwrote foreign" } else { "injected" },
                                     packet.packet_type,
                                     crate::hexrep(destination_hash, false),
                                     state.path_table.len()),
