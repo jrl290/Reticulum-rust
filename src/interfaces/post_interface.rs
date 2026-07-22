@@ -119,6 +119,7 @@ pub struct PostInterface {
     batch_seq: u64,
     ack_batch_ids: Vec<String>,
     pub is_wake_mode: bool,
+    pub rns_mode: u8,
     pub running: Arc<AtomicBool>,
     client: reqwest::blocking::Client,
     pub wake_listen_host: Option<String>,
@@ -190,6 +191,18 @@ impl PostInterface {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(Self::HW_MTU);
 
+        let mode: u8 = config
+            .get("mode")
+            .map(|m| match m.to_lowercase().as_str() {
+                "full" | "point_to_point" => 1,
+                "access_point" => 3,
+                "roaming" => 4,
+                "boundary" => 5,
+                "gateway" => 6,
+                _ => 1,
+            })
+            .unwrap_or(1); // MODE_FULL default like Python
+
         let is_wake_mode = wake_url.is_some();
         let wake_listen_host = config.get("wake_listen_host").map(|s| s.to_string());
         let wake_listen_port = config.get("wake_listen_port").and_then(|p| p.parse::<u16>().ok());
@@ -234,6 +247,7 @@ impl PostInterface {
             batch_seq: 0,
             ack_batch_ids: Vec::new(),
             is_wake_mode,
+            rns_mode: mode,
             running: Arc::new(AtomicBool::new(false)),
             client,
             wake_listen_host,
@@ -255,7 +269,7 @@ impl PostInterface {
             RegisterMetadata {
                 client: Some("reticulum-php"),
                 implementation: "PostInterface",
-                mode: 6, // MODE_GATEWAY
+                mode: self.rns_mode,
                 transport: None,
                 peer_url: Some(peer_url),
                 peer_interface_id: self.peer_interface_id.clone(),
@@ -267,8 +281,8 @@ impl PostInterface {
             RegisterMetadata {
                 client: Some("rns-post-interface"),
                 implementation: "PostInterface",
-                mode: 6,
-                transport: Some("tcp-backbone-gateway"),
+                mode: self.rns_mode,
+                transport: Some(if self.rns_mode == 6 { "tcp-backbone-gateway" } else { "http-exchange" }),
                 peer_url: None,
                 peer_interface_id: None,
                 peer_session_token: None,
