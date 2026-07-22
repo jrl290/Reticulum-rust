@@ -577,6 +577,16 @@ impl PostInterface {
     fn process_incoming(&mut self, data: Vec<u8>) {
         if self.base.online && !self.base.detached {
             self.base.rxb += data.len() as u64;
+            let mut data = data;
+            // ── Hop fix for link packets from PHP ───────────────────────
+            // Matches Python PostInterface.py: browser-originated link
+            // packets forwarded by PHP arrive with hops=0.  RNS Transport
+            // adds 1, but link_table expects specific remaining_hops.
+            // Default: browser→PHP(1 hop) + PHP→bridge(1 hop) = 2 hops.
+            // Set to expected-1 so Transport.inbound's +1 gives expected.
+            if data.len() >= 2 && data[1] == 0 {
+                data[1] = 1; // expected=2, -1 = 1
+            }
             let interface_name = self.base.name.clone();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 RnsTransport::inbound(data, interface_name)
