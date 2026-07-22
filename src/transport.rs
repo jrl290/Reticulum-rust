@@ -86,6 +86,8 @@ pub const LOCAL_CLIENT_ANNOUNCE_PACE: f64 = 0.60;
 pub const DESTINATION_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 pub const MAX_RECEIPTS: usize = 1024;
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
+/// Maximum announces per destination hash per second before dropping.
+pub const ANNOUNCE_RATE_LIMIT: usize = 10;
 pub const PERSIST_RANDOM_BLOBS: usize = 32;
 pub const MAX_RANDOM_BLOBS: usize = 64;
 /// Max number of alternative paths stored per destination in the
@@ -4462,7 +4464,7 @@ impl Transport {
 
         // Inline packet_filter + control destination check in a single lock acquisition
         let (filter_pass, control_aspects) = {
-            let state = TRANSPORT.lock().unwrap();
+            let mut state = TRANSPORT.lock().unwrap();
 
             // --- packet_filter logic (inlined to avoid separate lock) ---
             // The transport_id check only applies when rnsd is acting as
@@ -4470,7 +4472,7 @@ impl Transport {
             // transport identities.  In standalone mode, every connected
             // client (MeshChat via TCP, PostInterface backbone peers) has
             // its own identity and must be accepted for forwarding.
-            let filter_ok = if state.is_connected_to_shared_instance {
+            let mut filter_ok = if state.is_connected_to_shared_instance {
                 // Shared instance: the instance daemon handles filtering.
                 true
             } else if packet.context == crate::packet::KEEPALIVE
@@ -4510,6 +4512,30 @@ impl Transport {
             } else {
                 false
             };
+
+            // ── Announce rate limiter ──────────────────────────────────────
+            // Drop announces for the same destination if more than
+            // ANNOUNCE_RATE_LIMIT (10) arrive within 1 second.
+            if filter_ok && packet.packet_type == ANNOUNCE {
+                if let Some(dest_hash) = &packet.destination_hash {
+                    let now_ts = now();
+                    let entry = state.announce_rate_table
+                        .entry(dest_hash.clone())
+                        .or_insert(AnnounceRateEntry {
+                            last: now_ts,
+                            rate_violations: 0,
+                            blocked_until: 0.0,
+                            timestamps: Vec::new(),
+                        });
+                    entry.timestamps.push(now_ts);
+                    entry.timestamps.retain(|t| now_ts - *t < 1.0);
+                    if entry.timestamps.len() > ANNOUNCE_RATE_LIMIT {
+                        entry.rate_violations = entry.rate_violations.saturating_add(1);
+                        entry.last = now_ts;
+                        filter_ok = false;
+                    }
+                }
+            }
 
             if !filter_ok {
                 (false, None)
@@ -4785,7 +4811,13 @@ impl Transport {
                                 _ => 0.0,
                             };
 
-                            if packet.hops > 0 && packet.hops - 1 == entry_hops {
+                            // Dedup: if this announce has travelled more hops than
+                            // the entry we stored, it has been circulating.
+                            // Use `packet.hops > entry_hops` (not exact `- 1`)
+                            // because intermediate peers (Python client) add
+                            // their own hop, so the packet may come back with
+                            // hops = entry_hops + 2 or more.
+                            if packet.hops > 0 && packet.hops > entry_hops {
                                 if let Some(AnnounceEntryValue::LocalRebroadcasts(count)) = announce_entry.get_mut(IDX_AT_LCL_RBRD) {
                                     *count = count.saturating_add(1);
                                 }
@@ -4794,7 +4826,7 @@ impl Transport {
                                 }
                             }
 
-                            if packet.hops > 0 && packet.hops - 1 == entry_hops.saturating_add(1) && retries > 0 {
+                            if packet.hops > 0 && packet.hops > entry_hops && retries > 0 {
                                 if now() < retransmit_timeout {
                                     remove_entry = true;
                                 }
