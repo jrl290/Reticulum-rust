@@ -840,8 +840,15 @@ impl PostInterface {
                                 }
                             }
 
-                            // Security: only accept wakes from our configured PHP node
-                            if !waker_url.is_empty() && waker_url.starts_with(&node_url) {
+                            // Security: only accept wakes from our configured PHP node.
+                            // PHP may send a shorter base URL (e.g. https://retichat.com)
+                            // while node_url includes the full path (https://retichat.com/reticulum).
+                            // Check that either one is a prefix of the other.
+                            let waker_ok = !waker_url.is_empty() && (
+                                waker_url.starts_with(&node_url) ||
+                                node_url.starts_with(&waker_url)
+                            );
+                            if waker_ok {
                                 let (lock, cvar) = &*wake_signal;
                                 let mut woken = lock.lock().unwrap();
                                 *woken = true;
