@@ -5544,6 +5544,11 @@ impl Transport {
                                     new_raw[1] = packet.hops;
                                 }
                                 if let Some(iface) = find_interface_by_name(&mut state.interfaces, name) {
+                                    crate::log(
+                                        &format!("[PROOF-FWD] forwarding PROOF dest={} via rcvd_if={}",
+                                            crate::hexrep(destination_hash, false), name),
+                                        crate::LOG_NOTICE, false, false,
+                                    );
                                     deferred_outbound.push((iface.name.clone(), new_raw));
                                 }
                             }
@@ -5554,6 +5559,38 @@ impl Transport {
                                 LOG_DEBUG,
                                 false,
                                 false,
+                            );
+                        }
+                    } else {
+                        // ── Reverse-table miss fallback ─────────────────
+                        // When the reverse_table has no entry (e.g. because
+                        // the original DATA was forwarded without creating
+                        // one, or the key doesn't match), fall back to
+                        // path-table routing.  Without this, PROOFs and
+                        // LRPROOFs silently disappear on bridges that
+                        // forward between WAN interfaces.
+                        let (_, _, outbound_iface) =
+                            Self::select_path(&state.path_table, &state.interfaces, destination_hash, now())
+                                .map(|(_, e)| (e.next_hop.clone(), e.hops, e.receiving_interface.clone()))
+                                .unwrap_or((Vec::new(), 0, None));
+                        if let Some(ref name) = outbound_iface {
+                            if packet.receiving_interface.as_deref() != Some(name.as_str()) {
+                                let mut new_raw = packet.raw.clone();
+                                if new_raw.len() > 1 {
+                                    new_raw[1] = packet.hops;
+                                }
+                                crate::log(
+                                    &format!("[PROOF-FWD-FALLBACK] reverse_table miss, forwarding PROOF dest={} via path_iface={}",
+                                        crate::hexrep(destination_hash, false), name),
+                                    crate::LOG_NOTICE, false, false,
+                                );
+                                deferred_outbound.push((name.clone(), new_raw));
+                            }
+                        } else {
+                            crate::log(
+                                &format!("[PROOF-DROP] no reverse_table entry and no path for PROOF dest={}",
+                                    crate::hexrep(destination_hash, false)),
+                                crate::LOG_NOTICE, false, false,
                             );
                         }
                     }
