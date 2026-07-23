@@ -2010,7 +2010,7 @@ impl Reticulum {
                                     iface.process_outgoing(raw.to_vec()).is_ok()
                                 }),
                             );
-                            crate::interfaces::post_interface::PostInterface::start_poll_loop(
+                            crate::interfaces::post_interface::PostInterface::start_exchange_worker(
                                 Arc::clone(&interface),
                             );
                             self.system_interfaces.push(SystemInterface::Post(interface));

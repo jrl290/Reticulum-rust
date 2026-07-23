@@ -11,8 +11,9 @@
 //!    - ACK batch IDs for received batches
 //!    Receives base64-encoded inbound packets.
 //!
-//! 3. **Poll loop**: Periodically exchanges packets. In wake mode, idles
-//!    until the remote node sends a wake notification.
+//! 3. **Event-driven exchange**: Exchanges are triggered by outgoing packets
+//!    (process_outgoing signals the exchange worker) or by wake notifications
+//!    from the PHP node (wake server signals the exchange worker). No polling.
 //!
 //! Protocol reverse-engineered from:
 //!   ../Reticulum-post/php/src/post_interface.php
@@ -108,12 +109,10 @@ pub struct PostInterface {
     pub wake_url: Option<String>,
     pub peer_interface_id: Option<String>,
     pub peer_session_token: Option<String>,
-    pub poll_interval_secs: f64,
     pub interface_id: Option<String>,
     pub session_token: Option<String>,
     pub max_batch_packets: usize,
     pub max_packet_bytes: usize,
-    pub idle_exchange_interval_ms: u64,
     pub outbound_queue: VecDeque<Vec<u8>>,
     queue_lock: Arc<Mutex<()>>,
     batch_seq: u64,
@@ -124,7 +123,7 @@ pub struct PostInterface {
     client: reqwest::blocking::Client,
     pub wake_listen_host: Option<String>,
     pub wake_listen_port: Option<u16>,
-    wake_signal: Arc<(Mutex<bool>, Condvar)>,
+    exchange_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 fn generate_hex(bytes: usize) -> String {
@@ -144,8 +143,6 @@ fn requeue_packets(queue: &mut VecDeque<Vec<u8>>, packets: &mut Vec<Vec<u8>>, _l
 impl PostInterface {
     pub const HW_MTU: usize = 500;
     pub const BITRATE_GUESS: u64 = 1_000_000_000;
-    pub const DEFAULT_POLL_INTERVAL_SECS: f64 = 5.0;
-    pub const MIN_POLL_INTERVAL_SECS: f64 = 2.0;
     pub const DEFAULT_MAX_BATCH_PACKETS: usize = 64;
     pub const DEFAULT_MAX_PACKET_BYTES: usize = 512;
 
@@ -174,12 +171,6 @@ impl PostInterface {
             .get("wake_url")
             .map(|u| u.trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
-
-        let poll_interval_secs = config
-            .get("poll_interval_seconds")
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v.max(Self::MIN_POLL_INTERVAL_SECS))
-            .unwrap_or(Self::DEFAULT_POLL_INTERVAL_SECS);
 
         let bitrate = config
             .get("bitrate")
@@ -236,12 +227,10 @@ impl PostInterface {
             wake_url,
             peer_interface_id,
             peer_session_token,
-            poll_interval_secs,
             interface_id: None,
             session_token: None,
             max_batch_packets: Self::DEFAULT_MAX_BATCH_PACKETS,
             max_packet_bytes: Self::DEFAULT_MAX_PACKET_BYTES,
-            idle_exchange_interval_ms: 1000,
             outbound_queue: VecDeque::new(),
             queue_lock: Arc::new(Mutex::new(())),
             batch_seq: 0,
@@ -252,7 +241,7 @@ impl PostInterface {
             client,
             wake_listen_host,
             wake_listen_port,
-            wake_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            exchange_signal: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -354,12 +343,6 @@ impl PostInterface {
         self.session_token = Some(register_response.session_token.clone());
         self.max_batch_packets = register_response.max_batch_packets.unwrap_or(Self::DEFAULT_MAX_BATCH_PACKETS);
         self.max_packet_bytes = register_response.max_packet_bytes.unwrap_or(Self::DEFAULT_MAX_PACKET_BYTES);
-        self.idle_exchange_interval_ms = register_response.idle_exchange_interval_ms.unwrap_or(1000);
-
-        let remote_interval_secs = (self.idle_exchange_interval_ms as f64) / 1000.0;
-        if remote_interval_secs > self.poll_interval_secs {
-            self.poll_interval_secs = remote_interval_secs;
-        }
 
         self.base.online = true;
         if let Some(ref name) = self.base.name {
@@ -519,14 +502,6 @@ impl PostInterface {
             return Err(format!("Exchange returned error: {}", err));
         }
 
-        if let Some(ms) = exchange_response.idle_exchange_interval_ms {
-            self.idle_exchange_interval_ms = ms;
-            let remote_secs = (ms as f64) / 1000.0;
-            if remote_secs > self.poll_interval_secs {
-                self.poll_interval_secs = remote_secs;
-            }
-        }
-
         let mut recv_count: usize = 0;
         if let Some(delivery_packets) = exchange_response.delivery_packets {
             for b64_packet in &delivery_packets {
@@ -550,17 +525,11 @@ impl PostInterface {
         }
 
         let has_more = exchange_response.delivery_more.unwrap_or(false);
-        let effective_interval = if has_more {
-            (self.idle_exchange_interval_ms as f64 / 1000.0).max(0.1)
-        } else {
-            self.poll_interval_secs
-        };
 
         Ok(ExchangeResult {
             sent_count: raw_packets.len(),
             recv_count,
             has_more,
-            effective_interval_secs: effective_interval,
             batch_id,
         })
     }
@@ -618,55 +587,69 @@ impl PostInterface {
             return Err("PostInterface offline or detached".to_string());
         }
 
-        let _lock = self.queue_lock.lock().unwrap();
-        const MAX_QUEUE_LEN: usize = 1024;
-        if self.outbound_queue.len() >= MAX_QUEUE_LEN {
-            drop(_lock);
-            log("PostInterface outbound queue full, dropping oldest packet",
-                crate::LOG_WARNING, false, false);
+        {
             let _lock = self.queue_lock.lock().unwrap();
-            self.outbound_queue.pop_front();
+            const MAX_QUEUE_LEN: usize = 1024;
+            if self.outbound_queue.len() >= MAX_QUEUE_LEN {
+                log("PostInterface outbound queue full, dropping oldest packet",
+                    crate::LOG_WARNING, false, false);
+                self.outbound_queue.pop_front();
+            }
+            self.outbound_queue.push_back(data);
         }
 
-        self.outbound_queue.push_back(data);
+        // Signal the exchange worker to send immediately
+        let (lock, cvar) = &*self.exchange_signal;
+        let mut triggered = lock.lock().unwrap();
+        *triggered = true;
+        cvar.notify_one();
+
         Ok(())
     }
 
-    pub fn start_poll_loop(iface: Arc<Mutex<PostInterface>>) {
+    /// Start the event-driven exchange worker and wake HTTP server.
+    ///
+    /// Exchange worker waits on `exchange_signal`.  It is signalled by:
+    /// - `process_outgoing` (Transport has a packet to send)
+    /// - wake server (PHP node has data for us)
+    ///
+    /// On signal, the worker drains the outbound queue and exchanges with
+    /// the PHP node.  If PHP returns `delivery_more: true`, the worker
+    /// immediately exchanges again.  When there is no more work, it goes
+    /// back to waiting on the signal.
+    pub fn start_exchange_worker(iface: Arc<Mutex<PostInterface>>) {
         let running = {
             let guard = iface.lock().unwrap();
             guard.running.store(true, Ordering::SeqCst);
             Arc::clone(&guard.running)
         };
-        let wake_signal = {
+        let exchange_signal = {
             let guard = iface.lock().unwrap();
-            Arc::clone(&guard.wake_signal)
+            Arc::clone(&guard.exchange_signal)
         };
 
         // Spawn wake HTTP server if configured
         {
-            let (host, port, node_url) = {
+            let (host, port) = {
                 let guard = iface.lock().unwrap();
-                (guard.wake_listen_host.clone(), guard.wake_listen_port, guard.node_url.clone())
+                (guard.wake_listen_host.clone(), guard.wake_listen_port)
             };
             if let (Some(h), Some(p)) = (host, port) {
-                let signal = {
-                    let guard = iface.lock().unwrap();
-                    Arc::clone(&guard.wake_signal)
-                };
+                let signal = Arc::clone(&exchange_signal);
                 let running_clone = Arc::clone(&running);
                 thread::spawn(move || {
-                    Self::wake_server(h, p, signal, running_clone, node_url);
+                    Self::wake_server(h, p, signal, running_clone);
                 });
             }
         }
 
         thread::spawn(move || {
+            // Initial setup: register and wire outbound handler
             {
                 let mut guard = iface.lock().unwrap();
                 if let Err(e) = guard.register_with_remote() {
                     log(
-                        &format!("PostInterface initial registration failed: {}. Will retry in poll loop.", e),
+                        &format!("PostInterface initial registration failed: {}. Will retry on first exchange.", e),
                         crate::LOG_ERROR, false, false,
                     );
                 }
@@ -677,16 +660,9 @@ impl PostInterface {
                     crate::interface_writer::register(
                         &name_clone,
                         Arc::new(move |raw: &[u8]| -> bool {
-                            log(
-                                &format!("PostInterface handler called: {} bytes", raw.len()),
-                                crate::LOG_NOTICE, false, false,
-                            );
                             if let Ok(mut guard) = iface_clone.lock() {
                                 match guard.process_outgoing(raw.to_vec()) {
-                                    Ok(()) => {
-                                        log("PostInterface handler enqueued packet", crate::LOG_NOTICE, false, false);
-                                        true
-                                    }
+                                    Ok(()) => true,
                                     Err(e) => {
                                         log(&format!("PostInterface handler enqueue failed: {}", e), crate::LOG_ERROR, false, false);
                                         false
@@ -707,119 +683,123 @@ impl PostInterface {
             }
 
             let mut consecutive_errors: u32 = 0;
-            let mut last_exchange: f64 = 0.0;
-            let min_interval = 3.0;
-            let wake_fallback_interval = 60.0;
 
             while running.load(Ordering::SeqCst) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
+                // Wait for a signal (outgoing packet or wake)
+                {
+                    let (lock, cvar) = &*exchange_signal;
+                    let mut triggered = lock.lock().unwrap();
+                    while !*triggered && running.load(Ordering::SeqCst) {
+                        let result = cvar.wait_timeout(triggered, Duration::from_secs(1));
+                        let (guard, timeout) = result.unwrap();
+                        triggered = guard;
+                        if timeout.timed_out() {
+                            // Periodic wake-up to check running flag
+                            continue;
+                        }
+                    }
+                    *triggered = false;
+                }
 
-                // Check for pending wake — triggers immediate exchange
-                let triggered = {
-                    let (lock, _cvar) = &*wake_signal;
-                    let mut woken = lock.lock().unwrap();
-                    let was_woken = *woken;
-                    *woken = false;
-                    was_woken
-                };
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
 
-                if !triggered {
-                    let interval = {
-                        let guard = iface.lock().unwrap();
-                        let registered = guard.interface_id.is_some();
-                        if !registered {
-                            5.0
-                        } else if guard.wake_url.is_some() {
-                            wake_fallback_interval
-                        } else if guard.poll_interval_secs > 0.0 {
-                            guard.poll_interval_secs.max(min_interval)
+                // Exchange loop: keep exchanging while there's work
+                loop {
+                    // Re-register if needed
+                    {
+                        let mut guard = iface.lock().unwrap();
+                        if guard.interface_id.is_none() {
+                            match guard.register_with_remote() {
+                                Ok(()) => consecutive_errors = 0,
+                                Err(e) => {
+                                    consecutive_errors += 1;
+                                    log(&format!("PostInterface re-registration failed: {}", e),
+                                        crate::LOG_ERROR, false, false);
+                                    break; // try again after backoff
+                                }
+                            }
+                        }
+                    }
+
+                    // Do exchange
+                    let result = {
+                        let mut guard = iface.lock().unwrap();
+                        if guard.interface_id.is_some() {
+                            match guard.exchange() {
+                                Ok(r) => Some(r),
+                                Err(e) => {
+                                    consecutive_errors += 1;
+                                    if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
+                                        log(
+                                            &format!("PostInterface exchange error ({} consecutive): {}", consecutive_errors, e),
+                                            crate::LOG_ERROR, false, false,
+                                        );
+                                    }
+                                    None
+                                }
+                            }
                         } else {
-                            (guard.idle_exchange_interval_ms as f64 / 1000.0).max(min_interval)
+                            None
                         }
                     };
 
-                    if now - last_exchange < interval {
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                }
-
-                // Re-register if needed
-                {
-                    let mut guard = iface.lock().unwrap();
-                    if guard.interface_id.is_none() {
-                        match guard.register_with_remote() {
-                            Ok(()) => consecutive_errors = 0,
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                log(&format!("PostInterface re-registration failed: {}", e),
-                                    crate::LOG_ERROR, false, false);
-                            }
+                    match result {
+                        Some(ref r) if r.sent_count > 0 || r.recv_count > 0 || r.has_more => {
+                            consecutive_errors = 0;
+                            let name = {
+                                let guard = iface.lock().unwrap();
+                                guard.base.name.clone().unwrap_or_else(|| "post".to_string())
+                            };
+                            log(
+                                &format!("PostInterface({}): sent={} recv={}{}",
+                                    name, r.sent_count, r.recv_count,
+                                    if r.has_more { " (more)" } else { "" }),
+                                crate::LOG_NOTICE, false, false,
+                            );
+                        }
+                        Some(_) => {
+                            consecutive_errors = 0;
+                        }
+                        None => {
+                            // Exchange failed — backoff then retry
+                            let backoff = (consecutive_errors as f64).min(60.0);
+                            thread::sleep(Duration::from_secs_f64(backoff));
+                            break; // go back to waiting for signal
                         }
                     }
-                }
 
-                // Do exchange
-                {
-                    let mut guard = iface.lock().unwrap();
-                    if guard.interface_id.is_some() {
-                        match guard.exchange() {
-                            Ok(result) => {
-                                consecutive_errors = 0;
-                                // When PHP signals more packets are waiting,
-                                // do NOT update last_exchange so the next
-                                // poll iteration triggers immediately.
-                                if !result.has_more {
-                                    last_exchange = now;
-                                }
-                                if result.sent_count > 0 || result.recv_count > 0 || result.has_more {
-                                    let name = guard.base.name.as_deref().unwrap_or("post");
-                                    log(
-                                        &format!("PostInterface({}): sent={} recv={}{}",
-                                            name, result.sent_count, result.recv_count,
-                                            if result.has_more { " (more)" } else { "" }),
-                                        crate::LOG_NOTICE, false, false,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                last_exchange = now; // backoff even on failure
-                                if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
-                                    log(
-                                        &format!("PostInterface exchange error ({} consecutive): {}", consecutive_errors, e),
-                                        crate::LOG_ERROR, false, false,
-                                    );
-                                }
-                                // Sleep to avoid tight spin on persistent errors
-                                let backoff = (consecutive_errors as f64).min(60.0);
-                                thread::sleep(Duration::from_secs_f64(backoff));
-                            }
-                        }
+                    // Determine if we should exchange again immediately
+                    let should_continue = {
+                        let guard = iface.lock().unwrap();
+                        let has_queued = {
+                            let _ql = guard.queue_lock.lock().unwrap();
+                            !guard.outbound_queue.is_empty()
+                        };
+                        result.as_ref().map(|r| r.has_more).unwrap_or(false) || has_queued
+                    };
+
+                    if !should_continue {
+                        break; // no more work, go back to waiting
                     }
-                }
 
-                // No tight loop — already slept above if not triggered
-                if triggered {
-                    thread::sleep(Duration::from_millis(100));
+                    // Small yield to avoid monopolising the lock
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
 
-            log("PostInterface poll loop shutting down", crate::LOG_NOTICE, false, false);
+            log("PostInterface exchange worker shutting down", crate::LOG_NOTICE, false, false);
         });
     }
 
     /// Minimal HTTP server that listens for POST /v1/wake from the PHP node.
-    /// Signals the poll loop to do an immediate exchange.
+    /// Signals the exchange worker to do an immediate exchange.
     fn wake_server(
         host: String,
         port: u16,
-        wake_signal: Arc<(Mutex<bool>, Condvar)>,
+        exchange_signal: Arc<(Mutex<bool>, Condvar)>,
         running: Arc<AtomicBool>,
-        node_url: String,
     ) {
         let bind_addr = format!("{}:{}", host, port);
         let listener = match TcpListener::bind(&bind_addr) {
@@ -848,9 +828,9 @@ impl PostInterface {
                     if let Ok(n) = stream.read(&mut buf) {
                         let request = String::from_utf8_lossy(&buf[..n]);
                         // POST /v1/interfaces/exchange — PHP peer pushing exchange to us
-                        // We trigger an immediate poll loop iteration instead of handling inline.
+                        // We signal the exchange worker to do an immediate exchange.
                         if request.starts_with("POST /v1/interfaces/exchange") || request.contains("POST /v1/interfaces/exchange") {
-                            let (lock, cvar) = &*wake_signal;
+                            let (lock, cvar) = &*exchange_signal;
                             let mut woken = lock.lock().unwrap();
                             *woken = true;
                             cvar.notify_one();
@@ -874,7 +854,7 @@ impl PostInterface {
                                 }
                             }
 
-                            let (lock, cvar) = &*wake_signal;
+                            let (lock, cvar) = &*exchange_signal;
                             let mut woken = lock.lock().unwrap();
                             *woken = true;
                             cvar.notify_one();
@@ -925,6 +905,5 @@ pub struct ExchangeResult {
     pub sent_count: usize,
     pub recv_count: usize,
     pub has_more: bool,
-    pub effective_interval_secs: f64,
     pub batch_id: Option<String>,
 }
