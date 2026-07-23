@@ -630,15 +630,15 @@ impl PostInterface {
 
         // Spawn wake HTTP server if configured
         {
-            let (host, port) = {
+            let (host, port, node_url) = {
                 let guard = iface.lock().unwrap();
-                (guard.wake_listen_host.clone(), guard.wake_listen_port)
+                (guard.wake_listen_host.clone(), guard.wake_listen_port, guard.node_url.clone())
             };
             if let (Some(h), Some(p)) = (host, port) {
                 let signal = Arc::clone(&exchange_signal);
                 let running_clone = Arc::clone(&running);
                 thread::spawn(move || {
-                    Self::wake_server(h, p, signal, running_clone);
+                    Self::wake_server(h, p, signal, running_clone, node_url);
                 });
             }
         }
@@ -794,12 +794,14 @@ impl PostInterface {
     }
 
     /// Minimal HTTP server that listens for POST /v1/wake from the PHP node.
-    /// Signals the exchange worker to do an immediate exchange.
+    /// Validates waker_url against the configured node_url to prevent
+    /// wake spam from arbitrary hosts, then signals the exchange worker.
     fn wake_server(
         host: String,
         port: u16,
         exchange_signal: Arc<(Mutex<bool>, Condvar)>,
         running: Arc<AtomicBool>,
+        node_url: String,
     ) {
         let bind_addr = format!("{}:{}", host, port);
         let listener = match TcpListener::bind(&bind_addr) {
@@ -854,6 +856,19 @@ impl PostInterface {
                                 }
                             }
 
+                            // Validate waker_url matches our configured node_url
+                            let expected = node_url.trim_end_matches('/');
+                            let received = waker_url.trim_end_matches('/');
+                            if received.is_empty() || received != expected {
+                                log(
+                                    &format!("PostInterface wake rejected: waker_url '{}' does not match node_url '{}'", received, expected),
+                                    crate::LOG_WARNING, false, false,
+                                );
+                                let response = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"status\":\"rejected\"}";
+                                let _ = stream.write_all(response.as_bytes());
+                                continue;
+                            }
+
                             let (lock, cvar) = &*exchange_signal;
                             let mut woken = lock.lock().unwrap();
                             *woken = true;
@@ -863,7 +878,7 @@ impl PostInterface {
                             let _ = stream.write_all(response.as_bytes());
 
                             log(
-                                &format!("PostInterface wake received from {}", waker_url),
+                                &format!("PostInterface wake accepted from {}", waker_url),
                                 crate::LOG_NOTICE, false, false,
                             );
                         } else if request.starts_with("GET /health") {
