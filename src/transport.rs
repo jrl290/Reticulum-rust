@@ -3243,7 +3243,7 @@ impl Transport {
             packet.packet_type,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
             packet.attached_interface),
-            crate::LOG_NOTICE, false, false);
+            crate::LOG_DEBUG, false, false);
         // Step 2 of the transport refactor (TRANSPORT_REFACTOR_PLAN.md):
         //
         // Previously this function spinwaited on `state.jobs_running`,
@@ -3480,7 +3480,7 @@ impl Transport {
 
                 crate::log(&format!("[OUTBOUND-IFACE] ptype={} iface={} out={} should_send={}",
                     packet.packet_type, interface.name, interface.out, should_send_on_interface),
-                    crate::LOG_NOTICE, false, false);
+                    crate::LOG_DEBUG, false, false);
 
                 if should_send_on_interface {
                     let mut should_transmit = true;
@@ -3536,7 +3536,7 @@ impl Transport {
                     if should_transmit {
                         crate::log(&format!("[OUTBOUND-BCAST] ptype={} iface={} raw_len={}",
                             packet.packet_type, interface.name, packet.raw.len()),
-                            crate::LOG_NOTICE, false, false);
+                            crate::LOG_DEBUG, false, false);
                         if packet.packet_hash.is_some() {
                             packet_hashes.push(packet.packet_hash.clone().unwrap());
                         }
@@ -3549,7 +3549,7 @@ impl Transport {
                     } else {
                         crate::log(&format!("[OUTBOUND-SKIP] ptype={} iface={}",
                             packet.packet_type, interface.name),
-                            crate::LOG_NOTICE, false, false);
+                            crate::LOG_DEBUG, false, false);
                     }
                 }
             }
@@ -4608,7 +4608,7 @@ impl Transport {
             packet.destination_type,
             packet.context,
             packet.hops,
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
         if _trace_is_target { crate::log("[TRACE] target passed filter", crate::LOG_DEBUG, false, false); }
 
         // Handle control destination routing (lock already released)
@@ -4616,7 +4616,7 @@ impl Transport {
             packet.packet_type,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
             control_aspects.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
         if let Some(ref aspects) = control_aspects {
             if _trace_is_target { crate::log(&format!("[TRACE] target HIT control aspects={:?}", aspects), crate::LOG_DEBUG, false, false); }
             match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
@@ -4767,7 +4767,7 @@ impl Transport {
             packet.destination_type,
             packet.context,
             packet.hops,
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
         if let Some(destination_hash) = &packet.destination_hash {
             if state.link_table.contains_key(destination_hash) {
                 remember_packet_hash = false;
