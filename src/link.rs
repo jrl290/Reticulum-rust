@@ -1335,21 +1335,6 @@ pub fn mode_from_lp_packet(data: &[u8]) -> u8 {
 /// Derive link ID from a link request packet
 pub fn link_id_from_lr_packet(packet: &Packet) -> Vec<u8> {
     let mut hashable_part = packet.get_hashable_part();
-
-    // PHP exchanges wrap HEADER_1 packets in HEADER_2 with a transport
-    // ID, inserting 16 bytes between hops and destination hash. The
-    // initiator's hashable_part used the original HEADER_1 bytes.
-    // Reconstruct the canonical HEADER_1 hash: flags_nibble + raw[2..],
-    // skipping the transport ID. Strip MTU signalling bytes from both.
-    if packet.header_type == packet::HEADER_2 && packet.raw.len() > 18 {
-        let dst_len = reticulum::TRUNCATED_HASHLENGTH / 8;
-        hashable_part = vec![packet.raw[0] & 0b0000_1111];
-        // Skip flags(1) + hops(1) + transport_id(16) = 18 bytes
-        if packet.raw.len() > dst_len + 2 {
-            hashable_part.extend_from_slice(&packet.raw[dst_len + 2..]);
-        }
-    }
-
     if packet.data.len() > ECPUBSIZE {
         let diff = packet.data.len() - ECPUBSIZE;
         if hashable_part.len() >= diff {
