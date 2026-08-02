@@ -29,22 +29,55 @@
 // SOFTWARE.
 
 use sha2::{Digest, Sha256};
+use hkdf::Hkdf;
+use rand::RngCore;
 
 /// LXMF-style proof-of-work stamp generator and validator
-/// This is a minimal implementation compatible with LXMF stamps
+/// This implementation is byte-compatible with Python LXMF
 pub struct LXStamper;
 
 impl LXStamper {
     pub const STAMP_SIZE: usize = 32;
     
-    /// Generate a workblock from the given data
-    /// The workblock is used as the basis for stamp validation
+    /// Encodes a non-negative integer as MessagePack.
+    /// Mirrors `umsgpack.packb` / `msgpack.packb` for unsigned ints
+    /// to ensure the per-round salt counter matches Python LXMF exactly.
+    fn msgpack_uint(n: u32) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else if n <= 0xff {
+            vec![0xcc, n as u8]
+        } else if n <= 0xffff {
+            vec![0xcd, (n >> 8) as u8, n as u8]
+        } else {
+            vec![
+                0xce,
+                (n >> 24) as u8,
+                (n >> 16) as u8,
+                (n >> 8) as u8,
+                n as u8,
+            ]
+        }
+    }
+    
+    /// Generate a memory-hard workblock from the given data
     pub fn stamp_workblock(data: &[u8], expand_rounds: u32) -> Vec<u8> {
-        let mut workblock = crate::identity::full_hash(data);
+        let mut workblock = Vec::with_capacity((expand_rounds as usize) * 256);
         
-        // Expand the workblock through multiple hash rounds
-        for _ in 0..expand_rounds {
-            workblock = crate::identity::full_hash(&workblock);
+        for n in 0..expand_rounds {
+            let counter = Self::msgpack_uint(n);
+            let mut salt_input = Vec::with_capacity(data.len() + counter.len());
+            salt_input.extend_from_slice(data);
+            salt_input.extend_from_slice(&counter);
+            
+            let salt = Sha256::digest(&salt_input);
+            
+            // Extract and Expand using HKDF-SHA256
+            let hk = Hkdf::<Sha256>::new(Some(&salt), data);
+            let mut okm = [0u8; 256];
+            hk.expand(&[], &mut okm).expect("HKDF expansion failed");
+            
+            workblock.extend_from_slice(&okm);
         }
         
         workblock
@@ -54,35 +87,18 @@ impl LXStamper {
     /// Returns (stamp, value) where value indicates the computational cost
     pub fn generate_stamp(data: &[u8], stamp_cost: u32, expand_rounds: u32) -> (Vec<u8>, u32) {
         let workblock = Self::stamp_workblock(data, expand_rounds);
-        
-        // Simple proof-of-work: find a nonce that produces a hash with enough leading zeros
-        let mut nonce = 0u128;
-        let target = stamp_cost;
+        let mut stamp = vec![0u8; Self::STAMP_SIZE];
+        let mut rng = rand::thread_rng();
         
         loop {
-            let stamp = Self::compute_stamp(&workblock, nonce);
+            // Python LXMF searches for a valid 32-byte stamp by random trial
+            rng.fill_bytes(&mut stamp);
             let value = Self::stamp_value(&workblock, &stamp);
             
-            if value >= target {
-                return (stamp, value);
-            }
-            
-            nonce += 1;
-            
-            // Prevent infinite loops by capping iterations
-            if nonce > 1_000_000 {
-                // Return whatever we have so far
+            if value >= stamp_cost {
                 return (stamp, value);
             }
         }
-    }
-    
-    /// Compute a stamp from workblock and nonce
-    fn compute_stamp(workblock: &[u8], nonce: u128) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(workblock);
-        hasher.update(nonce.to_le_bytes());
-        hasher.finalize().to_vec()
     }
     
     /// Calculate the value (difficulty) of a stamp
@@ -91,7 +107,6 @@ impl LXStamper {
             return 0;
         }
         
-        // Calculate proof-of-work difficulty by counting leading zeros
         let mut hasher = Sha256::new();
         hasher.update(workblock);
         hasher.update(stamp);
@@ -129,9 +144,10 @@ mod tests {
     #[test]
     fn test_stamp_generation() {
         let data = b"test data";
+        // Using a low cost and low rounds for fast tests
         let (stamp, value) = LXStamper::generate_stamp(data, 8, 2);
         
-        assert!(stamp.len() >= LXStamper::STAMP_SIZE);
+        assert_eq!(stamp.len(), LXStamper::STAMP_SIZE);
         assert!(value >= 8);
     }
     
@@ -147,14 +163,12 @@ mod tests {
     
     #[test]
     fn test_stamp_value() {
-        // Generate a real stamp and verify stamp_value agrees with it
         let data = b"test value data";
         let required = 8u32;
         let (stamp, _) = LXStamper::generate_stamp(data, required, 2);
         let workblock = LXStamper::stamp_workblock(data, 2);
 
         let value = LXStamper::stamp_value(&workblock, &stamp);
-        // A properly generated stamp must satisfy the required difficulty
         assert!(value >= required, "stamp_value {} should be >= {}", value, required);
     }
 }
