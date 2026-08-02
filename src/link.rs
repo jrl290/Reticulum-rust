@@ -1649,6 +1649,14 @@ impl Link {
             }
         }
         link.mode = mode_from_lr_packet(data);
+        // Intermediate relays (PHP exchanges, rmap.world) can append or
+        // mutate signalling bytes on the LINKREQUEST. If the mode field
+        // decodes to garbage, signalling_bytes() in prove_with_identity
+        // will fail and silently drop the link. Fall back to defaults.
+        if link.mode != MODE_AES256_CBC && link.mode != MODE_AES128_CBC {
+            link.mode = MODE_DEFAULT;
+            link.mtu = reticulum::MTU; // reset MTU to compiled-in default
+        }
         link.update_mdu();
 
         link.establishment_timeout = ESTABLISHMENT_TIMEOUT_PER_HOP * (packet.hops.max(1) as f64) + KEEPALIVE;
