@@ -3293,6 +3293,22 @@ impl Transport {
             let dest_hash = destination_hash.as_ref().unwrap();
             mark_packet_sent(packet, outbound_time);
 
+            // ── No-hedge gate for LINKREQUEST / PROOF ─────────────────────
+            // Multi-path hedging sends the same packet down several paths
+            // when the best is stale. For LINKREQUEST and PROOF that is fatal:
+            // every relay's reverse-path routing matches the returning
+            // LRPROOF by EXACT hop count (HOPS.md §5, hops_test Test 6), and
+            // a duplicate arriving via a different hop count overwrites the
+            // single stored remaining_hops, so the proof is dropped
+            // (validated=0) — the production propagation-link failure.
+            // These two packet types must go down ONE path only so the
+            // forward and reverse hop counts always agree. DATA keeps hedging
+            // (duplicates are tolerable there). In the common converged case
+            // (a single fresh path) behavior is identical to before, so this
+            // cannot regress single-path destinations.
+            let single_path_only =
+                packet.packet_type == LINKREQUEST || packet.packet_type == PROOF;
+
             for (_idx, _score, entry) in &all_paths {
                 let hops = entry.hops;
                 let outbound_interface_name = entry.receiving_interface.clone();
@@ -3403,7 +3419,17 @@ impl Transport {
                         }
                     }
 
-                    // Continue to next-best path (hedge)
+                    // Continue to next-best path (hedge) — UNLESS this packet
+                    // type is gated to a single path AND we already queued a
+                    // transmission on it. LINKREQUEST/PROOF still refresh the
+                    // stale best path above (path_request fires), but must NOT
+                    // continue to a second path once delivered, which would
+                    // duplicate the packet and fork the reverse hop count. If
+                    // the best path's interface was offline (sent still false)
+                    // we fall through to try the next path so delivery isn't lost.
+                    if single_path_only && sent {
+                        break;
+                    }
                 } else {
                     // Fresh path — delivery covered, stop hedging
                     break;
