@@ -7520,6 +7520,15 @@ mod tests {
         iface_name: &str,
         captured: Arc<Mutex<Vec<Vec<u8>>>>,
     ) {
+        // Test-isolation fix: a previous test may have registered a writer
+        // actor for this same interface name (via the production
+        // `register_outbound_handler` path). `dispatch_outbound` prefers a
+        // registered writer over the legacy `OUTBOUND_HANDLERS` map, so a
+        // stale `rns-writer-<name>` thread would swallow every dispatch and
+        // this test's sync handler would never fire — producing the "Got 0
+        // packets" cross-test cascade. Remove any stale writer so the sync
+        // handler installed here is authoritative for this test.
+        crate::interface_writer::unregister(iface_name);
         let captured_for_handler = captured.clone();
         let handler: OutboundHandler = Arc::new(move |bytes: &[u8]| {
             captured_for_handler.lock().unwrap().push(bytes.to_vec());
