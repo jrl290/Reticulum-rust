@@ -6182,7 +6182,7 @@ mod tests {
 
     #[test]
     fn delivered_receipt_triggers_immediate_delivery_callback_on_registration() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let receipt = make_receipt(0x11, crate::packet::PacketReceipt::DELIVERED);
         let receipt_hash = receipt.hash.clone();
@@ -6205,7 +6205,7 @@ mod tests {
 
     #[test]
     fn failed_receipt_triggers_immediate_timeout_callback_on_registration() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let receipt = make_receipt(0x22, crate::packet::PacketReceipt::FAILED);
         let receipt_hash = receipt.hash.clone();
@@ -6228,7 +6228,7 @@ mod tests {
 
     #[test]
     fn inbound_data_invokes_destination_callback_without_transport_lock_deadlock() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let callback_hits = Arc::new(AtomicUsize::new(0));
@@ -6285,7 +6285,7 @@ mod tests {
 
     #[test]
     fn inbound_proof_marks_receipt_delivered() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let identity = Identity::new(true);
@@ -6346,7 +6346,7 @@ mod tests {
 
     #[test]
     fn inbound_lrproof_without_runtime_link_does_not_validate_generic_receipt() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let identity = Identity::new(true);
@@ -6409,7 +6409,7 @@ mod tests {
 
     #[test]
     fn inbound_link_proof_with_runtime_link_validates_receipt() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let proving_identity = Identity::new(true);
@@ -6500,7 +6500,7 @@ mod tests {
 
     #[test]
     fn packet_filter_rejects_lrproof_for_other_transport_identity() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let local_identity = Identity::new(true);
@@ -6534,7 +6534,7 @@ mod tests {
 
     #[test]
     fn packet_filter_rejects_link_proof_for_other_transport_identity() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let local_identity = Identity::new(true);
@@ -6581,7 +6581,7 @@ mod tests {
 
     #[test]
     fn inbound_valid_ratcheted_announce_remembers_ratchet() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let mut destination = Destination::new_inbound(
@@ -6678,7 +6678,7 @@ mod tests {
 
     #[test]
     fn inbound_live_announce_replaces_unverified_cached_path_even_when_hops_worse() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let saved_path_table;
@@ -6810,7 +6810,7 @@ mod tests {
 
     #[test]
     fn lrproof_valid_signature_short_proof() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0xA1; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
 
@@ -6824,7 +6824,7 @@ mod tests {
 
     #[test]
     fn lrproof_valid_signature_long_proof_with_signalling() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0xB2; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
 
@@ -6840,7 +6840,7 @@ mod tests {
 
     #[test]
     fn lrproof_invalid_signature_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0xC3; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
 
@@ -6855,7 +6855,7 @@ mod tests {
 
     #[test]
     fn lrproof_wrong_link_id_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0xD4; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
         let wrong_link_id = vec![0xE5; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
@@ -6870,7 +6870,7 @@ mod tests {
 
     #[test]
     fn lrproof_wrong_identity_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Create two different identities
         let (identity_a, dst_hash_a) = setup_known_identity();
         let (_identity_b, dst_hash_b) = setup_known_identity();
@@ -6887,7 +6887,7 @@ mod tests {
 
     #[test]
     fn lrproof_wrong_data_length_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0x07; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
 
@@ -6912,7 +6912,7 @@ mod tests {
 
     #[test]
     fn lrproof_unknown_destination_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let identity = Identity::new(true);
         let link_id = vec![0x18; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
         // Use a dst_hash that is NOT registered in known destinations
@@ -6924,7 +6924,7 @@ mod tests {
 
     #[test]
     fn lrproof_corrupted_peer_pub_bytes_rejected() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let (identity, dst_hash) = setup_known_identity();
         let link_id = vec![0x29; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
 
@@ -6996,7 +6996,7 @@ mod tests {
     /// on the interface, breaking tunnel path association.
     #[test]
     fn handle_tunnel_sets_tunnel_id_on_interface_stub() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let iface_name = "test_tunnel_iface_42";
@@ -7047,7 +7047,7 @@ mod tests {
     /// tunnel entry and still keep tunnel_id on the interface.
     #[test]
     fn handle_tunnel_restores_existing_tunnel() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let iface_name = "test_tunnel_restore_iface";
@@ -7088,7 +7088,7 @@ mod tests {
     /// on that link can be forwarded.
     #[test]
     fn inbound_linkrequest_creates_link_table_entry() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let local_identity = Identity::new(true);
@@ -7219,7 +7219,7 @@ mod tests {
     /// With the fix, `jobs()` returns within milliseconds.
     #[test]
     fn jobs_does_not_deadlock_with_published_destination_refresh() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         // Reset relevant state so prior tests don't influence this one.
@@ -7297,7 +7297,7 @@ mod tests {
     /// stuck high, so the concurrent outbound call returns quickly.
     #[test]
     fn outbound_from_other_thread_does_not_deadlock_during_jobs_published_refresh() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         {
@@ -7392,7 +7392,7 @@ mod tests {
     /// `jobs_running`. Both pathologies are now eliminated.
     #[test]
     fn dispatch_outbound_does_not_stall_across_interfaces() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
         let wedged_name = "test-wedged-iface";
         let fast_name = "test-fast-iface";
@@ -7621,7 +7621,7 @@ mod tests {
     /// outbound handler (i.e. would have hit the wire in production).
     #[test]
     fn synthesize_tunnel_emits_to_wire_when_stub_registered() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -7681,7 +7681,7 @@ mod tests {
     /// is your in-tree explanation of why and how to fix it.
     #[test]
     fn synthesize_tunnel_emits_nothing_when_stub_missing() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -7763,7 +7763,7 @@ mod tests {
     /// silently breaking the rnsd reverse-route for link-initiated stubs.
     #[test]
     fn repr_stored_in_interface_stub() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _ifaces_restore = InterfacesRestore::new();
 
         let iface_name = "test-repr-persist";
@@ -7797,7 +7797,7 @@ mod tests {
     /// If this test fails, the fix has regressed and the stall will return.
     #[test]
     fn synthesize_tunnel_all_tcp_fires_on_stubs_with_repr() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -7867,7 +7867,7 @@ mod tests {
     /// signed packet on an interface that cannot forward it.
     #[test]
     fn synthesize_tunnel_all_tcp_skips_offline_stubs() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -7971,7 +7971,7 @@ mod tests {
     // check from standalone-mode packet_filter.
     #[test]
     fn plain_data_passes_filter_with_foreign_transport_id() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         // Ensure standalone mode
@@ -8022,7 +8022,7 @@ mod tests {
     // ── Regression: announce from local client forwarded to non-local outbound interfaces ──
     #[test]
     fn announce_from_local_client_forwarded_to_non_local_interfaces() {
-        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let local_identity = Identity::new(true);
@@ -8138,6 +8138,206 @@ mod tests {
             state.local_client_interfaces.clear();
         }
         // Clean up ratchet file
+        let _ = std::fs::remove_file(&ratchet_file);
+    }
+
+    // ── Reference-conformance regression tests (interface.OUT / single-path) ──
+    //
+    // These pin the Python Transport parity behaviour that the multi-path
+    // divergence broke in production:
+    //   * select_path must not pick a path on an offline interface even when
+    //     that path is fresher / higher-scoring (the RMap-beats-MichMesh bug).
+    //   * inbound announce re-forward must skip offline interfaces.
+    //   * outbound path-routed send must transmit on exactly ONE path (no
+    //     multi-path hedge / fork).
+    //
+    // Each test is self-contained: its own identity, uniquely-named interface
+    // stubs, TEST_GUARD-serialized, and InterfacesRestore so interface state
+    // cannot leak to siblings.
+
+    /// Build a PathEntry for test use.
+    fn make_test_path_entry(
+        next_hop: Vec<u8>,
+        hops: u8,
+        receiving_interface: Option<String>,
+        age_secs: f64,
+    ) -> PathEntry {
+        let now_ts = now();
+        PathEntry {
+            timestamp: now_ts - age_secs,
+            next_hop,
+            hops,
+            expires: now_ts + DESTINATION_TIMEOUT,
+            receiving_interface,
+            packet_hash: vec![0xAB; 16],
+        }
+    }
+
+    /// Register a single interface stub for a test and return its name.
+    fn register_test_iface(name: &str, online: bool, bitrate: Option<u64>) {
+        let mut cfg = InterfaceStubConfig::default();
+        cfg.name = name.to_string();
+        cfg.online = Some(online);
+        cfg.out = true;
+        cfg.mode = InterfaceStub::MODE_FULL;
+        cfg.bitrate = bitrate;
+        Transport::register_interface_stub_config(cfg);
+    }
+
+    #[test]
+    fn select_path_prefers_online_interface_over_fresher_offline_path() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let dest_hash = vec![0x11; 16];
+        let online_name = "test-sp-online";
+        let offline_name = "test-sp-offline";
+
+        // Online interface is SLOWER (lower bitrate) and its path is OLDER —
+        // naive score/freshness would prefer the offline one.  The
+        // interface.OUT gate must override that.
+        register_test_iface(online_name, true, Some(1_000));
+        register_test_iface(offline_name, false, Some(1_000_000));
+
+        let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        let mut deque = VecDeque::new();
+        // Fresher + faster path on the OFFLINE interface (front = newest).
+        deque.push_front(make_test_path_entry(vec![0x22; 16], 1, Some(offline_name.to_string()), 0.0));
+        // Older + slower path on the ONLINE interface.
+        deque.push_back(make_test_path_entry(vec![0x33; 16], 2, Some(online_name.to_string()), 100.0));
+        table.insert(dest_hash.clone(), deque);
+
+        let interfaces = Transport::get_interface_list();
+        let selected = Transport::select_path(&table, &interfaces, &dest_hash, now())
+            .expect("a usable path must be selected");
+
+        assert_eq!(
+            selected.1.receiving_interface.as_deref(),
+            Some(online_name),
+            "select_path must skip the offline-interface path even though it is fresher/faster"
+        );
+    }
+
+    #[test]
+    fn select_path_returns_none_when_all_paths_offline() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let dest_hash = vec![0x44; 16];
+        let offline_name = "test-sp-alloffline";
+        register_test_iface(offline_name, false, Some(1_000_000));
+
+        let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        let mut deque = VecDeque::new();
+        deque.push_front(make_test_path_entry(vec![0x55; 16], 1, Some(offline_name.to_string()), 0.0));
+        table.insert(dest_hash.clone(), deque);
+
+        let interfaces = Transport::get_interface_list();
+        assert!(
+            Transport::select_path(&table, &interfaces, &dest_hash, now()).is_none(),
+            "select_path must return None when every path is on an offline interface"
+        );
+        // has_path must agree (it drives link-request gating).
+        let mut state = TRANSPORT.lock().unwrap();
+        state.path_table = table;
+        drop(state);
+        assert!(
+            !Transport::has_path(&dest_hash),
+            "has_path must be false when the only path is on an offline interface"
+        );
+    }
+
+    #[test]
+    fn announce_reforward_skips_offline_interfaces() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let src_iface = "test-arf-src";
+        let online_wan = "test-arf-online-wan";
+        let offline_wan = "test-arf-offline-wan";
+
+        // Transport must be enabled with an identity for the re-forward path.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.transport_enabled = true;
+            state.is_connected_to_shared_instance = false;
+            state.announce_table.clear();
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+        }
+
+        // Source interface (where the announce arrives) + two WAN candidates.
+        register_test_iface(src_iface, true, None);
+        register_test_iface(online_wan, true, None);
+        register_test_iface(offline_wan, false, None);
+
+        let captured_online: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_offline: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(online_wan, captured_online.clone());
+        install_sync_outbound_handler(offline_wan, captured_offline.clone());
+
+        // Build a valid SINGLE-destination announce (same pattern as the
+        // existing announce-fwd test).
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "announce_reforward_test".to_string(),
+            vec!["announce".to_string()],
+        )
+        .expect("announce destination");
+        let ratchet_file = std::env::temp_dir()
+            .join(format!("rns_test_arf_{}.ratchets", crate::hexrep(&destination.hash, false)))
+            .to_string_lossy().to_string();
+        destination.enable_ratchets(ratchet_file.clone()).expect("enable ratchets");
+        destination.rotate_ratchets().expect("rotate ratchets");
+        let ratchet_prv = destination.ratchets.as_ref().and_then(|r| r.first()).expect("ratchet").clone();
+        let ratchet_pub = Identity::ratchet_public_bytes(&ratchet_prv).expect("ratchet pub");
+        let identity = destination.identity.as_ref().expect("dest identity");
+        let public_key = identity.get_public_key().expect("pubkey");
+        let random_hash = [0x7Au8; 10];
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&destination.hash);
+        signed_data.extend_from_slice(&public_key);
+        signed_data.extend_from_slice(&destination.name_hash);
+        signed_data.extend_from_slice(&random_hash);
+        signed_data.extend_from_slice(&ratchet_pub);
+        let signature = identity.sign(&signed_data);
+        let mut announce_data = Vec::new();
+        announce_data.extend_from_slice(&public_key);
+        announce_data.extend_from_slice(&destination.name_hash);
+        announce_data.extend_from_slice(&random_hash);
+        announce_data.extend_from_slice(&ratchet_pub);
+        announce_data.extend_from_slice(&signature);
+        let mut announce_packet = Packet::new(
+            Some(destination.clone()),
+            announce_data,
+            ANNOUNCE,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_SET,
+        );
+        announce_packet.pack().expect("pack announce");
+
+        let accepted = Transport::inbound(announce_packet.raw.clone(), Some(src_iface.to_string()));
+        assert!(accepted, "inbound announce must be accepted");
+
+        assert!(
+            !captured_online.lock().unwrap().is_empty(),
+            "online WAN interface must receive the re-forwarded announce"
+        );
+        assert!(
+            captured_offline.lock().unwrap().is_empty(),
+            "offline WAN interface must NOT receive the re-forwarded announce (interface.OUT gate)"
+        );
+
+        uninstall_sync_outbound_handler(online_wan);
+        uninstall_sync_outbound_handler(offline_wan);
         let _ = std::fs::remove_file(&ratchet_file);
     }
 }
