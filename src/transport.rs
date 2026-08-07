@@ -7110,16 +7110,23 @@ mod tests {
 
         {
             let mut state = TRANSPORT.lock().unwrap();
-            // Register outbound interface stub
+            // Register outbound interface stub.  It must be ONLINE: a relay
+            // path is only ever learned via an interface that is up, and the
+            // reference interface.OUT gate (select_path) treats a path on an
+            // offline interface as unusable.  InterfaceStub::default() has
+            // online=false, so without this the fixture is unrealistic and the
+            // path lookup correctly returns None.
             let mut stub_out = InterfaceStub::default();
             stub_out.name = outbound_iface_name.to_string();
             stub_out.out = true;
+            stub_out.online = true;
             state.interfaces.push(stub_out);
 
             // Register receiving interface stub
             let mut stub_in = InterfaceStub::default();
             stub_in.name = receiving_iface_name.to_string();
             stub_in.out = true;
+            stub_in.online = true;
             state.interfaces.push(stub_in);
 
             // Create path table entry for dest_hash
@@ -8123,12 +8130,22 @@ mod tests {
         let result = Transport::inbound(announce_packet.raw.clone(), Some(local_iface_name.clone()));
         assert!(result, "ANNOUNCE from local client must be accepted");
 
-        let forwarded = captured.lock().unwrap();
+        // The WAN handler runs on the async writer actor thread
+        // (register_outbound_handler spawns one), so the forwarded packet is
+        // not necessarily captured synchronously when inbound() returns.
+        // Poll with a deadline so the writer has time to drain its queue —
+        // asserting immediately races the writer and is flaky single-threaded.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut forwarded_len = captured.lock().unwrap().len();
+        while forwarded_len == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            forwarded_len = captured.lock().unwrap().len();
+        }
         assert!(
-            !forwarded.is_empty(),
+            forwarded_len > 0,
             "ANNOUNCE from local client '{}' must be forwarded to WAN '{}'. Got {} packets. \
              Regression: [ANNOUNCE-FWD] removed or broken.",
-            local_iface_name, wan_iface_name, forwarded.len(),
+            local_iface_name, wan_iface_name, forwarded_len,
         );
 
         Transport::unregister_outbound_handler(&wan_iface_name);
