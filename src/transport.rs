@@ -3293,21 +3293,21 @@ impl Transport {
             let dest_hash = destination_hash.as_ref().unwrap();
             mark_packet_sent(packet, outbound_time);
 
-            // ── No-hedge gate for LINKREQUEST / PROOF ─────────────────────
-            // Multi-path hedging sends the same packet down several paths
-            // when the best is stale. For LINKREQUEST and PROOF that is fatal:
-            // every relay's reverse-path routing matches the returning
-            // LRPROOF by EXACT hop count (HOPS.md §5, hops_test Test 6), and
-            // a duplicate arriving via a different hop count overwrites the
-            // single stored remaining_hops, so the proof is dropped
-            // (validated=0) — the production propagation-link failure.
-            // These two packet types must go down ONE path only so the
-            // forward and reverse hop counts always agree. DATA keeps hedging
-            // (duplicates are tolerable there). In the common converged case
-            // (a single fresh path) behavior is identical to before, so this
-            // cannot regress single-path destinations.
-            let single_path_only =
-                packet.packet_type == LINKREQUEST || packet.packet_type == PROOF;
+            // ── Single-path send (Python Transport parity) ────────────────
+            // The reference sends a path-routed packet on exactly ONE path:
+            // the single best usable entry.  Multi-path hedging — re-sending
+            // the same packet down several paths when the best is stale — is
+            // fatal for LINKREQUEST/PROOF (every relay matches the returning
+            // LRPROOF by EXACT hop count, HOPS.md §5 hops_test Test 6; a
+            // duplicate arriving via a different hop count overwrites the
+            // stored remaining_hops and the proof is dropped, validated=0 —
+            // the production propagation-link failure) and wasteful for DATA
+            // (duplicate traffic down a dead fork).  Hedging is removed for
+            // ALL packet types: we walk best-first and stop at the first path
+            // that actually transmits.  Stale entries still fire a single
+            // path_request to refresh the route and get their expiry
+            // shortened, matching Python's mark-path-unresponsive intent.
+            let single_path_only = true;
 
             for (_idx, _score, entry) in &all_paths {
                 let hops = entry.hops;
@@ -3419,19 +3419,18 @@ impl Transport {
                         }
                     }
 
-                    // Continue to next-best path (hedge) — UNLESS this packet
-                    // type is gated to a single path AND we already queued a
-                    // transmission on it. LINKREQUEST/PROOF still refresh the
-                    // stale best path above (path_request fires), but must NOT
-                    // continue to a second path once delivered, which would
-                    // duplicate the packet and fork the reverse hop count. If
-                    // the best path's interface was offline (sent still false)
-                    // we fall through to try the next path so delivery isn't lost.
+                    // Single-path: stop once a transmission was queued.  The
+                    // stale best path still refreshed above (path_request
+                    // fires), but we must NOT continue to a second path once
+                    // delivered — that would duplicate the packet and fork the
+                    // reverse hop count.  If the best path's interface was
+                    // missing (sent still false) we fall through to the next
+                    // path so delivery isn't lost.
                     if single_path_only && sent {
                         break;
                     }
                 } else {
-                    // Fresh path — delivery covered, stop hedging
+                    // Fresh path — delivery covered, stop here
                     break;
                 }
             }
@@ -3496,10 +3495,20 @@ impl Transport {
                 .collect();
 
             for interface in &mut state.interfaces {
-                // For announces, broadcast to ALL interfaces even if out_enabled=false
-                // For other packets, only send on interfaces with out_enabled=true
-                let should_send_on_interface = if packet.packet_type == ANNOUNCE {
-                    true  // Announces broadcast to all interfaces
+                // interface.OUT gate (Python Transport.outbound ~line 982):
+                // never broadcast down an interface that is offline.  Python's
+                // broadcast loop is `for interface in Transport.interfaces: if
+                // interface.OUT:` — a down interface is skipped entirely, so
+                // announces are never sent-and-dropped on dead links.  For
+                // announces we broadcast to all *online* interfaces even if
+                // out_enabled=false; for other packets we additionally require
+                // out_enabled=true.  This stops the announce-spam to dead
+                // interfaces (RMap etc.) that the downstream offline filter
+                // was having to drop.
+                let should_send_on_interface = if !interface.online {
+                    false
+                } else if packet.packet_type == ANNOUNCE {
+                    true  // Announces broadcast to all online interfaces
                 } else {
                     interface.out  // Regular packets only on outgoing interfaces
                 };
@@ -4156,6 +4165,20 @@ impl Transport {
             if entry.is_expired(now) {
                 continue;
             }
+            // interface.OUT gate (Python Transport parity): a path is only
+            // usable if its receiving interface is currently online.  The
+            // single-entry Python path table never holds a live path on a
+            // dead interface for long because inbound re-announce overwrites
+            // it; our multi-entry table keeps stale forks, so we must gate on
+            // interface online status here.  Without this a fresh path on a
+            // dead interface (e.g. RMap) out-scores a live one (MichMesh).
+            if let Some(name) = entry.receiving_interface.as_ref() {
+                if let Some(iface) = interfaces.iter().find(|i| &i.name == name) {
+                    if !iface.online {
+                        continue;
+                    }
+                }
+            }
             let bitrate = entry.receiving_interface.as_ref()
                 .and_then(|name| interfaces.iter().find(|i| &i.name == name))
                 .and_then(|i| i.bitrate);
@@ -4196,6 +4219,16 @@ impl Transport {
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.is_expired(now))
+            // interface.OUT gate: drop paths whose interface is offline
+            // (see select_path).
+            .filter(|(_, e)| match e.receiving_interface.as_ref() {
+                Some(name) => interfaces
+                    .iter()
+                    .find(|i| &i.name == name)
+                    .map(|i| i.online)
+                    .unwrap_or(true),
+                None => true,
+            })
             .map(|(idx, e)| {
                 let bitrate = e
                     .receiving_interface
