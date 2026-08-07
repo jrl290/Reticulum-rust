@@ -2267,6 +2267,7 @@ impl Transport {
                 .iter()
                 .filter(|i| {
                     i.out
+                        && i.online
                         && !state.local_client_interfaces.iter().any(|lc| lc.name == i.name)
                         && attached_interface.as_deref() != Some(&i.name)
                 })
@@ -5145,7 +5146,15 @@ impl Transport {
                         let local_names: std::collections::HashSet<String> = state
                             .local_client_interfaces.iter().map(|i| i.name.clone()).collect();
                         for iface in &state.interfaces {
+                            // interface.OUT gate (Python Transport parity):
+                            // never re-forward an announce down an interface
+                            // that is offline.  Same rule as the outbound()
+                            // broadcast gate — a down interface is skipped
+                            // entirely, stopping announce-spam to dead links
+                            // (RMap/Beleth/EtherWhisperer) that would
+                            // otherwise be sent-then-dropped downstream.
                             if iface.out
+                                && iface.online
                                 && !local_names.contains(&iface.name)
                                 && packet.receiving_interface.as_deref() != Some(&iface.name)
                             {
