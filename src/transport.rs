@@ -432,6 +432,11 @@ pub struct TransportState {
     pub published_last_checked: f64,
     /// How often jobs() examines the published set for due refreshes.
     pub published_check_interval: f64,
+    /// Wall-clock of the last published-destination announce actually sent.
+    /// Enforces `LOCAL_CLIENT_ANNOUNCE_PACE` spacing between them so a node
+    /// with many published destinations never emits a burst that trips the
+    /// upstream peer's announce ingress control.
+    pub published_last_announced_at: f64,
     /// True when `path_table` has been mutated since the last on-disk
     /// persist. Drives the opportunistic save in `jobs()` so that warm
     /// starts find every learned path on disk — not just whatever
@@ -755,6 +760,7 @@ pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| Fast
     mgmt_announce_interval: 2.0 * 60.0 * 60.0,
     blackhole_check_interval: 60.0,
     published_check_interval: 30.0,
+    published_last_announced_at: 0.0,
     path_table_save_interval: 30.0,
     ..TransportState::default()
 }));
@@ -2696,7 +2702,29 @@ impl Transport {
         //       Mitigation: drop `state` BEFORE invoking `announce()`, do
         //       the build outside the lock, then re-acquire `state` to
         //       update bookkeeping.
-        let mut published_announce_packets: Vec<(Vec<u8>, Packet)> = Vec::new();
+        //
+        // PACING — at most ONE published announce is emitted per sweep, and
+        // never sooner than `LOCAL_CLIENT_ANNOUNCE_PACE` after the previous
+        // one. A node that publishes many destinations (rfed publishes 16)
+        // otherwise emits all of them inside a single jobs() tick, which is
+        // exactly the burst that `LOCAL_CLIENT_ANNOUNCE_PACE` exists to
+        // avoid: every RNS interface runs `ingress_control` by default and
+        // measures `incoming_announce_frequency()` over the last 6 samples
+        // (`Reticulum-master/RNS/Interfaces/Interface.py:117-131`). Sixteen
+        // announces in one tick puts the measured rate far above
+        // `IC_BURST_FREQ_NEW = 3.5/s`, so the upstream peer holds the
+        // remainder (`hold_announce`) and dribbles them back out one every
+        // `IC_HELD_RELEASE_INTERVAL = 30 s` after a 300 s penalty — with a
+        // 256-entry cap that silently discards the overflow. The observed
+        // symptom is that only a few of the published destinations get a
+        // refreshed path upstream after a restart, and every LINK to one of
+        // the others is routed into the node's *previous*, now-dead
+        // connection until the next refresh interval.
+        //
+        // While a backlog exists `published_last_checked` is deliberately
+        // NOT advanced, so the sweep re-runs on the next 250 ms tick and the
+        // whole set drains at ~1 announce per 600 ms instead of 30 s apart.
+        let mut published_announce_packet: Option<(Vec<u8>, Packet)> = None;
         if !state.published_destinations.is_empty()
             && now() > state.published_last_checked + state.published_check_interval
         {
@@ -2709,11 +2737,13 @@ impl Transport {
                     } else { None }
                 })
                 .collect();
-            state.published_last_checked = now_ts;
-            if !due.is_empty() {
+            if due.is_empty() {
+                state.published_last_checked = now_ts;
+            } else if now_ts - state.published_last_announced_at >= LOCAL_CLIENT_ANNOUNCE_PACE {
                 // Snapshot the matching destinations so we can release the
                 // lock before invoking announce() (see deadlock note above).
-                let candidates: Vec<(Vec<u8>, Option<Vec<u8>>, Destination)> = due.iter()
+                // Sorted by hash so the drain order is deterministic.
+                let mut candidates: Vec<(Vec<u8>, Option<Vec<u8>>, Destination)> = due.iter()
                     .filter_map(|(hash, app_data)| {
                         state.destinations.iter().find(|d|
                             d.hash == *hash
@@ -2722,10 +2752,19 @@ impl Transport {
                         ).map(|orig| (hash.clone(), app_data.clone(), orig.clone()))
                     })
                     .collect();
-                let missing: Vec<Vec<u8>> = due.iter()
-                    .filter(|(hash, _)| !candidates.iter().any(|(h, _, _)| h == hash))
-                    .map(|(hash, _)| hash.clone())
-                    .collect();
+                candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                let selected = if candidates.is_empty() { None } else { Some(candidates.remove(0)) };
+                let missing: Vec<Vec<u8>> = if selected.is_some() {
+                    // Real work to do — keep draining. Unregistered hashes are
+                    // reported on a later sweep, once the backlog is empty, so
+                    // the log cadence stays at `published_check_interval`.
+                    Vec::new()
+                } else {
+                    // Nothing left but unregistered hashes; they must not pin
+                    // the sweep to the 250 ms tick forever.
+                    state.published_last_checked = now_ts;
+                    due.iter().map(|(hash, _)| hash.clone()).collect()
+                };
 
                 // Drop the TRANSPORT lock before calling announce(), which
                 // re-enters TRANSPORT via remember_ratchet ->
@@ -2738,10 +2777,10 @@ impl Transport {
                         LOG_DEBUG, false, false,
                     );
                 }
-                for (hash, app_data, mut d) in candidates {
+                if let Some((hash, app_data, mut d)) = selected {
                     match d.announce(app_data.as_deref(), false, None, None, false) {
                         Ok(Some(packet)) => {
-                            published_announce_packets.push((hash, packet));
+                            published_announce_packet = Some((hash, packet));
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -2758,10 +2797,11 @@ impl Transport {
                 // before send() completes. Send failures are rare and
                 // self-correct on the next interval.
                 state = TRANSPORT.lock().unwrap();
-                for (hash, _) in &published_announce_packets {
+                if let Some((hash, _)) = &published_announce_packet {
                     if let Some(entry) = state.published_destinations.get_mut(hash) {
                         entry.last_announced_at = now_ts;
                     }
+                    state.published_last_announced_at = now_ts;
                 }
             }
         }
@@ -3180,10 +3220,10 @@ impl Transport {
             let _ = packet.send();
         }
 
-        // Send published-destination refresh announces (also deferred — see
-        // the published-destination refresh sweep above for the full
-        // re-entrant deadlock rationale).
-        for (hash, mut packet) in published_announce_packets {
+        // Send the published-destination refresh announce (also deferred —
+        // see the published-destination refresh sweep above for the full
+        // re-entrant deadlock rationale). At most one per tick, by design.
+        if let Some((hash, mut packet)) = published_announce_packet {
             match packet.send() {
                 Ok(_) => log(
                     &format!("Published-destination refresh: announced {}", crate::hexrep(&hash, true)),
@@ -4160,11 +4200,38 @@ impl Transport {
         destination_hash: &[u8],
         now: f64,
     ) -> Option<(usize, PathEntry)> {
+        Self::select_path_excluding(table, interfaces, destination_hash, now, None)
+    }
+
+    /// `select_path` with split-horizon support.
+    ///
+    /// `exclude_interface` drops any path entry whose receiving interface is
+    /// the interface a transit packet just arrived on.  Forwarding a transit
+    /// packet back down the interface it came from is never correct: it is a
+    /// routing loop that burns hops until the packet dies, and it black-holes
+    /// the destination in the meantime.  The announce forwarder and the PROOF
+    /// fallback already apply this rule; transit forwarding must too.
+    fn select_path_excluding(
+        table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
+        interfaces: &[InterfaceStub],
+        destination_hash: &[u8],
+        now: f64,
+        exclude_interface: Option<&str>,
+    ) -> Option<(usize, PathEntry)> {
         let entries = table.get(destination_hash)?;
         let mut best: Option<(usize, f64, PathEntry)> = None;
         for (idx, entry) in entries.iter().enumerate() {
             if entry.is_expired(now) {
                 continue;
+            }
+            // split-horizon: never route a transit packet back out the
+            // interface it arrived on (see doc comment above).
+            if let (Some(excluded), Some(name)) =
+                (exclude_interface, entry.receiving_interface.as_ref())
+            {
+                if name == excluded {
+                    continue;
+                }
             }
             // interface.OUT gate (Python Transport parity): a path is only
             // usable if its receiving interface is currently online.  The
@@ -4947,7 +5014,9 @@ impl Transport {
                     //
                     //   1. Track seen blobs in global_blobs (anti-replay, decoupled).
                     //   2. Always prepend the new path entry (newest-first).
-                    //   3. Dedup by packet_hash within the same destination.
+                    //   3. Dedup by ROUTE (receiving interface + next hop) within
+                    //      the same destination — NOT by packet_hash, which is
+                    //      identical across every relayed copy of one announce.
                     //   4. Cap at MAX_PATHS_PER_DEST (=3).
                     //   5. No quality gate — multiple paths coexist; select_path()
                     //      picks the best at forwarding time via bitrate/hops score.
@@ -5004,12 +5073,42 @@ impl Transport {
                             packet_hash: packet_hash.clone(),
                         };
 
-                        // Insert: get or create deque, dedup by packet_hash,
-                        // push_front, truncate.
+                        // Insert: get or create deque, dedup by ROUTE, push_front,
+                        // truncate.
+                        //
+                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
+                        // The dedup key MUST be the route (receiving interface +
+                        // next hop), NOT the announce's packet_hash.
+                        //
+                        // `Packet::get_hashable_part()` deliberately excludes the
+                        // hops byte and the transport_id, so ONE announce relayed
+                        // to us over N different routes arrives N times with the
+                        // SAME packet_hash. Keying dedup on packet_hash therefore
+                        // made every copy delete its predecessor: the deque could
+                        // only ever hold a single entry per announce, and the
+                        // winner was whichever copy happened to land last — which
+                        // over a WAN is the LONGEST route, because it is the
+                        // slowest. `select_path()` then had no alternative to
+                        // score and routed traffic down that long path.
+                        //
+                        // Observed in production: the post bridge held the
+                        // michmesh peer at hops=4 via RMAP and forwarded every
+                        // DATA packet there, black-holing it, even though the
+                        // same peer was 2 hops away on the directly-attached
+                        // MichMesh interface.
+                        //
+                        // Keying on the route preserves genuine dedup (a repeat of
+                        // the same announce over the same route refreshes that
+                        // entry in place) while letting distinct routes coexist,
+                        // which is the entire premise of the multi-entry model and
+                        // of `select_path`'s interface.OUT gate.
                         let deque = state.path_table
                             .entry(destination_hash.clone())
                             .or_insert_with(VecDeque::new);
-                        deque.retain(|e| e.packet_hash != packet_hash);
+                        deque.retain(|e| {
+                            e.receiving_interface != new_entry.receiving_interface
+                                || e.next_hop != new_entry.next_hop
+                        });
                         deque.push_front(new_entry);
                         deque.truncate(MAX_PATHS_PER_DEST);
 
@@ -5217,7 +5316,13 @@ impl Transport {
                 {
                     if let Some(destination_hash) = &packet.destination_hash {
                         let (next_hop, remaining_hops, outbound_interface_name) =
-                            Self::select_path(&state.path_table, &state.interfaces, destination_hash, now())
+                            Self::select_path_excluding(
+                                &state.path_table,
+                                &state.interfaces,
+                                destination_hash,
+                                now(),
+                                packet.receiving_interface.as_deref(),
+                            )
                                 .map(|(_, e)| (e.next_hop.clone(), e.hops, e.receiving_interface.clone()))
                                 .unwrap_or((Vec::new(), 0, None));
 
@@ -5340,6 +5445,19 @@ impl Transport {
                             if let Some(name) = outbound_interface_name.as_ref() {
                                 deferred_outbound.push((name.clone(), new_raw));
                             } else {
+                                // No usable path once split-horizon has excluded
+                                // the arrival interface.  Dropping is correct —
+                                // the only route we know points back where the
+                                // packet came from — but say so, because a
+                                // silent drop here is indistinguishable from a
+                                // lost packet when debugging a relay chain.
+                                crate::log(
+                                    &format!("[TRANSIT-DROP] no usable path for ptype={} dest={} arrived_on={} (split-horizon)",
+                                        packet.packet_type,
+                                        crate::hexrep(destination_hash, false),
+                                        packet.receiving_interface.as_deref().unwrap_or("?")),
+                                    crate::LOG_NOTICE, false, false,
+                                );
                             }
 
                             // Refresh timestamp on the best path entry
@@ -6763,6 +6881,143 @@ mod tests {
         }
     }
 
+    /// Regression: ONE announce relayed to us over TWO different routes must
+    /// produce TWO coexisting path entries, and `select_path` must pick the
+    /// shorter one.
+    ///
+    /// `Packet::get_hashable_part()` excludes the hops byte and the
+    /// transport_id, so every relayed copy of a single announce carries the
+    /// SAME `packet_hash`. The path-insert dedup therefore MUST key on the
+    /// route (receiving interface + next hop), not on `packet_hash`.
+    ///
+    /// With the old `deque.retain(|e| e.packet_hash != packet_hash)` the
+    /// second copy deleted the first, collapsing the deque to a single entry
+    /// whose route was whichever copy arrived LAST — over a WAN that is the
+    /// slowest and therefore usually the longest path. In production the post
+    /// bridge pinned a 2-hop MichMesh peer to a 4-hop RMAP route this way and
+    /// silently black-holed every DATA packet addressed to it.
+    ///
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
+    #[test]
+    fn same_announce_over_two_routes_keeps_both_paths_and_prefers_fewer_hops() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let saved_path_table;
+        let saved_verified;
+        let saved_drop_announces;
+        let saved_watchlist;
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            saved_path_table = std::mem::take(&mut state.path_table);
+            saved_verified = std::mem::take(&mut state.path_verified_this_session);
+            saved_drop_announces = state.drop_announces;
+            saved_watchlist = std::mem::take(&mut state.announce_watchlist);
+            state.drop_announces = false;
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+        }
+
+        let short_iface = "test-dual-route-short";
+        let long_iface = "test-dual-route-long";
+        register_test_iface(short_iface, true, None);
+        register_test_iface(long_iface, true, None);
+
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "dual_route_test".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("announce destination");
+        let dest_hash = destination.hash.clone();
+
+        let announce_packet = destination
+            .announce(None, false, None, None, false)
+            .expect("build announce")
+            .expect("announce packet");
+
+        // Rebuild the announce exactly the way a transport node relays it:
+        // HEADER_2 with a per-relay transport_id and per-route hop count.
+        // Both copies share a packet_hash because the hashable part starts
+        // after the transport_id.
+        let build_relayed = |transport_id: u8, hops: u8| -> Vec<u8> {
+            let flags: u8 = (crate::packet::HEADER_2 << 6)
+                | ((announce_packet.context_flag & 0x01) << 5)
+                | (MODE_TRANSPORT << 4)
+                | ANNOUNCE;
+            let mut raw = vec![flags, hops];
+            raw.extend_from_slice(&[transport_id; crate::reticulum::TRUNCATED_HASHLENGTH / 8]);
+            raw.extend_from_slice(&dest_hash);
+            raw.push(crate::packet::NONE);
+            raw.extend_from_slice(&announce_packet.data);
+            raw
+        };
+
+        // Long route lands first, short route second — the ordering that the
+        // old packet_hash dedup turned into a permanent 4-hop pin.
+        assert!(
+            Transport::inbound(build_relayed(0xAA, 3), Some(long_iface.to_string())),
+            "long-route announce copy should be accepted"
+        );
+        assert!(
+            Transport::inbound(build_relayed(0xBB, 1), Some(short_iface.to_string())),
+            "short-route announce copy should be accepted"
+        );
+
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let entries = state.path_table.get(&dest_hash).expect("path entries must exist");
+            assert_eq!(
+                entries.len(),
+                2,
+                "one announce relayed over two routes must yield two coexisting path \
+                 entries — got {}. Regression: path-insert dedup is keyed on \
+                 packet_hash again, which is identical across relayed copies and so \
+                 annihilates every alternative route.",
+                entries.len()
+            );
+
+            let (_, best) = Transport::select_path(
+                &state.path_table,
+                &state.interfaces,
+                &dest_hash,
+                now(),
+            )
+            .expect("a path must be selectable");
+            assert_eq!(
+                best.receiving_interface.as_deref(),
+                Some(short_iface),
+                "select_path must route via the 2-hop interface, not the 4-hop one"
+            );
+            assert_eq!(best.hops, 2, "selected path should be the 2-hop route");
+        }
+
+        // A repeat over an already-known route refreshes in place instead of
+        // stacking a duplicate.
+        assert!(Transport::inbound(build_relayed(0xBB, 1), Some(short_iface.to_string())));
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let entries = state.path_table.get(&dest_hash).expect("path entries must exist");
+            assert_eq!(
+                entries.len(),
+                2,
+                "re-announce over a known route must refresh that route in place, \
+                 not append a duplicate entry"
+            );
+        }
+
+        Identity::forget_destination_in_memory(&dest_hash);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table = saved_path_table;
+            state.path_verified_this_session = saved_verified;
+            state.drop_announces = saved_drop_announces;
+            state.announce_watchlist = saved_watchlist;
+        }
+    }
+
     /// Build valid LRPROOF proof_data (96 bytes, no signalling) for a given link_id,
     /// using the identity's signing key.
     fn build_valid_proof_data(identity: &Identity, link_id: &[u8]) -> Vec<u8> {
@@ -7381,6 +7636,99 @@ mod tests {
         assert!(out_outcome.is_ok(), "concurrent Transport::outbound deadlocked");
         let _ = jobs_handle.join();
         let _ = out_handle.join();
+    }
+
+    /// A node that publishes many destinations (rfed publishes 16) must not
+    /// announce them all inside one jobs() tick. Every RNS interface runs
+    /// `ingress_control` by default and measures
+    /// `incoming_announce_frequency()` over the last 6 samples
+    /// (`Reticulum-master/RNS/Interfaces/Interface.py:117-131`); a burst well
+    /// above `IC_BURST_FREQ_NEW = 3.5/s` makes the upstream peer hold the
+    /// remainder and release one every 30 s after a 300 s penalty, silently
+    /// discarding the overflow. The observable failure is that only a few
+    /// published destinations get a refreshed upstream path after a restart,
+    /// so LINK packets to the rest are routed into the node's previous,
+    /// now-dead connection.
+    #[test]
+    fn published_destination_refresh_is_paced_one_announce_per_tick() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_destinations.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
+        }
+
+        // Publish several destinations that are all immediately due.
+        let mut hashes: Vec<Vec<u8>> = Vec::new();
+        for i in 0..4 {
+            let destination = Destination::new_inbound(
+                Some(Identity::new(true)),
+                DestinationType::Single,
+                "pace_test".to_string(),
+                vec![format!("regression{}", i)],
+            )
+            .expect("inbound destination");
+            let dest_hash = destination.hash.clone();
+            Transport::register_destination(destination);
+            // A long refresh interval with `last_announced_at == 0.0` makes
+            // every entry due on the first sweep and *not* due again once it
+            // has been announced, so the count below tracks distinct
+            // destinations rather than repeats of the same one.
+            Transport::publish_destination(dest_hash.clone(), Some(Duration::from_secs(3600)), None);
+            hashes.push(dest_hash);
+        }
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+            state.published_last_announced_at = 0.0;
+        }
+
+        let announced = |hashes: &[Vec<u8>]| -> usize {
+            let state = TRANSPORT.lock().unwrap();
+            hashes
+                .iter()
+                .filter(|h| {
+                    state
+                        .published_destinations
+                        .get(*h)
+                        .map(|p| p.last_announced_at > 0.0)
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+
+        Transport::jobs();
+        let after_first = announced(&hashes);
+
+        // A second tick arrives well inside LOCAL_CLIENT_ANNOUNCE_PACE, so it
+        // must not emit anything further.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+        }
+        Transport::jobs();
+        let after_second = announced(&hashes);
+
+        for hash in &hashes {
+            Transport::unpublish_destination(hash);
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(hash);
+        }
+
+        assert_eq!(
+            after_first, 1,
+            "published-destination refresh emitted {} announces in a single jobs() tick — \
+             the burst trips upstream announce ingress control (IC_BURST_FREQ_NEW = 3.5/s)",
+            after_first
+        );
+        assert_eq!(
+            after_second, 1,
+            "published-destination refresh emitted another announce inside \
+             LOCAL_CLIENT_ANNOUNCE_PACE ({} s) — pacing is not enforced",
+            LOCAL_CLIENT_ANNOUNCE_PACE
+        );
     }
 
     /// Step-2 cross-interface no-stall regression.
@@ -8199,6 +8547,178 @@ mod tests {
         cfg.mode = InterfaceStub::MODE_FULL;
         cfg.bitrate = bitrate;
         Transport::register_interface_stub_config(cfg);
+    }
+
+    // ── Regression: transit split-horizon ────────────────────────────────
+    //
+    // The bug (found 2026-08-09, gateway rnsd at jrl290):
+    //
+    //   The propagation destination 0f75ac15 was black-holed for days while
+    //   the sibling destination d7e08998 on the SAME remote node, over the
+    //   SAME route, linked fine. Gateway log, same code path, one line apart:
+    //
+    //     [INJECT-TID] ... dest=d7e08998...
+    //     [DISPATCH-OUT] iface=MichMesh            <- correct, toward the node
+    //
+    //     [INJECT-TID] ... dest=0f75ac15...
+    //     [DISPATCH-OUT] iface=PostInterface Bridge <- REFLECTED back where it came from
+    //
+    //   The PHP relays downstream re-announce destinations they have learned,
+    //   so the gateway also learned 0f75ac15 *via the Bridge* — pointing back
+    //   into the chain the LINKREQUEST had just traversed. That entry
+    //   out-scored the real MichMesh path, and `select_path` had no notion of
+    //   where the packet arrived from, so every LINKREQUEST was bounced
+    //   straight back down the interface it came in on. It never reached the
+    //   destination node, so no LRPROOF ever came back and the link could
+    //   never establish.
+    //
+    //   The announce forwarder (`[ANNOUNCE-FWD]`) and the PROOF fallback
+    //   (`[PROOF-FWD-FALLBACK]`) already refuse to send back out the arrival
+    //   interface. Transit forwarding was the one path missing that rule.
+    //
+    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
+
+    /// Unit-level: `select_path_excluding` must skip the arrival interface
+    /// even when that entry scores best, and fall back to a real alternate.
+    #[test]
+    fn select_path_excluding_skips_arrival_interface() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let dest_hash = vec![0x5A; 16];
+        let arrival = "test-sh-arrival";
+        let alternate = "test-sh-alternate";
+        register_test_iface(arrival, true, None);
+        register_test_iface(alternate, true, None);
+
+        // The reflecting entry is deliberately the BETTER one (fewer hops,
+        // fresher) — exactly the production shape.
+        let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        let mut deque = VecDeque::new();
+        deque.push_back(make_test_path_entry(vec![0x01; 16], 1, Some(arrival.to_string()), 0.0));
+        deque.push_back(make_test_path_entry(vec![0x02; 16], 4, Some(alternate.to_string()), 30.0));
+        table.insert(dest_hash.clone(), deque);
+
+        let interfaces = { TRANSPORT.lock().unwrap().interfaces.clone() };
+
+        // Without exclusion the reflecting entry wins (this is what produced
+        // the production black-hole).
+        let (_, unrestricted) =
+            Transport::select_path(&table, &interfaces, &dest_hash, now())
+                .expect("a path must be selectable");
+        assert_eq!(
+            unrestricted.receiving_interface.as_deref(),
+            Some(arrival),
+            "fixture invariant: the arrival-interface entry must be the best-scoring one, \
+             otherwise this test proves nothing"
+        );
+
+        // With exclusion we must fall back to the genuine alternate.
+        let (_, restricted) =
+            Transport::select_path_excluding(&table, &interfaces, &dest_hash, now(), Some(arrival))
+                .expect("the alternate path must still be selectable");
+        assert_eq!(
+            restricted.receiving_interface.as_deref(),
+            Some(alternate),
+            "select_path_excluding must skip the arrival interface and choose the alternate"
+        );
+
+        // And when the reflecting entry is the ONLY one, there is no path.
+        let mut only_reflect: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        let mut deque2 = VecDeque::new();
+        deque2.push_back(make_test_path_entry(vec![0x01; 16], 1, Some(arrival.to_string()), 0.0));
+        only_reflect.insert(dest_hash.clone(), deque2);
+        assert!(
+            Transport::select_path_excluding(&only_reflect, &interfaces, &dest_hash, now(), Some(arrival))
+                .is_none(),
+            "when the only known path points back out the arrival interface, there is no \
+             usable path — the packet must be dropped, not reflected"
+        );
+    }
+
+    /// End-to-end: a transit LINKREQUEST must never be dispatched back out
+    /// the interface it arrived on, and must take the alternate route.
+    #[test]
+    fn transit_linkrequest_is_not_reflected_back_out_arrival_interface() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+
+        let arrival = "test-reflect-bridge";
+        let alternate = "test-reflect-michmesh";
+        let dest_hash = vec![0x0F; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(local_identity);
+            state.transport_enabled = true;
+            state.is_connected_to_shared_instance = false;
+            state.link_table.clear();
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+        }
+
+        register_test_iface(arrival, true, None);
+        register_test_iface(alternate, true, None);
+
+        // Path table mirrors the gateway: the looped entry learned back
+        // through the arrival interface scores BEST, the genuine route is
+        // older and longer.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut deque = VecDeque::new();
+            deque.push_back(make_test_path_entry(vec![0xB1; 16], 1, Some(arrival.to_string()), 0.0));
+            deque.push_back(make_test_path_entry(vec![0xB2; 16], 4, Some(alternate.to_string()), 30.0));
+            state.path_table.insert(dest_hash.clone(), deque);
+        }
+
+        let captured_arrival: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_alternate: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(arrival, captured_arrival.clone());
+        install_sync_outbound_handler(alternate, captured_alternate.clone());
+
+        // HEADER_2 LINKREQUEST carrying our own transport_id, arriving on the
+        // interface that the looped path points back at.
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let flags: u8 =
+            (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (crate::packet::LINKREQUEST & 0x03);
+        let mut raw = vec![flags, 1u8];
+        raw.extend_from_slice(&local_hash[..dst_len]);
+        raw.extend_from_slice(&dest_hash);
+        raw.push(crate::packet::NONE);
+        raw.extend_from_slice(&vec![0x55; 64]);
+
+        Transport::inbound(raw, Some(arrival.to_string()));
+
+        let reflected = captured_arrival.lock().unwrap().len();
+        let forwarded = captured_alternate.lock().unwrap().len();
+
+        assert_eq!(
+            reflected, 0,
+            "a transit LINKREQUEST must NEVER be dispatched back out the interface it \
+             arrived on — got {} frame(s) on '{}'. This is the 2026-08-09 gateway \
+             black-hole: the propagation destination was reflected into the PHP relay \
+             chain instead of being forwarded to the destination node, so no LRPROOF \
+             could ever return and the link never established.",
+            reflected, arrival
+        );
+        assert_eq!(
+            forwarded, 1,
+            "the LINKREQUEST must be forwarded via the alternate path instead — \
+             expected 1 frame on '{}', got {}",
+            alternate, forwarded
+        );
+
+        uninstall_sync_outbound_handler(arrival);
+        uninstall_sync_outbound_handler(alternate);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.link_table.clear();
+            state.path_table.remove(&dest_hash);
+        }
     }
 
     #[test]
