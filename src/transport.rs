@@ -4834,7 +4834,7 @@ impl Transport {
         crate::log(&format!("[POST-ANNOUNCE] ptype={} dest={} — made it past announce block",
             packet.packet_type,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
 
         let interface_announce_callback = if packet.packet_type == ANNOUNCE && announce_should_add {
             let handler = {
@@ -4875,7 +4875,7 @@ impl Transport {
         crate::log(&format!("[PRE-LOCK] ptype={} dest={} — about to acquire dispatch lock",
             packet.packet_type,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
         let mut state = TRANSPORT.lock().unwrap();
         let inbound_wait_ms = inbound_lock_wait_started.elapsed().as_millis();
         if inbound_wait_ms > 250 {
@@ -5260,7 +5260,7 @@ impl Transport {
                                 crate::log(
                                     &format!("[ANNOUNCE-FWD] forwarding announce dest={} to non-local iface={}",
                                         crate::hexrep(destination_hash, false), iface.name),
-                                    crate::LOG_NOTICE, false, false,
+                                    crate::LOG_DEBUG, false, false,
                                 );
                                 deferred_outbound.push((iface.name.clone(), announce_raw.clone()));
                             }
@@ -5829,7 +5829,7 @@ impl Transport {
 
         for (iface_name, raw) in deferred_outbound {
             crate::log(&format!("[DISPATCH-OUT] iface={} raw_len={}", iface_name, raw.len()),
-                crate::LOG_NOTICE, false, false);
+                crate::LOG_DEBUG, false, false);
             if !Transport::dispatch_outbound(&iface_name, &raw) {
                 crate::log(&format!("[DISPATCH] outbound failed for interface {} (disconnected?), {} bytes dropped",
                     iface_name, raw.len()), crate::LOG_WARNING, false, false);
