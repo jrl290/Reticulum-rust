@@ -936,6 +936,19 @@ impl Reticulum {
                     crate::set_loglevel(loglevel);
                 }
             }
+
+            // Route logs to a file instead of stdout. On a containerised
+            // node stdout feeds the Docker json-file driver, whose log file
+            // lives on the daemon's storage and grows unbounded; heavy
+            // logging then wedges the shared daemon. A logfile on the data
+            // volume is rotated at LOG_MAXSIZE and never touches Docker's
+            // log pipeline at all.
+            if let Some(logfile) = logging.get("logfile") {
+                if !logfile.is_empty() {
+                    crate::set_logfile(logfile.to_string());
+                    crate::set_logdest(crate::LOG_FILE);
+                }
+            }
         }
 
         if let Some(level) = self.requested_loglevel {
