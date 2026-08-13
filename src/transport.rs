@@ -451,6 +451,9 @@ pub struct TransportState {
     /// Minimum spacing between opportunistic path-table saves.
     /// Bounded so a chatty network (lots of fresh announces) doesn't
     /// thrash the disk while still keeping the persisted set fresh.
+    /// 300 s matches GRACIOUS_PERSIST_INTERVAL: on a busy node the
+    /// table is dirty ~always, and 30 s rewrites of a multi-MB file
+    /// wedged the btrfs journal on the Synology NAS (jbd2 D-state).
     pub path_table_save_interval: f64,
     /// Set of destination hashes whose `path_table` entry has been
     /// confirmed by an inbound announce SINCE THIS PROCESS STARTED.
@@ -761,7 +764,7 @@ pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| Fast
     blackhole_check_interval: 60.0,
     published_check_interval: 30.0,
     published_last_announced_at: 0.0,
-    path_table_save_interval: 30.0,
+    path_table_save_interval: 300.0,
     ..TransportState::default()
 }));
 
@@ -3892,8 +3895,14 @@ impl Transport {
         }
         let path = crate::reticulum::storage_path().join("packet_hashlist");
         if let Ok(data) = to_vec_named(&state.packet_hashlist.iter().cloned().collect::<Vec<_>>()) {
-            if let Ok(mut file) = File::create(path) {
-                let _ = file.write_all(&data);
+            // Atomic write: tmp file + rename avoids the truncate+rewrite
+            // pattern that doubles journal churn on btrfs and leaves a
+            // truncated file behind on crash.
+            let tmp_path = path.with_extension("tmp");
+            if let Ok(mut file) = File::create(&tmp_path) {
+                if file.write_all(&data).is_ok() {
+                    let _ = fs::rename(&tmp_path, &path);
+                }
             }
         }
     }
@@ -3912,8 +3921,12 @@ impl Transport {
             .collect();
         let path = crate::reticulum::storage_path().join("destination_table");
         if let Ok(data) = to_vec_named(&entries) {
-            if let Ok(mut file) = File::create(path) {
-                let _ = file.write_all(&data);
+            // Atomic write (see save_packet_hashlist).
+            let tmp_path = path.with_extension("tmp");
+            if let Ok(mut file) = File::create(&tmp_path) {
+                if file.write_all(&data).is_ok() {
+                    let _ = fs::rename(&tmp_path, &path);
+                }
             }
         }
     }
@@ -3991,8 +4004,12 @@ impl Transport {
 
         let path = crate::reticulum::storage_path().join("tunnels");
         if let Ok(data) = to_vec_named(&entries) {
-            if let Ok(mut file) = File::create(path) {
-                let _ = file.write_all(&data);
+            // Atomic write (see save_packet_hashlist).
+            let tmp_path = path.with_extension("tmp");
+            if let Ok(mut file) = File::create(&tmp_path) {
+                if file.write_all(&data).is_ok() {
+                    let _ = fs::rename(&tmp_path, &path);
+                }
             }
         }
     }
