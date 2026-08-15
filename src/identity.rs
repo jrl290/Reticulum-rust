@@ -448,7 +448,7 @@ impl Identity {
             ratchet_info,
             hexrep(salt, false),
             hexrep(ephemeral_pub.as_bytes(), false)
-        ), crate::LOG_NOTICE, false, false);
+        ), crate::LOG_DEBUG, false, false);
         
         let token = Token::new(&derived_key)?;
         let ciphertext = token.encrypt(plaintext)?;
@@ -456,7 +456,7 @@ impl Identity {
                 // The actual HMAC is the last 32 bytes of ciphertext
                 if ciphertext.len() >= 32 {
                     let hmac = &ciphertext[ciphertext.len() - 32..];
-                    crate::log(&format!("[ENCRYPT] hmac_first_16={}", hexrep(&hmac[..16], false)), crate::LOG_NOTICE, false, false);
+                    crate::log(&format!("[ENCRYPT] hmac_first_16={}", hexrep(&hmac[..16], false)), crate::LOG_DEBUG, false, false);
                 }
         
         
