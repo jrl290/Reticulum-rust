@@ -4630,9 +4630,13 @@ impl Transport {
             // keepalive/control packets and contribute nothing to ops triage.
             let suppress = packet.packet_type == DATA && packet.hops == 0;
             if !suppress {
+                // Per-packet inbound DATA at NOTICE dominated the log during
+                // busy periods; demote to DEBUG. LINKREQUEST/PROOF inbound
+                // stay at NOTICE as path-establishment signals.
+                let lvl = if packet.packet_type == DATA { crate::LOG_DEBUG } else { crate::LOG_NOTICE };
                 crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
                     packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-                    packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+                    packet.context, packet.destination_type), lvl, false, false);
             }
         }
         let _trace_dest_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
@@ -5317,7 +5321,7 @@ impl Transport {
                             packet.packet_type,
                             crate::hexrep(destination_hash, false),
                             state.path_table.len()),
-                        crate::LOG_NOTICE, false, false,
+                        crate::LOG_DEBUG, false, false,
                     );
                 }
             }
@@ -5585,12 +5589,12 @@ impl Transport {
                 .unwrap_or_default();
             crate::log(&format!("[DATA-IN] ptype=DATA dtype={:?} dest={} ctx={} hops={}",
                 packet.destination_type, dest_hex, packet.context, packet.hops),
-                crate::LOG_NOTICE, false, false);
+                crate::LOG_DEBUG, false, false);
             if _trace_is_target { crate::log(&format!("[TRACE] target reached DATA branch dtype={:?}", packet.destination_type), crate::LOG_NOTICE, false, false); }
             if packet.destination_type == Some(crate::destination::DestinationType::Link) {
                 if _trace_is_target { crate::log("[TRACE] target → deferred_link_packets", crate::LOG_NOTICE, false, false); }
                 crate::log(&format!("[DATA-LINK] dest={} pushed to deferred_link_packets", dest_hex),
-                    crate::LOG_NOTICE, false, false);
+                    crate::LOG_DEBUG, false, false);
                 deferred_link_packets.push(packet.clone());
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
@@ -5901,7 +5905,7 @@ impl Transport {
                 link_packet.context,
                 link_packet.data.len(),
                 is_link_proof,
-            ), LOG_NOTICE, false, false);
+            ), LOG_DEBUG, false, false);
             if is_link_proof {
                 let proof_hash_hex = if link_packet.data.len() >= 32 {
                     crate::hexrep(&link_packet.data[..32], false)
