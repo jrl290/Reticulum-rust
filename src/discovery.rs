@@ -531,7 +531,19 @@ impl InterfaceAnnounceHandler {
         let valid = LXStamper::stamp_valid(stamp, self.required_value, &workblock);
         
         if !valid {
-            log("Ignored discovered interface with invalid stamp", LOG_DEBUG, false, false);
+            // RNS.Discovery on the Python side validates these with
+            // LXMF.LXStamper, so this path is a direct interop surface. Call out
+            // the pre-parity workblock by name: while it was in use, every
+            // announce exchanged with a reference node failed here, in both
+            // directions, and looked indistinguishable from an empty network.
+            if LXStamper::is_legacy_stamp(&infohash, stamp, self.required_value,
+                                          InterfaceAnnouncer::WORKBLOCK_EXPAND_ROUNDS) {
+                log("Ignored discovered interface: announcer is using the pre-parity stamp \
+                     workblock (iterated digest instead of LXMF HKDF expansion)",
+                    LOG_WARNING, false, false);
+            } else {
+                log("Ignored discovered interface with invalid stamp", LOG_DEBUG, false, false);
+            }
             return;
         }
         
