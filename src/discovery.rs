@@ -453,12 +453,16 @@ impl InterfaceAnnouncer {
                 cached_stamp.clone()
             } else {
                 drop(cache);
-                // Generate LXMF proof-of-work stamp
+                // Generate LXMF proof-of-work stamp. A cancelled or timed-out
+                // search yields None; announcing without a stamp is better than
+                // announcing one that fails our own validator, so skip the
+                // announce entirely this round.
                 let (generated_stamp, _value) = LXStamper::generate_stamp(
                     &infohash,
                     stamp_value,
                     Self::WORKBLOCK_EXPAND_ROUNDS
                 );
+                let generated_stamp = generated_stamp?;
                 let mut cache = stamp_cache.lock().unwrap();
                 cache.insert(infohash.clone(), generated_stamp.clone());
                 generated_stamp

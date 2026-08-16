@@ -28,155 +28,285 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use hkdf::Hkdf;
+use once_cell::sync::Lazy;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rmp::encode::write_uint;
 use sha2::Sha256;
 
 use crate::identity::{full_hash, HASHLENGTH};
+use crate::{host_os, log, LOG_DEBUG, LOG_ERROR, LOG_WARNING};
 
-/// LXMF proof-of-work stamps.
+// ── LXMF proof-of-work stamps ────────────────────────────────────────────────
+//
+// A direct port of `LXMF/LXStamper.py`, and the single implementation in this
+// workspace. `lxmf_rust::lx_stamper` re-exports these rather than keeping its
+// own copy: the algorithm is shared with the wider Reticulum network — Python's
+// RNS.Discovery validates interface announces with LXMF.LXStamper — so a second
+// copy is a second chance to drift out of parity, which is exactly what
+// happened once already.
+//
+// LXMF-layer concerns that need `LXMessage` (PN stamp validation) stay in
+// lxmf_rust. Everything protocol-generic lives here.
+//
+// Verified against Python-generated vectors in the tests below.
+
+pub const STAMP_SIZE: usize = HASHLENGTH / 8;
+pub const WORKBLOCK_EXPAND_ROUNDS: u32 = 3000;
+pub const WORKBLOCK_EXPAND_ROUNDS_PN: u32 = 1000;
+pub const WORKBLOCK_EXPAND_ROUNDS_PEERING: u32 = 25;
+
+static ACTIVE_JOBS: Lazy<Mutex<HashMap<Vec<u8>, Arc<AtomicBool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Expand `material` into the proof-of-work workblock.
 ///
-/// This is a direct port of `LXMF/LXStamper.py`. The wire format is shared with
-/// the reference Python stack — `RNS.Discovery` validates interface-announce
-/// stamps with `LXMF.LXStamper` — so any divergence here is an interoperability
-/// break, not an implementation detail. It must stay byte-identical.
+/// Python:
+/// ```text
+/// workblock = b""
+/// for n in range(expand_rounds):
+///     workblock += hkdf(length=256, derive_from=material,
+///                       salt=full_hash(material + msgpack.packb(n)))
+/// ```
+/// so the result is `expand_rounds * 256` bytes, NOT a single digest. The salt
+/// uses msgpack's minimal uint encoding, which is what makes rounds past 127
+/// line up with Python.
+pub fn stamp_workblock(material: &[u8], expand_rounds: u32) -> Vec<u8> {
+    let mut workblock = Vec::with_capacity(expand_rounds as usize * 256);
+
+    for n in 0..expand_rounds as u64 {
+        let mut packed_n = Vec::new();
+        let _ = write_uint(&mut packed_n, n);
+
+        let mut salt_input = Vec::with_capacity(material.len() + packed_n.len());
+        salt_input.extend_from_slice(material);
+        salt_input.extend_from_slice(&packed_n);
+        let salt = full_hash(&salt_input);
+
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), material);
+        let mut derived = vec![0u8; 256];
+        if hkdf.expand(&[], &mut derived).is_err() {
+            log("HKDF expansion failed while generating stamp workblock".to_string(),
+                LOG_ERROR, false, false);
+            break;
+        }
+        workblock.extend_from_slice(&derived);
+    }
+
+    workblock
+}
+
+/// Number of leading zero bits in `full_hash(workblock || stamp)`.
+pub fn stamp_value(workblock: &[u8], stamp: &[u8]) -> u32 {
+    let mut material = Vec::with_capacity(workblock.len() + stamp.len());
+    material.extend_from_slice(workblock);
+    material.extend_from_slice(stamp);
+    let hash = full_hash(&material);
+
+    let mut value = 0u32;
+    for byte in hash.iter() {
+        if *byte == 0 {
+            value += 8;
+        } else {
+            value += byte.leading_zeros();
+            break;
+        }
+    }
+
+    value
+}
+
+/// Whether `stamp` meets `required_value` against `workblock`.
+pub fn stamp_valid(stamp: &[u8], required_value: u32, workblock: &[u8]) -> bool {
+    if stamp.len() != STAMP_SIZE {
+        return false;
+    }
+    stamp_value(workblock, stamp) >= required_value
+}
+
+pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8], target_cost: u32) -> bool {
+    let workblock = stamp_workblock(peering_id, WORKBLOCK_EXPAND_ROUNDS_PEERING);
+    stamp_valid(peering_key, target_cost, &workblock)
+}
+
+/// Mine a stamp for `material` meeting `stamp_cost`.
 ///
-/// Verified against Python-derived vectors in the tests below.
+/// Returns `(None, 0)` when the search is cancelled via [`cancel_work`] or the
+/// worker pool times out — never a stamp that fails its own validator, which an
+/// earlier version of this function returned silently after giving up.
+pub fn generate_stamp(material: &[u8], stamp_cost: u32, expand_rounds: u32) -> (Option<Vec<u8>>, u32) {
+    log(format!("Generating stamp with cost {stamp_cost}"), LOG_DEBUG, false, false);
+    let workblock = stamp_workblock(material, expand_rounds);
+
+    let start = Instant::now();
+    let (stamp, rounds) = match host_os().as_str() {
+        "windows" | "darwin" | "android" => job_simple(stamp_cost, &workblock, material),
+        _ => job_parallel(stamp_cost, &workblock, material),
+    };
+
+    let duration = start.elapsed().as_secs_f64();
+    let speed = if duration > 0.0 { rounds as f64 / duration } else { 0.0 };
+    let value = stamp.as_ref().map(|s| stamp_value(&workblock, s)).unwrap_or(0);
+
+    log(format!("Stamp with value {value} generated in {duration:.2}s, {rounds} rounds, {} rounds per second",
+                speed as u64), LOG_DEBUG, false, false);
+
+    (stamp, value)
+}
+
+/// Ask an in-flight [`generate_stamp`] for `material` to stop.
+pub fn cancel_work(material: &[u8]) {
+    if let Ok(jobs) = ACTIVE_JOBS.lock() {
+        if let Some(stop_flag) = jobs.get(material) {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn job_simple(stamp_cost: u32, workblock: &[u8], material: &[u8]) -> (Option<Vec<u8>>, u64) {
+    log(format!("Running stamp generation on {}, work limited to single CPU core", host_os()),
+        LOG_WARNING, false, false);
+
+    let rounds_start = Instant::now();
+    let mut rounds = 0u64;
+    let mut stamp = vec![0u8; STAMP_SIZE];
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut jobs) = ACTIVE_JOBS.lock() {
+        jobs.insert(material.to_vec(), Arc::clone(&stop_flag));
+    }
+
+    loop {
+        OsRng.fill_bytes(&mut stamp);
+        rounds += 1;
+
+        if stamp_valid(&stamp, stamp_cost, workblock) {
+            break;
+        }
+
+        if stop_flag.load(Ordering::SeqCst) {
+            if let Ok(mut jobs) = ACTIVE_JOBS.lock() { jobs.remove(material); }
+            return (None, rounds);
+        }
+
+        if rounds % 2500 == 0 {
+            let elapsed = rounds_start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { rounds as f64 / elapsed } else { 0.0 };
+            log(format!("Stamp generation running. {rounds} rounds completed so far, {} rounds per second",
+                        speed as u64), LOG_DEBUG, false, false);
+        }
+    }
+
+    if let Ok(mut jobs) = ACTIVE_JOBS.lock() { jobs.remove(material); }
+    (Some(stamp), rounds)
+}
+
+fn job_parallel(stamp_cost: u32, workblock: &[u8], material: &[u8]) -> (Option<Vec<u8>>, u64) {
+    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let jobs_count = if cores <= 12 { cores } else { cores / 2 };
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let rounds_total = Arc::new(Mutex::new(0u64));
+
+    if let Ok(mut jobs) = ACTIVE_JOBS.lock() {
+        jobs.insert(material.to_vec(), Arc::clone(&stop_flag));
+    }
+
+    log(format!("Starting {jobs_count} stamp generation workers"), LOG_DEBUG, false, false);
+
+    for _ in 0..jobs_count {
+        let stop = Arc::clone(&stop_flag);
+        let sender = tx.clone();
+        let wb = workblock.to_vec();
+        let rounds_acc = Arc::clone(&rounds_total);
+        thread::spawn(move || {
+            let mut local_rounds = 0u64;
+            let mut stamp = vec![0u8; STAMP_SIZE];
+            while !stop.load(Ordering::SeqCst) {
+                OsRng.fill_bytes(&mut stamp);
+                local_rounds += 1;
+                if stamp_valid(&stamp, stamp_cost, &wb) {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = sender.send(stamp.clone());
+                    break;
+                }
+            }
+            if let Ok(mut total) = rounds_acc.lock() {
+                *total += local_rounds;
+            }
+        });
+    }
+    drop(tx);
+
+    let stamp = rx.recv_timeout(Duration::from_secs(30)).ok();
+    stop_flag.store(true, Ordering::SeqCst);
+    if let Ok(mut jobs) = ACTIVE_JOBS.lock() { jobs.remove(material); }
+
+    let total_rounds = rounds_total.lock().map(|g| *g).unwrap_or(0);
+    (stamp, total_rounds)
+}
+
+// ── Transition aid ───────────────────────────────────────────────────────────
+
+/// The workblock this crate produced before parity with Python was restored:
+/// a single 32-byte digest, iterated `expand_rounds` times.
+///
+/// Retained ONLY so a peer still running the old build can be recognised and
+/// named in the logs. Never generate with this.
+pub fn legacy_stamp_workblock(material: &[u8], expand_rounds: u32) -> Vec<u8> {
+    let mut workblock = full_hash(material);
+    for _ in 0..expand_rounds {
+        workblock = full_hash(&workblock);
+    }
+    workblock
+}
+
+/// True when `stamp` fails the standard check but satisfies the legacy one —
+/// i.e. the sender is running a pre-parity build. A diagnostic, never an
+/// acceptance path.
+pub fn is_legacy_stamp(material: &[u8], stamp: &[u8], required_value: u32, expand_rounds: u32) -> bool {
+    let legacy = legacy_stamp_workblock(material, expand_rounds);
+    stamp_valid(stamp, required_value, &legacy)
+}
+
+// ── Facade ───────────────────────────────────────────────────────────────────
+
+/// Namespaced access to the functions above, for call sites that read better
+/// as `LXStamper::stamp_valid(...)`. Carries no logic of its own.
 pub struct LXStamper;
 
 impl LXStamper {
-    pub const STAMP_SIZE: usize = HASHLENGTH / 8;
-    pub const WORKBLOCK_EXPAND_ROUNDS: u32 = 3000;
-    pub const WORKBLOCK_EXPAND_ROUNDS_PN: u32 = 1000;
-    pub const WORKBLOCK_EXPAND_ROUNDS_PEERING: u32 = 25;
+    pub const STAMP_SIZE: usize = STAMP_SIZE;
+    pub const WORKBLOCK_EXPAND_ROUNDS: u32 = WORKBLOCK_EXPAND_ROUNDS;
+    pub const WORKBLOCK_EXPAND_ROUNDS_PN: u32 = WORKBLOCK_EXPAND_ROUNDS_PN;
+    pub const WORKBLOCK_EXPAND_ROUNDS_PEERING: u32 = WORKBLOCK_EXPAND_ROUNDS_PEERING;
 
-    /// Expand `material` into the proof-of-work workblock.
-    ///
-    /// Python:
-    /// ```text
-    /// workblock = b""
-    /// for n in range(expand_rounds):
-    ///     workblock += hkdf(length=256, derive_from=material,
-    ///                       salt=full_hash(material + msgpack.packb(n)))
-    /// ```
-    /// so the result is `expand_rounds * 256` bytes, NOT a single digest. The
-    /// salt uses msgpack's minimal uint encoding, which is what makes rounds
-    /// past 127 line up with Python.
+    #[inline]
     pub fn stamp_workblock(material: &[u8], expand_rounds: u32) -> Vec<u8> {
-        let mut workblock = Vec::with_capacity(expand_rounds as usize * 256);
-
-        for n in 0..expand_rounds as u64 {
-            let mut packed_n = Vec::new();
-            let _ = write_uint(&mut packed_n, n);
-
-            let mut salt_input = Vec::with_capacity(material.len() + packed_n.len());
-            salt_input.extend_from_slice(material);
-            salt_input.extend_from_slice(&packed_n);
-            let salt = full_hash(&salt_input);
-
-            let hkdf = Hkdf::<Sha256>::new(Some(&salt), material);
-            let mut derived = vec![0u8; 256];
-            if hkdf.expand(&[], &mut derived).is_err() {
-                crate::log(
-                    "HKDF expansion failed while generating stamp workblock".to_string(),
-                    crate::LOG_ERROR, false, false,
-                );
-                break;
-            }
-            workblock.extend_from_slice(&derived);
-        }
-
-        workblock
+        stamp_workblock(material, expand_rounds)
     }
-
-    /// Number of leading zero bits in `full_hash(workblock || stamp)`.
+    #[inline]
     pub fn stamp_value(workblock: &[u8], stamp: &[u8]) -> u32 {
-        let mut material = Vec::with_capacity(workblock.len() + stamp.len());
-        material.extend_from_slice(workblock);
-        material.extend_from_slice(stamp);
-        let hash = full_hash(&material);
-
-        let mut value = 0u32;
-        for byte in hash.iter() {
-            if *byte == 0 {
-                value += 8;
-            } else {
-                value += byte.leading_zeros();
-                break;
-            }
-        }
-
-        value
+        stamp_value(workblock, stamp)
     }
-
-    /// Whether `stamp` meets `required_value` against `workblock`.
+    #[inline]
     pub fn stamp_valid(stamp: &[u8], required_value: u32, workblock: &[u8]) -> bool {
-        if stamp.len() != Self::STAMP_SIZE {
-            return false;
-        }
-        Self::stamp_value(workblock, stamp) >= required_value
+        stamp_valid(stamp, required_value, workblock)
     }
-
-    /// Mine a stamp for `material` meeting `stamp_cost`.
-    ///
-    /// Random search over 32-byte stamps, as Python does — the previous
-    /// implementation derived the stamp from `sha256(workblock || nonce)`,
-    /// which made every node produce the identical stamp for a given input,
-    /// and gave up after 1e6 tries by returning an INVALID stamp with no error.
-    /// Callers had no way to tell success from failure.
-    ///
-    /// Loops until it succeeds, like the reference. The costs in use are small
-    /// (8-16 bits ⇒ hundreds to tens of thousands of tries); progress is logged
-    /// so a pathological cost is visible rather than silently wedging.
-    pub fn generate_stamp(material: &[u8], stamp_cost: u32, expand_rounds: u32) -> (Vec<u8>, u32) {
-        let workblock = Self::stamp_workblock(material, expand_rounds);
-
-        let mut stamp = vec![0u8; Self::STAMP_SIZE];
-        let mut rounds: u64 = 0;
-
-        loop {
-            OsRng.fill_bytes(&mut stamp);
-            rounds += 1;
-
-            let value = Self::stamp_value(&workblock, &stamp);
-            if value >= stamp_cost {
-                return (stamp, value);
-            }
-
-            if rounds % 5_000_000 == 0 {
-                crate::log(
-                    format!("Stamp generation still running after {rounds} rounds at cost {stamp_cost}"),
-                    crate::LOG_WARNING, false, false,
-                );
-            }
-        }
+    #[inline]
+    pub fn generate_stamp(material: &[u8], stamp_cost: u32, expand_rounds: u32) -> (Option<Vec<u8>>, u32) {
+        generate_stamp(material, stamp_cost, expand_rounds)
     }
-
-    // ── Transition aid ───────────────────────────────────────────────────────
-
-    /// The workblock this crate produced before parity with Python was
-    /// restored: a single 32-byte digest, iterated `expand_rounds` times.
-    ///
-    /// Retained ONLY so a peer still running the old build can be recognised
-    /// and named in the logs. Never generate with this.
-    pub fn legacy_stamp_workblock(material: &[u8], expand_rounds: u32) -> Vec<u8> {
-        let mut workblock = full_hash(material);
-        for _ in 0..expand_rounds {
-            workblock = full_hash(&workblock);
-        }
-        workblock
-    }
-
-    /// True when `stamp` fails the standard check but satisfies the legacy one
-    /// — i.e. the sender is running a pre-parity build.
-    ///
-    /// Callers use this to log something actionable instead of a bare
-    /// "invalid stamp". It is a diagnostic, not an acceptance path.
+    #[inline]
     pub fn is_legacy_stamp(material: &[u8], stamp: &[u8], required_value: u32, expand_rounds: u32) -> bool {
-        let legacy = Self::legacy_stamp_workblock(material, expand_rounds);
-        Self::stamp_valid(stamp, required_value, &legacy)
+        is_legacy_stamp(material, stamp, required_value, expand_rounds)
     }
 }
 
@@ -229,6 +359,7 @@ mod tests {
     #[test]
     fn generated_stamps_validate() {
         let (stamp, value) = LXStamper::generate_stamp(FIXTURE, 8, 16);
+        let stamp = stamp.expect("generation must succeed at cost 8");
         let workblock = LXStamper::stamp_workblock(FIXTURE, 16);
         assert_eq!(stamp.len(), LXStamper::STAMP_SIZE);
         assert!(value >= 8);
@@ -237,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_stamp_for_other_material_is_rejected() {
-        let (stamp, _) = LXStamper::generate_stamp(b"material-a", 8, 16);
+        let stamp = LXStamper::generate_stamp(b"material-a", 8, 16).0.expect("generated");
         let other = LXStamper::stamp_workblock(b"material-b", 16);
         assert!(!LXStamper::stamp_valid(&stamp, 8, &other));
     }
@@ -254,7 +385,7 @@ mod tests {
         // A stamp mined the old way must fail the standard check, and be
         // reported as legacy so operators see why.
         let cost = 8;
-        let legacy_wb = LXStamper::legacy_stamp_workblock(FIXTURE, 16);
+        let legacy_wb = legacy_stamp_workblock(FIXTURE, 16);
         let mut stamp = vec![0u8; LXStamper::STAMP_SIZE];
         let mut n = 0u64;
         loop {
@@ -269,7 +400,7 @@ mod tests {
         assert!(LXStamper::is_legacy_stamp(FIXTURE, &stamp, cost, 16),
             "a legacy stamp must be recognisable for the transition warning");
 
-        let (good, _) = LXStamper::generate_stamp(FIXTURE, cost, 16);
+        let good = LXStamper::generate_stamp(FIXTURE, cost, 16).0.expect("generated");
         assert!(!LXStamper::is_legacy_stamp(FIXTURE, &good, cost, 16),
             "a standard stamp must not be misreported as legacy");
     }
