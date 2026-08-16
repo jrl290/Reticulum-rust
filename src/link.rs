@@ -820,7 +820,18 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
 
                 // --- Internal: packet dispatch ---
                 LinkMsg::Receive(packet, reply) => {
-                    let was_pending = link.state != STATE_ACTIVE;
+                    // The §1 assertion and link_established callback belong to
+                    // the PENDING/HANDSHAKE → ACTIVE transition (actual link
+                    // establishment). STALE → ACTIVE is a keepalive recovery,
+                    // NOT an establishment: the watchdog demotes an idle link
+                    // to STALE and the next inbound packet revives it (see
+                    // receive()'s "Mark active if stale"). Counting the stale
+                    // revival as a late link-establishment success re-fired
+                    // the callback and tripped §1 with the ORIGINAL
+                    // request_time, so the reported latency escalated by one
+                    // keepalive period per cycle (66s, 132s, 199s, ...).
+                    let was_establishing =
+                        link.state == STATE_PENDING || link.state == STATE_HANDSHAKE;
                     let handled = link.receive(&packet).is_ok();
                     let now_active = link.state == STATE_ACTIVE;
 
@@ -834,7 +845,7 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                     // methods (snapshot, identify, request, etc.) which would deadlock
                     // if called on the actor thread itself (the actor can't process its
                     // own reply while it's blocked inside the callback).
-                    if was_pending && now_active {
+                    if was_establishing && now_active {
                         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
                         crate::send_assertion::assert_send_completed_in_time(
                             "link.establish",
