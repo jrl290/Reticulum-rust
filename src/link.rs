@@ -3014,7 +3014,12 @@ impl Link {
             // LRRTT packets are encrypted over the link, decrypt first
             let plaintext = match self.decrypt(&packet.data) {
                 Ok(pt) => pt,
-                Err(_) => {
+                Err(e) => {
+                    // Never drop silently — see the decrypt log note below.
+                    crate::log(&format!(
+                        "Decryption failed on link {} (LRRTT, {} bytes): {}",
+                        crate::hexrep(&self.link_id, false), packet.data.len(), e
+                    ), crate::LOG_ERROR, false, false);
                     return Ok(());
                 }
             };
@@ -3058,7 +3063,21 @@ impl Link {
             Ok(plaintext) => {
                 plaintext
             },
-            Err(_) => {
+            Err(e) => {
+                // NEVER drop silently. The reference logs every decrypt
+                // failure — RNS/Link.py:1236 "Decryption failed on link ...",
+                // LOG_ERROR — and this branch used to be a bare
+                // `return Ok(())`. The cost of that silence, measured
+                // 2026-08-17: /rfed/pull requests arrived here ([HDR] logged
+                // just above), vanished without a trace, and the client burned
+                // a 43-49s timeout per attempt. Diagnosing it meant manually
+                // correlating packet sizes across two machines' logs; this one
+                // line would have named the failing packet immediately.
+                crate::log(&format!(
+                    "Decryption failed on link {} (context=0x{:02x}, {} bytes): {}",
+                    crate::hexrep(&self.link_id, false), packet.context,
+                    packet.data.len(), e
+                ), crate::LOG_ERROR, false, false);
                 return Ok(());
             },
         };
@@ -4286,6 +4305,52 @@ fn now_seconds() -> f64 {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// Every decrypt-failure branch in the packet pipeline must log.
+    ///
+    /// The reference logs each one — RNS/Link.py:1236 "Decryption failed on
+    /// link ..." at LOG_ERROR — and until 2026-08-17 two branches here were
+    /// bare `Err(_) => { return Ok(()); }`. The measured cost of that silence:
+    /// /rfed/pull requests reached the link ([HDR] logged), disappeared
+    /// without a trace, and every client attempt burned a 43-49s timeout.
+    /// The root cause (a malformed request from the JS client) was findable
+    /// in minutes once the failure was loud, and took hours while it was not.
+    ///
+    /// This walks the source: every `self.decrypt(` whose Err arm returns
+    /// must carry a `crate::log` call in that arm.
+    #[test]
+    fn decrypt_failures_are_never_silent() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/link.rs"
+        ))
+        .expect("read link.rs");
+
+        let mut checked = 0;
+        let mut idx = 0;
+        while let Some(pos) = source[idx..].find("match self.decrypt(") {
+            let start = idx + pos;
+            idx = start + 1;
+            // The Err arm lives within the match block; take a window large
+            // enough to hold it.
+            let window = &source[start..(start + 1800).min(source.len())];
+            let Some(err_pos) = window.find("Err(") else { continue };
+            let err_window = &window[err_pos..(err_pos + 1500).min(window.len())];
+            checked += 1;
+            assert!(
+                err_window.contains("crate::log"),
+                "a decrypt-failure arm near byte {start} does not log. Every \
+                 decrypt failure must be logged (RNS/Link.py:1236 parity) — \
+                 a silent drop here cost hours of cross-machine log \
+                 correlation on 2026-08-17."
+            );
+        }
+        assert!(
+            checked >= 3,
+            "expected at least 3 decrypt sites in the packet pipeline, \
+             found {checked} — if decryption moved, move this test's target"
+        );
+    }
 
     /// Build a minimal incoming Link with a unique link_id. `initiator=false`.
     fn make_incoming_link(link_id: Vec<u8>) -> Link {
