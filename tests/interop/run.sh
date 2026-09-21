@@ -99,6 +99,12 @@ pair() { # <server kind> <client kind> [hub|rusthub|direct]
   kill "$spid" $hpid 2>/dev/null; wait "$spid" $hpid 2>/dev/null
   local oversize; oversize="$(grep -c '^OVERSIZE' "$hdir/out")"
   [ "$oversize" -gt 0 ] && result="FAIL $oversize frame(s) over the medium MTU: $(grep -m1 '^OVERSIZE' "$hdir/out") [end result: ${result:-none}]"
+  # A Resource concludes once. The server prints one RESOURCE line per
+  # concluded-callback invocation; two means every inbound Resource is being
+  # handed to the application twice.
+  local concluded; concluded="$(grep -c '^RESOURCE' "$sdir/out")"
+  case "$result" in PASS*) [ "$concluded" -eq 1 ] || result="FAIL the server's resource-concluded callback fired $concluded times for one Resource [end result: $result]";; esac
+  grep -q '^RESOURCE .*intact=\(False\|false\)' "$sdir/out" && result="FAIL plain resource arrived corrupted"
   case "$result" in
     PASS*) echo "PASS  $label: $result ($(grep -c '^REQUEST' "$sdir/out") request(s) seen by server, 0 oversize frames)";;
     *)     echo "FAIL  $label: ${result:-no result}"; FAILED=1

@@ -20,7 +20,7 @@ import time
 import RNS
 
 APP_NAME, ASPECT, PATH = "interop", "request", "/echo"
-REQUEST_SEED, RESPONSE_SEED = 0x1234, 0x4321
+REQUEST_SEED, RESPONSE_SEED, RESOURCE_SEED = 0x1234, 0x4321, 0x5678
 
 
 def pattern(length, seed):
@@ -73,6 +73,15 @@ def server(config_dir):
         emit(f"REQUEST bytes={len(payload)} intact={intact}")
         return pattern(response_len, RESPONSE_SEED) if intact else b""
 
+    def resource_concluded(resource):
+        data = resource.data.read()
+        emit(f"RESOURCE bytes={len(data)} intact={data == pattern(len(data), RESOURCE_SEED)}")
+
+    def link_established(link):
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(resource_concluded)
+
+    destination.set_link_established_callback(link_established)
     destination.register_request_handler(PATH, response_generator=echo, allow=RNS.Destination.ALLOW_ALL)
     emit(f"DEST {destination.hash.hex()}")
     while True:
@@ -117,6 +126,13 @@ def client(config_dir, dest_hex, request_len, response_len):
     if response is None:
         fail(reason)
     if response == pattern(response_len, RESPONSE_SEED):
+        # One plain Resource (not a request): the server's concluded callback
+        # must fire exactly once for it. The runner counts.
+        proven = threading.Event()
+        sent = RNS.Resource(pattern(max(request_len, 2000), RESOURCE_SEED), link, callback=lambda r: proven.set())
+        if not proven.wait(60) or sent.status != RNS.Resource.COMPLETE:
+            fail("plain resource not proven")
+        time.sleep(0.5)
         emit(f"PASS request={request_len} response={len(response)}")
         os._exit(0)
     fail(f"response mismatch: got {len(response)} bytes, wanted {response_len}")

@@ -1711,13 +1711,7 @@ impl Resource {
 
             crate::log(&format!("Resource assembly concluded status={:?} data_len={}",
                 self.status, self.data.as_ref().map(|d| d.len()).unwrap_or(0)), crate::LOG_DEBUG, false, false);
-            let resource_arc = Arc::new(Mutex::new(self.clone()));
-            let concluded_cb = self.link.resource_concluded(resource_arc.clone());
-            if let Some(cb) = &concluded_cb {
-                cb(resource_arc);
-            } else {
-                crate::log("Resource concluded but no callback registered", crate::LOG_WARNING, false, false);
-            }
+            self.conclude_on_link();
 
             if self.segment_index == self.total_segments {
                 if let Some(cb) = &self.callback {
@@ -1782,11 +1776,7 @@ impl Resource {
                 if &proof_data[identity::HASHLENGTH / 8..] == self.expected_proof.as_slice() {
                     crate::log("[RESOURCE] proof MATCHED, setting Complete", crate::LOG_NOTICE, false, false);
                     self.status = ResourceStatus::Complete;
-                    let resource_arc = Arc::new(Mutex::new(self.clone()));
-                    let concluded_cb = self.link.resource_concluded(resource_arc.clone());
-                    if let Some(cb) = concluded_cb {
-                        cb(resource_arc);
-                    }
+                    self.conclude_on_link();
                     crate::log(&format!("[RESOURCE] resource_concluded done, seg={}/{}", self.segment_index, self.total_segments), crate::LOG_NOTICE, false, false);
 
                     if self.segment_index == self.total_segments {
@@ -1854,11 +1844,7 @@ impl Resource {
             }
 
             if let Some(cb) = &self.callback {
-                let resource_arc = Arc::new(Mutex::new(self.clone()));
-                let concluded_cb = self.link.resource_concluded(resource_arc.clone());
-                if let Some(ccb) = concluded_cb {
-                    ccb(resource_arc.clone());
-                }
+                self.conclude_on_link();
                 cb(Arc::new(Mutex::new(self.clone())));
             }
         }
@@ -1870,15 +1856,33 @@ impl Resource {
                 self.status = ResourceStatus::Rejected;
                 self.link.cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
                 if let Some(cb) = &self.callback {
-                    let resource_arc = Arc::new(Mutex::new(self.clone()));
-                    let concluded_cb = self.link.resource_concluded(resource_arc.clone());
-                    if let Some(ccb) = concluded_cb {
-                        ccb(resource_arc.clone());
-                    }
+                    self.conclude_on_link();
                     cb(Arc::new(Mutex::new(self.clone())));
                 }
             }
         }
+    }
+
+    /// RNS/Link.py `resource_concluded(resource)`: tell the link this transfer
+    /// is over so it can drop it from its in/outgoing lists and remember the
+    /// window and EIFR. Bookkeeping ONLY.
+    ///
+    /// `LinkHandle::resource_concluded` also hands back the link's application
+    /// `resource_concluded` callback, and until 2026-09 every site here invoked
+    /// it — and then invoked `self.callback` as well. But for an inbound
+    /// Resource those are the SAME closure: `Link` passes its
+    /// `callbacks.resource_concluded` to `Resource::accept` as the Resource's
+    /// callback, exactly as the reference does. So every inbound Resource
+    /// concluded twice. In production rfed ingested every propagation batch
+    /// twice — stamp validation run twice, and every notify wake sent twice —
+    /// and LXMF delivered every Resource-borne message to the router twice.
+    /// On the sending side the link's callback fired for OUTGOING transfers
+    /// too, which the reference never does.
+    ///
+    /// The reference invokes exactly one thing: the Resource's own callback.
+    /// `tests/interop/run.sh` checks that a Resource concludes once.
+    fn conclude_on_link(&self) {
+        let _ = self.link.resource_concluded(Arc::new(Mutex::new(self.clone())));
     }
 
     pub fn set_callback(&mut self, callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>) {

@@ -15,6 +15,11 @@
 //! everything the two ends learn about each other has to be rebroadcast and
 //! routed by it.
 //!
+//! After the request is answered the client also sends one plain Resource (not
+//! a request). The server prints a `RESOURCE` line each time its concluded
+//! callback fires, and the runner requires exactly one: a Resource concludes
+//! once.
+//!
 //! The request is `[response_len, payload]`; the server checks `payload` and
 //! answers with `response_len` bytes. Both payloads come from `pattern()`, so
 //! either end can verify every byte without sharing anything but the length.
@@ -27,7 +32,9 @@ use std::time::{Duration, Instant};
 
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC};
+use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, ACCEPT_ALL as ACCEPT_ALL_RESOURCES, MODE_AES256_CBC};
+use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
+use std::sync::Mutex;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
@@ -49,6 +56,7 @@ fn pattern(len: usize, seed: u32) -> Vec<u8> {
 
 const REQUEST_SEED: u32 = 0x1234;
 const RESPONSE_SEED: u32 = 0x4321;
+const RESOURCE_SEED: u32 = 0x5678;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -108,6 +116,19 @@ fn server(config_dir: PathBuf) {
             true,
         )
         .expect("register handler");
+
+    destination.set_link_established_callback(Some(Arc::new(|link: LinkHandle| {
+        link.set_resource_strategy(ACCEPT_ALL_RESOURCES);
+        link.set_resource_callbacks(
+            None,
+            None,
+            Some(Arc::new(|resource: Arc<Mutex<Resource>>| {
+                let data = resource.lock().ok().and_then(|r| r.data.clone()).unwrap_or_default();
+                let intact = data == pattern(data.len(), RESOURCE_SEED);
+                println!("RESOURCE bytes={} intact={}", data.len(), intact);
+            })),
+        );
+    })));
 
     Transport::register_destination(destination.clone());
     println!("DEST {}", reticulum_rust::hexrep(&destination.hash, false));
@@ -185,6 +206,7 @@ fn client(config_dir: PathBuf, dest_hex: &str, request_len: usize, response_len:
             let value = rmpv::decode::read_value(&mut std::io::Cursor::new(&response)).expect("response is msgpack");
             let body = value.as_slice().unwrap_or_else(|| fail("response is not bin"));
             if body == pattern(response_len, RESPONSE_SEED).as_slice() {
+                send_plain_resource(&link, request_len.max(2000));
                 println!("PASS request={} response={}", request_len, body.len());
                 std::process::exit(0);
             }
@@ -192,6 +214,42 @@ fn client(config_dir: PathBuf, dest_hex: &str, request_len: usize, response_len:
         }
         Ok(Err(reason)) => fail(reason),
         Err(_) => fail("no response within the test ceiling"),
+    }
+}
+
+/// Send one plain Resource and wait for the receiver's proof.
+fn send_plain_resource(link: &LinkHandle, len: usize) {
+    let (tx, rx) = mpsc::channel::<bool>();
+    let tx = Mutex::new(tx);
+    let resource = Resource::new_internal(
+        Some(ResourceData::Bytes(pattern(len, RESOURCE_SEED))),
+        link.clone(),
+        None,
+        false,
+        AutoCompressOption::Enabled,
+        Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
+            let complete = resource.lock().map(|r| r.status == ResourceStatus::Complete).unwrap_or(false);
+            let _ = tx.lock().unwrap().send(complete);
+        })),
+        None,
+        None,
+        1,
+        None,
+        None,
+        false,
+        0,
+        None,
+    )
+    .unwrap_or_else(|e| fail(&format!("could not build resource: {e}")));
+    Resource::advertise_shared(Arc::new(Mutex::new(resource)));
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(true) => {
+            // Give the receiver's callback a moment to print before we exit
+            // and the runner counts its RESOURCE lines.
+            thread::sleep(Duration::from_millis(500));
+        }
+        Ok(false) => fail("plain resource transfer failed"),
+        Err(_) => fail("plain resource not proven within the test ceiling"),
     }
 }
 
