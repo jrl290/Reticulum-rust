@@ -1967,10 +1967,22 @@ impl Transport {
             return;
         }
 
-        if state.transport_enabled || is_from_local_client {
-            let now_ts = now();
-            let selected = Self::select_path(&state.path_table, &state.interfaces, &destination_hash, now_ts);
-            if let Some((_, best)) = selected {
+        // RNS/Transport.py: `elif (transport_enabled or is_from_local_client)
+        // and destination_hash in path_table`. Knowing a path is part of the
+        // CONDITION: a destination we hold no path to must fall through to the
+        // branches below (forward for a local client, discover, hand to local
+        // clients, ignore). From 2026-07-16 until 2026-09 this was a block that
+        // returned unconditionally, so a transport node — and any local client
+        // of one — silently dropped every path request for an unknown
+        // destination and never reached discovery at all.
+        // `unknown_path_request_tests` holds the fall-through in place.
+        let selected = if state.transport_enabled || is_from_local_client {
+            Self::select_path(&state.path_table, &state.interfaces, &destination_hash, now())
+        } else {
+            None
+        };
+        if let Some((_, best)) = selected {
+            {
             let packet_hash = best.packet_hash.clone();
             let next_hop = best.next_hop.clone();
             let announce_hops = best.hops;
@@ -2163,8 +2175,6 @@ impl Transport {
             } else {
                 drop(state);
             }
-            } else {
-                drop(state);
             }
             return;
         }
@@ -2233,13 +2243,10 @@ impl Transport {
 
             for name in interface_list {
                 if Some(&name) != attached_interface.as_ref() {
-                    Transport::request_path(
-                        &destination_hash,
-                        None,
-                        Some(name),
-                        None,
-                        tag.clone(),
-                    );
+                    // Use the tag extracted from this path request on the new
+                    // path requests as well, to avoid potential loops
+                    // (RNS/Transport.py path_request, `recursive=True`).
+                    Transport::request_path_recursive(&destination_hash, name, tag.clone());
                 }
             }
             return;
@@ -2264,43 +2271,21 @@ impl Transport {
             return;
         }
 
-        // ── Fallback: forward to non-local outbound interfaces ───────────
-        // When there are no local clients, forward the path request to
-        // WAN-facing outbound interfaces (PostInterface, Backbone) instead
-        // of silently ignoring it.  Without this, bridges that only connect
-        // WAN interfaces (TCPClient to rmap.world + PostInterface to PHP)
-        // drop all path requests from the backbone.
-        if !is_from_local_client {
-            let non_local_outbound: Vec<String> = state
-                .interfaces
-                .iter()
-                .filter(|i| {
-                    i.out
-                        && i.online
-                        && !state.local_client_interfaces.iter().any(|lc| lc.name == i.name)
-                        && attached_interface.as_deref() != Some(&i.name)
-                })
-                .map(|i| i.name.clone())
-                .collect();
-            if !non_local_outbound.is_empty() {
-                drop(state);
-                log(
-                    &format!(
-                        "Forwarding path request for {}{} to non-local outbound interfaces",
-                        crate::hexrep(&destination_hash, true),
-                        interface_str
-                    ),
-                    LOG_DEBUG,
-                    false,
-                    false,
-                );
-                for name in non_local_outbound {
-                    Transport::request_path(&destination_hash, None, Some(name), None, None);
-                }
-                return;
-            }
-        }
-
+        // A path request for a destination we know nothing about, arriving on
+        // an interface that is not in DISCOVER_PATHS_FOR, ends here — exactly
+        // as in RNS/Transport.py. A node that must discover paths on behalf of
+        // the peers on an interface says so in its config, with
+        // `interface_mode = gateway` (or access_point / roaming) on that
+        // interface, which takes the `should_search_for_unknown` branch above:
+        // it forwards the ORIGINAL tag, dedups on `discovery_path_requests`,
+        // and is held to the announce cap.
+        //
+        // Until 2026-09 a fallback here re-emitted the request on every other
+        // online interface under a FRESH random tag. `destination_hash + tag`
+        // is the only loop suppression path requests have, so no node
+        // downstream could recognise the re-emission as a duplicate, and each
+        // unanswerable request left with a gain of (interfaces - 1).
+        // `unknown_path_request_tests` keeps it from coming back.
         drop(state);
         log(
             &format!(
@@ -5977,6 +5962,51 @@ impl Transport {
         true
     }
 
+    /// `Transport.request_path(..., on_interface, tag, recursive=True)` from
+    /// RNS/Transport.py: a path request made on behalf of someone else's path
+    /// request. It is subject to the interface's announce cap, and is dropped
+    /// rather than queued while that interface has announces waiting or is
+    /// still inside its cap window — a node discovering paths for others must
+    /// not be able to spend more of an interface than its own announces may.
+    fn request_path_recursive(destination_hash: &[u8], on_interface: String, tag: Option<Vec<u8>>) {
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let transport_enabled = state.transport_enabled;
+            if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == on_interface) {
+                if !iface.announce_queue.is_empty() {
+                    log(
+                        &format!("Blocking recursive path request on {} due to queued announces", on_interface),
+                        LOG_EXTREME, false, false,
+                    );
+                    return;
+                }
+                let now_ts = now();
+                if now_ts < iface.announce_allowed_at {
+                    log(
+                        &format!("Blocking recursive path request on {} due to active announce cap", on_interface),
+                        LOG_EXTREME, false, false,
+                    );
+                    return;
+                }
+                // destination_hash + [transport identity hash] + tag
+                let hash_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+                let data_len = destination_hash.len()
+                    + if transport_enabled { hash_len } else { 0 }
+                    + tag.as_ref().map(|t| t.len()).unwrap_or(hash_len);
+                if let Some(bitrate) = iface.bitrate.filter(|b| *b > 0.0) {
+                    let cap = if iface.announce_cap > 0.0 {
+                        iface.announce_cap
+                    } else {
+                        crate::reticulum::ANNOUNCE_CAP / 100.0
+                    };
+                    let tx_time = ((data_len + crate::reticulum::HEADER_MINSIZE) * 8) as f64 / bitrate;
+                    iface.announce_allowed_at = now_ts + tx_time / cap;
+                }
+            }
+        }
+        Transport::request_path(destination_hash, None, Some(on_interface), None, tag);
+    }
+
     pub fn request_path(
         destination_hash: &[u8],
         request_tag: Option<Vec<u8>>,
@@ -8897,5 +8927,183 @@ mod tests {
         uninstall_sync_outbound_handler(online_wan);
         uninstall_sync_outbound_handler(offline_wan);
         let _ = std::fs::remove_file(&ratchet_file);
+    }
+
+    // ── Reference conformance: path requests for unknown destinations ─────
+    //
+    // RNS/Transport.py path_request() ends in exactly three branches for a
+    // destination we hold no path to: discover on behalf of the requestor
+    // (only when the receiving interface is in DISCOVER_PATHS_FOR), hand it
+    // to local clients, or ignore it. There is no fourth branch.
+    mod unknown_path_request_tests {
+        use super::*;
+
+        const REQ_IFACE: &str = "upr-requesting";
+        const OTHER_IFACE: &str = "upr-other";
+
+        struct Fixture {
+            captured: Arc<Mutex<Vec<Vec<u8>>>>,
+            saved_interfaces: Vec<InterfaceStub>,
+            saved_local_clients: Vec<InterfaceStub>,
+            saved_transport_enabled: bool,
+        }
+
+        impl Fixture {
+            fn new(requesting_mode: u8) -> Self {
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let mut state = TRANSPORT.lock().unwrap();
+                let saved_interfaces = std::mem::take(&mut state.interfaces);
+                let saved_local_clients = std::mem::take(&mut state.local_client_interfaces);
+                let saved_transport_enabled = state.transport_enabled;
+                state.transport_enabled = true;
+                state.discovery_path_requests.clear();
+                for (name, mode) in [(REQ_IFACE, requesting_mode), (OTHER_IFACE, InterfaceStub::MODE_FULL)] {
+                    let mut stub = InterfaceStub::default();
+                    stub.name = name.to_string();
+                    stub.out = true;
+                    stub.online = true;
+                    stub.mode = mode;
+                    stub.bitrate = Some(1_000_000.0);
+                    stub.announce_cap = crate::reticulum::ANNOUNCE_CAP / 100.0;
+                    state.interfaces.push(stub);
+                }
+                drop(state);
+                install_sync_outbound_handler(OTHER_IFACE, captured.clone());
+                Fixture { captured, saved_interfaces, saved_local_clients, saved_transport_enabled }
+            }
+
+            /// Every path request leaves through the single FIFO transport-task
+            /// worker, so once a sentinel queued AFTER the call under test has
+            /// reached the wire, anything that call was going to emit already
+            /// has. That makes "nothing was sent" an observable event instead
+            /// of a sleep.
+            fn drain(&self) -> Vec<Vec<u8>> {
+                let sentinel = Identity::get_random_hash();
+                Transport::request_path(&sentinel, None, Some(OTHER_IFACE.to_string()), None, None);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let seen = self.captured.lock().unwrap().clone();
+                    if seen.iter().any(|raw| contains(raw, &sentinel)) {
+                        return seen.into_iter().filter(|raw| !contains(raw, &sentinel)).collect();
+                    }
+                    assert!(Instant::now() < deadline, "sentinel path request never reached the wire");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                uninstall_sync_outbound_handler(OTHER_IFACE);
+                let mut state = TRANSPORT.lock().unwrap();
+                state.interfaces = std::mem::take(&mut self.saved_interfaces);
+                state.local_client_interfaces = std::mem::take(&mut self.saved_local_clients);
+                state.transport_enabled = self.saved_transport_enabled;
+                state.discovery_path_requests.clear();
+            }
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        #[test]
+        fn unknown_destination_on_full_mode_interface_is_ignored() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new(InterfaceStub::MODE_FULL);
+            let unknown = Identity::get_random_hash();
+
+            Transport::path_request(
+                unknown.clone(),
+                false,
+                Some(REQ_IFACE.to_string()),
+                None,
+                Some(Identity::get_random_hash()),
+            );
+
+            let emitted = fixture.drain();
+            assert!(
+                !emitted.iter().any(|raw| contains(raw, &unknown)),
+                "a path request for an unknown destination arriving on a MODE_FULL interface \
+                 must be ignored, not re-emitted on other interfaces (RNS/Transport.py). \
+                 Regression: the non-canonical fallback is back."
+            );
+        }
+
+        #[test]
+        fn local_client_request_for_unknown_destination_is_forwarded() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new(InterfaceStub::MODE_FULL);
+            {
+                // REQ_IFACE is a local client of this (transport-enabled) instance.
+                let mut state = TRANSPORT.lock().unwrap();
+                let stub = state.interfaces.iter().find(|i| i.name == REQ_IFACE).unwrap().clone();
+                state.local_client_interfaces.push(stub);
+            }
+            let unknown = Identity::get_random_hash();
+
+            Transport::path_request(unknown.clone(), true, Some(REQ_IFACE.to_string()), None, None);
+
+            let emitted = fixture.drain();
+            assert_eq!(
+                emitted.iter().filter(|raw| contains(raw, &unknown)).count(),
+                1,
+                "a local client's path request for a destination we hold no path to must be \
+                 forwarded on every other interface (RNS/Transport.py). Regression: the \
+                 known-path block is swallowing unknown destinations again."
+            );
+        }
+
+        #[test]
+        fn discovery_forwards_the_original_tag() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new(InterfaceStub::MODE_GATEWAY);
+            let unknown = Identity::get_random_hash();
+            let tag = Identity::get_random_hash();
+
+            Transport::path_request(
+                unknown.clone(),
+                false,
+                Some(REQ_IFACE.to_string()),
+                None,
+                Some(tag.clone()),
+            );
+
+            let emitted = fixture.drain();
+            let forwarded: Vec<&Vec<u8>> = emitted.iter().filter(|raw| contains(raw, &unknown)).collect();
+            assert_eq!(forwarded.len(), 1, "gateway-mode interface must discover on the other interface, once");
+            assert!(
+                forwarded[0].ends_with(&tag),
+                "the forwarded path request must carry the ORIGINAL tag — destination_hash + tag \
+                 is the only loop suppression path requests have"
+            );
+        }
+
+        #[test]
+        fn discovery_is_held_to_the_announce_cap() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new(InterfaceStub::MODE_GATEWAY);
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                let other = state.interfaces.iter_mut().find(|i| i.name == OTHER_IFACE).unwrap();
+                other.announce_allowed_at = now() + 3600.0;
+            }
+            let unknown = Identity::get_random_hash();
+
+            Transport::path_request(
+                unknown.clone(),
+                false,
+                Some(REQ_IFACE.to_string()),
+                None,
+                Some(Identity::get_random_hash()),
+            );
+
+            let emitted = fixture.drain();
+            assert!(
+                !emitted.iter().any(|raw| contains(raw, &unknown)),
+                "a recursive path request must be dropped while the interface is inside its \
+                 announce cap window (RNS/Transport.py request_path, recursive=True)"
+            );
+        }
     }
 }
