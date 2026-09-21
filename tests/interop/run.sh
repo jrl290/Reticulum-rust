@@ -61,14 +61,22 @@ run_end() { # <rust|python> args...
 }
 
 FAILED=0; PORT=$((42000 + RANDOM % 2000))
-pair() { # <server kind> <client kind> [hub|direct]
+pair() { # <server kind> <client kind> [hub|rusthub|direct]
   local s="$1" c="$2" topo="${3:-hub}"; PORT=$((PORT + 1))
   local hdir="$WORK/hub-$PORT" sdir="$WORK/$s-server-$PORT" cdir="$WORK/$c-client-$PORT"
   local hpid="" label="$c client -> $s server"
   mkdir -p "$hdir"; : > "$hdir/out"
-  if [ "$topo" = hub ]; then
+  if [ "$topo" = hub ] || [ "$topo" = rusthub ]; then
     config "$hdir" listen "$PORT" true; config "$sdir" connect "$PORT" false
-    "$PY" "$SCRIPT" hub "$hdir" > "$hdir/out" 2> "$hdir/err" &
+    if [ "$topo" = rusthub ]; then
+      # This stack as the transport node in the middle — the gateway's role.
+      # It cannot police the medium the way the Python hub does, so this
+      # topology checks routing and rebroadcast, not frame sizes.
+      label="$label (via Rust hub)"
+      run_end rust hub "$hdir" > "$hdir/out" 2> "$hdir/err" &
+    else
+      "$PY" "$SCRIPT" hub "$hdir" > "$hdir/out" 2> "$hdir/err" &
+    fi
     hpid=$!; PIDS+=("$hpid")
     for _ in $(seq 1 100); do grep -q '^HUB ready' "$hdir/out" && break; sleep 0.1; done
   else
@@ -105,5 +113,7 @@ pair rust rust
 if [ "$REQ" -le 431 ]; then   # topology, not payload size, is what these two add
   pair rust python direct    # a Rust listener must announce to its own TCP peers
   pair rust rust direct
+  pair python python rusthub # a Rust transport node must rebroadcast and route for its TCP peers
+  pair rust rust rusthub
 fi
 exit $FAILED

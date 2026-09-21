@@ -273,8 +273,72 @@ impl InterfaceStub {
         // Placeholder for ingress limiting.
     }
 
-    pub fn process_announce_queue(&mut self) {
-        self.announce_queue.clear();
+    /// The announce cap, RNS/Transport.py outbound(): a rebroadcast announce
+    /// (`hops > 0`, no attached interface) may use at most `announce_cap` of
+    /// this interface's bitrate. Returns `true` when `raw` may be transmitted
+    /// now. Otherwise it has been queued — or, if this destination is already
+    /// queued, has replaced the queued copy when it is the newer emission —
+    /// and `next_queued_announce` will release it.
+    ///
+    /// Announces that originate on this node are not subject to the cap; the
+    /// caller does not bring them here.
+    pub fn admit_announce(&mut self, destination: &[u8], hops: u8, emitted: u64, raw: &[u8], outbound_time: f64) -> bool {
+        // The reference assumes every interface has a bitrate. Without one the
+        // airtime of a packet cannot be computed, so there is nothing to cap
+        // against — and queueing would hold the announce forever.
+        let Some(bitrate) = self.bitrate.filter(|b| *b > 0.0) else { return true };
+
+        if self.announce_queue.is_empty() && outbound_time > self.announce_allowed_at {
+            self.announce_allowed_at = outbound_time + self.announce_airtime_cost(raw.len(), bitrate);
+            return true;
+        }
+
+        if let Some(existing) = self.announce_queue.iter_mut().find(|e| e.destination == destination) {
+            if emitted > existing.emitted {
+                existing.time = outbound_time;
+                existing.hops = hops;
+                existing.emitted = emitted;
+                existing.raw = raw.to_vec();
+            }
+        } else if self.announce_queue.len() < crate::reticulum::MAX_QUEUED_ANNOUNCES {
+            self.announce_queue.push(AnnounceQueueEntry {
+                destination: destination.to_vec(),
+                time: outbound_time,
+                hops,
+                emitted,
+                raw: raw.to_vec(),
+            });
+        }
+        false
+    }
+
+    /// RNS/Interfaces/Interface.py process_announce_queue(): drop stale
+    /// entries, then — once the cap window has passed — release the queued
+    /// announce with the fewest hops, oldest first, and open the next window.
+    pub fn next_queued_announce(&mut self, now_ts: f64) -> Option<Vec<u8>> {
+        self.announce_queue.retain(|e| now_ts <= e.time + crate::reticulum::QUEUED_ANNOUNCE_LIFE);
+        if self.announce_queue.is_empty() || now_ts < self.announce_allowed_at {
+            return None;
+        }
+        let bitrate = self.bitrate.filter(|b| *b > 0.0)?;
+        let min_hops = self.announce_queue.iter().map(|e| e.hops).min()?;
+        let index = self
+            .announce_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.hops == min_hops)
+            .min_by(|(_, a), (_, b)| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)?;
+        let selected = self.announce_queue.remove(index);
+        self.announce_allowed_at = now_ts + self.announce_airtime_cost(selected.raw.len(), bitrate);
+        Some(selected.raw)
+    }
+
+    /// `tx_time / announce_cap`: how long this interface must stay clear of
+    /// rebroadcast announces after sending one of `raw_len` bytes.
+    fn announce_airtime_cost(&self, raw_len: usize, bitrate: f64) -> f64 {
+        let cap = if self.announce_cap > 0.0 { self.announce_cap } else { crate::reticulum::ANNOUNCE_CAP / 100.0 };
+        ((raw_len * 8) as f64 / bitrate) / cap
     }
 
     pub fn sent_announce(&mut self) {
@@ -2661,6 +2725,38 @@ impl Transport {
             }
         }
 
+        // Announce cap queues. RNS arms a timer per interface for the moment its
+        // cap window reopens; here each jobs() pass releases whatever has come
+        // due. An interface's window only reopens `tx_time / announce_cap` after
+        // its last announce, so a slow interface releases one and a fast one
+        // drains — bounded per pass so a full queue cannot hold the lock.
+        {
+            let now_ts = now();
+            let mut released: Vec<(String, Vec<u8>)> = Vec::new();
+            for iface in state.interfaces.iter_mut() {
+                if !iface.online {
+                    continue;
+                }
+                let mut budget = 64;
+                while budget > 0 {
+                    // Each release pushes announce_allowed_at forward from
+                    // `now_ts`; ask again with the same clock so a window that
+                    // has not reopened stops the drain.
+                    let Some(raw) = iface.next_queued_announce(now_ts) else { break };
+                    iface.sent_announce();
+                    released.push((iface.name.clone(), raw));
+                    budget -= 1;
+                }
+            }
+            if !released.is_empty() {
+                drop(state);
+                for (name, raw) in released {
+                    Transport::dispatch_outbound(&name, &raw);
+                }
+                state = TRANSPORT.lock().unwrap();
+            }
+        }
+
         // Published-destination refresh sweep.
         //
         // For every destination opted in via `publish_destination` with a
@@ -3523,6 +3619,21 @@ impl Transport {
                 .map(|i| i.name.clone())
                 .collect();
 
+            // Inputs to the announce rules below, read before `state.interfaces`
+            // is borrowed mutably. All None/false for anything but an
+            // untargeted announce.
+            let untargeted_announce = packet.packet_type == ANNOUNCE && packet.attached_interface.is_none();
+            let announce_wire = if untargeted_announce { announce_wire_fields(&packet.raw) } else { None };
+            let announce_is_local_destination = announce_wire
+                .as_ref()
+                .map(|(dest, _)| state.destinations.iter().any(|d| &d.hash == dest))
+                .unwrap_or(false);
+            // Mode of the interface this announce's path arrived on.
+            let announce_from_mode: Option<u8> = announce_wire.as_ref().and_then(|(dest, _)| {
+                let name = Self::next_hop_interface_locked(&state, dest)?;
+                state.interfaces.iter().find(|i| i.name == name).map(|i| i.mode)
+            });
+
             for interface in &mut state.interfaces {
                 // interface.OUT gate (Python Transport.outbound ~line 982):
                 // never broadcast down an interface that is offline.  Python's
@@ -3591,9 +3702,37 @@ impl Transport {
                         }
                     }
 
-                    if packet.packet_type == ANNOUNCE && packet.attached_interface.is_none() {
-                        if interface.mode == InterfaceStub::MODE_ACCESS_POINT {
-                            should_transmit = false;
+                    // RNS/Transport.py outbound(), `if packet.attached_interface
+                    // == None`: which interfaces an untargeted announce may leave
+                    // on, and how much of each it may use.
+                    if untargeted_announce && should_transmit {
+                        match interface.mode {
+                            InterfaceStub::MODE_ACCESS_POINT => should_transmit = false,
+                            // Roaming and boundary interfaces carry our own
+                            // destinations, and otherwise only announces whose
+                            // path did not itself arrive over a roaming (or, for
+                            // roaming, a boundary) interface.
+                            InterfaceStub::MODE_ROAMING if !announce_is_local_destination => {
+                                should_transmit = !matches!(
+                                    announce_from_mode,
+                                    None | Some(InterfaceStub::MODE_ROAMING) | Some(InterfaceStub::MODE_BOUNDARY)
+                                );
+                            }
+                            InterfaceStub::MODE_BOUNDARY if !announce_is_local_destination => {
+                                should_transmit = !matches!(announce_from_mode, None | Some(InterfaceStub::MODE_ROAMING));
+                            }
+                            InterfaceStub::MODE_ROAMING | InterfaceStub::MODE_BOUNDARY => {}
+                            // "Announces originating locally are always allowed,
+                            // and do not conform to bandwidth caps." Everything
+                            // else — every rebroadcast — is held to the cap, and
+                            // waits in the interface's queue when it is over it.
+                            _ => {
+                                if packet.hops > 0 {
+                                    if let Some((ref dest, emitted)) = announce_wire {
+                                        should_transmit = interface.admit_announce(dest, packet.hops, emitted, &packet.raw, outbound_time);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -6275,6 +6414,22 @@ pub(crate) fn validate_lrproof_signature(proof_data: &[u8], link_id: &[u8], dst_
     peer_identity.validate(signature, &signed_data)
 }
 
+/// Destination hash and emission time of an announce, read from its wire
+/// form. A rebroadcast is rebuilt as raw bytes with no `Destination` and no
+/// `data`, so the wire is the one place both are always present. The emission
+/// time is the 5-byte timebase in the announce's random blob
+/// (RNS/Transport.py announce_emitted / timebase_from_random_blob).
+fn announce_wire_fields(raw: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let hash_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+    let header_2 = (raw.first()? >> 6) & 0x01 == crate::packet::HEADER_2;
+    let dest_at = 2 + if header_2 { hash_len } else { 0 };
+    let data_at = dest_at + hash_len + 1;
+    let blob_at = data_at + crate::identity::KEYSIZE / 8 + crate::identity::NAME_HASH_LENGTH / 8;
+    let timebase = raw.get(blob_at + 5..blob_at + 10)?;
+    let emitted = timebase.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64);
+    Some((raw.get(dest_at..dest_at + hash_len)?.to_vec(), emitted))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8856,6 +9011,10 @@ mod tests {
         online_at_inbound: usize,
         online_after_jobs: usize,
         offline_after_jobs: usize,
+        /// Only meaningful with `cap_window_closed`: queue height after the
+        /// first pass, and what the interface saw once its window reopened.
+        queued_after_jobs: usize,
+        online_after_window_reopens: usize,
     }
 
     /// Make every announce-table entry due and run one jobs() pass. The random
@@ -8875,6 +9034,25 @@ mod tests {
     }
 
     fn announce_rebroadcast_scenario(transport_enabled: bool, source_is_local_client: bool) -> RebroadcastOutcome {
+        announce_rebroadcast_scenario_with(transport_enabled, source_is_local_client, false, None)
+    }
+
+    fn announce_rebroadcast_scenario_capped(
+        transport_enabled: bool,
+        source_is_local_client: bool,
+        cap_window_closed: bool,
+    ) -> RebroadcastOutcome {
+        announce_rebroadcast_scenario_with(transport_enabled, source_is_local_client, cap_window_closed, None)
+    }
+
+    /// `modes`: (mode of the interface the announce arrives on, mode of the
+    /// online interface it could be rebroadcast on).
+    fn announce_rebroadcast_scenario_with(
+        transport_enabled: bool,
+        source_is_local_client: bool,
+        cap_window_closed: bool,
+        modes: Option<(u8, u8)>,
+    ) -> RebroadcastOutcome {
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -8898,6 +9076,19 @@ mod tests {
         register_test_iface(offline_wan, false, None);
         if source_is_local_client {
             Transport::register_local_client_interface(src_iface);
+        }
+        if let Some((source_mode, wan_mode)) = modes {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.interfaces.iter_mut().find(|i| i.name == src_iface).unwrap().mode = source_mode;
+            state.interfaces.iter_mut().find(|i| i.name == online_wan).unwrap().mode = wan_mode;
+        }
+        if cap_window_closed {
+            // A slow interface that has just spent its announce budget.
+            let mut state = TRANSPORT.lock().unwrap();
+            let wan = state.interfaces.iter_mut().find(|i| i.name == online_wan).unwrap();
+            wan.bitrate = Some(1200.0);
+            wan.announce_cap = crate::reticulum::ANNOUNCE_CAP / 100.0;
+            wan.announce_allowed_at = now() + 3600.0;
         }
 
         let captured_online: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -8956,10 +9147,22 @@ mod tests {
         let online_at_inbound = captured_online.lock().unwrap().len();
 
         run_announce_rebroadcast_pass();
+        let online_after_jobs = captured_online.lock().unwrap().len();
+        let offline_after_jobs = captured_offline.lock().unwrap().len();
+        let queued_after_jobs = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let wan = state.interfaces.iter_mut().find(|i| i.name == online_wan).unwrap();
+            let queued = wan.announce_queue.len();
+            wan.announce_allowed_at = 0.0; // the cap window reopens
+            queued
+        };
+        Transport::jobs();
         let outcome = RebroadcastOutcome {
             online_at_inbound,
-            online_after_jobs: captured_online.lock().unwrap().len(),
-            offline_after_jobs: captured_offline.lock().unwrap().len(),
+            online_after_jobs,
+            offline_after_jobs,
+            queued_after_jobs,
+            online_after_window_reopens: captured_online.lock().unwrap().len(),
         };
 
         uninstall_sync_outbound_handler(online_wan);
@@ -8987,6 +9190,156 @@ mod tests {
             !source.contains("register_local_client_interface("),
             "tcp_interface.rs must not register its peers as local clients (RNS parity)"
         );
+    }
+
+    // ── Reference conformance: the announce cap ───────────────────────────
+    //
+    // RNS/Transport.py outbound() + Interface.process_announce_queue(): a
+    // rebroadcast announce may use at most `announce_cap` of an interface's
+    // bitrate; over that it waits in the interface's queue.
+    mod announce_cap_tests {
+        use super::*;
+
+        fn slow_interface() -> InterfaceStub {
+            let mut iface = InterfaceStub::default();
+            iface.name = "cap-test".to_string();
+            iface.bitrate = Some(1200.0);
+            iface.announce_cap = crate::reticulum::ANNOUNCE_CAP / 100.0;
+            iface
+        }
+
+        #[test]
+        fn first_announce_passes_and_opens_a_window_sized_by_airtime() {
+            let mut iface = slow_interface();
+            assert!(iface.admit_announce(&[1; 16], 1, 10, &[0u8; 150], 1000.0));
+            // 150 bytes at 1200 bps is 1 s of airtime; at a 2% cap that buys 50 s.
+            assert!((iface.announce_allowed_at - 1050.0).abs() < 1e-6, "got {}", iface.announce_allowed_at);
+            assert!(iface.announce_queue.is_empty());
+        }
+
+        #[test]
+        fn announce_inside_the_window_is_queued_not_sent() {
+            let mut iface = slow_interface();
+            assert!(iface.admit_announce(&[1; 16], 1, 10, &[0u8; 150], 1000.0));
+            assert!(!iface.admit_announce(&[2; 16], 1, 10, &[0u8; 150], 1001.0));
+            assert_eq!(iface.announce_queue.len(), 1);
+            // While anything is queued, later announces queue behind it even
+            // after the window has passed — the queue drains in order.
+            assert!(!iface.admit_announce(&[3; 16], 1, 10, &[0u8; 150], 2000.0));
+            assert_eq!(iface.announce_queue.len(), 2);
+        }
+
+        #[test]
+        fn a_queued_destination_keeps_only_its_newest_emission() {
+            let mut iface = slow_interface();
+            iface.announce_allowed_at = 5000.0;
+            assert!(!iface.admit_announce(&[7; 16], 3, 100, b"old", 1000.0));
+            assert!(!iface.admit_announce(&[7; 16], 2, 200, b"new", 1001.0));
+            assert!(!iface.admit_announce(&[7; 16], 1, 50, b"stale", 1002.0));
+            assert_eq!(iface.announce_queue.len(), 1, "one entry per destination");
+            assert_eq!(iface.announce_queue[0].raw, b"new");
+            assert_eq!(iface.announce_queue[0].hops, 2);
+        }
+
+        #[test]
+        fn queue_releases_fewest_hops_first_then_oldest_and_only_when_the_window_reopens() {
+            let mut iface = slow_interface();
+            iface.announce_allowed_at = 5000.0;
+            iface.admit_announce(&[1; 16], 3, 1, b"far", 1000.0);
+            iface.admit_announce(&[2; 16], 1, 1, b"near-late", 1002.0);
+            iface.admit_announce(&[3; 16], 1, 1, b"near-early", 1001.0);
+
+            assert!(iface.next_queued_announce(4999.0).is_none(), "window still closed");
+            assert_eq!(iface.next_queued_announce(5000.0).as_deref(), Some(&b"near-early"[..]));
+            assert!(iface.announce_allowed_at > 5000.0, "releasing one opens the next window");
+            assert!(iface.next_queued_announce(5000.0).is_none(), "and that window is closed");
+
+            let reopened = iface.announce_allowed_at;
+            assert_eq!(iface.next_queued_announce(reopened).as_deref(), Some(&b"near-late"[..]));
+            let reopened = iface.announce_allowed_at;
+            assert_eq!(iface.next_queued_announce(reopened).as_deref(), Some(&b"far"[..]));
+            assert!(iface.announce_queue.is_empty());
+        }
+
+        #[test]
+        fn stale_queued_announces_are_dropped() {
+            let mut iface = slow_interface();
+            iface.announce_allowed_at = 5000.0;
+            iface.admit_announce(&[1; 16], 1, 1, b"ancient", 1000.0);
+            let later = 1000.0 + crate::reticulum::QUEUED_ANNOUNCE_LIFE + 1.0;
+            assert!(iface.next_queued_announce(later).is_none());
+            assert!(iface.announce_queue.is_empty());
+        }
+
+        #[test]
+        fn interface_without_a_bitrate_is_not_capped() {
+            let mut iface = InterfaceStub::default();
+            for i in 0..5u8 {
+                assert!(iface.admit_announce(&[i; 16], 1, 1, &[0u8; 150], 1000.0));
+            }
+            assert!(iface.announce_queue.is_empty(), "with no bitrate there is no airtime to cap, and queueing would hold it forever");
+        }
+
+        #[test]
+        fn wire_fields_are_read_from_either_header_form() {
+            let dest = [0xD5u8; 16];
+            let mut data = vec![0u8; crate::identity::KEYSIZE / 8 + crate::identity::NAME_HASH_LENGTH / 8];
+            data.extend_from_slice(&[9, 9, 9, 9, 9, 0x00, 0x00, 0x01, 0x02, 0x03]); // random blob: 5 random + 5 timebase
+            data.extend_from_slice(&[0u8; 64]);
+
+            let mut header_1 = vec![ANNOUNCE, 2];
+            header_1.extend_from_slice(&dest);
+            header_1.push(crate::packet::NONE);
+            header_1.extend_from_slice(&data);
+
+            let mut header_2 = vec![(crate::packet::HEADER_2 << 6) | ANNOUNCE, 2];
+            header_2.extend_from_slice(&[0xAA; 16]); // transport_id
+            header_2.extend_from_slice(&dest);
+            header_2.push(crate::packet::NONE);
+            header_2.extend_from_slice(&data);
+
+            for raw in [header_1, header_2] {
+                let (parsed_dest, emitted) = announce_wire_fields(&raw).expect("parse");
+                assert_eq!(parsed_dest, dest);
+                assert_eq!(emitted, 0x010203);
+            }
+            assert!(announce_wire_fields(&[ANNOUNCE, 0, 1, 2, 3]).is_none(), "truncated input must not panic");
+        }
+
+        /// RNS/Transport.py outbound(): which modes an untargeted rebroadcast may
+        /// leave on, given the mode of the interface its path arrived over.
+        #[test]
+        fn interface_mode_rules_for_rebroadcast() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            use InterfaceStub as I;
+            // (arrived over, candidate, may it leave on the candidate?)
+            let cases = [
+                (I::MODE_FULL, I::MODE_FULL, true),
+                (I::MODE_FULL, I::MODE_ACCESS_POINT, false),
+                (I::MODE_FULL, I::MODE_ROAMING, true),
+                (I::MODE_ROAMING, I::MODE_ROAMING, false),
+                (I::MODE_BOUNDARY, I::MODE_ROAMING, false),
+                (I::MODE_FULL, I::MODE_BOUNDARY, true),
+                (I::MODE_ROAMING, I::MODE_BOUNDARY, false),
+                (I::MODE_BOUNDARY, I::MODE_BOUNDARY, true),
+            ];
+            for (from, to, allowed) in cases {
+                let outcome = announce_rebroadcast_scenario_with(true, false, false, Some((from, to)));
+                assert_eq!(
+                    outcome.online_after_jobs, allowed as usize,
+                    "announce whose path arrived over mode {:#04x}, rebroadcast on mode {:#04x}", from, to
+                );
+            }
+        }
+
+        #[test]
+        fn rebroadcast_over_the_cap_waits_in_the_queue_and_leaves_when_the_window_reopens() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = announce_rebroadcast_scenario_capped(true, false, true);
+            assert_eq!(outcome.online_after_jobs, 0, "the interface is inside its cap window: nothing may leave");
+            assert_eq!(outcome.queued_after_jobs, 1, "the rebroadcast is queued, not dropped");
+            assert_eq!(outcome.online_after_window_reopens, 1, "and released by jobs() once the window reopens");
+        }
     }
 
     // ── Reference conformance: announce rebroadcast ───────────────────────

@@ -7,8 +7,13 @@
 //! pairing, so each direction is checked against the reference rather than
 //! only against ourselves.
 //!
+//!   request_resource_interop hub    <config_dir>
 //!   request_resource_interop server <config_dir>
 //!   request_resource_interop client <config_dir> <dest_hex> <request_len> <response_len>
+//!
+//! `hub` is a bare transport node — this stack in the role the gateway plays:
+//! everything the two ends learn about each other has to be rebroadcast and
+//! routed by it.
 //!
 //! The request is `[response_len, payload]`; the server checks `payload` and
 //! answers with `response_len` bytes. Both payloads come from `pattern()`, so
@@ -48,6 +53,7 @@ const RESPONSE_SEED: u32 = 0x4321;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("hub") if args.len() == 3 => hub(PathBuf::from(&args[2])),
         Some("server") if args.len() == 3 => server(PathBuf::from(&args[2])),
         Some("client") if args.len() == 6 => client(
             PathBuf::from(&args[2]),
@@ -56,9 +62,17 @@ fn main() {
             args[5].parse().expect("response_len"),
         ),
         _ => {
-            eprintln!("usage: server <config_dir> | client <config_dir> <dest_hex> <request_len> <response_len>");
+            eprintln!("usage: hub <config_dir> | server <config_dir> | client <config_dir> <dest_hex> <request_len> <response_len>");
             std::process::exit(2);
         }
+    }
+}
+
+fn hub(config_dir: PathBuf) {
+    Reticulum::init(Some(config_dir), None, None, None, false, None).expect("Reticulum init");
+    println!("HUB ready");
+    loop {
+        thread::sleep(Duration::from_secs(3600));
     }
 }
 
