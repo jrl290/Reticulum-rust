@@ -965,6 +965,20 @@ impl Reticulum {
             crate::set_loglevel(loglevel);
         }
 
+        // Reported here, after the log level is set and before anything reads
+        // a setting, at ERROR: a setting that silently does nothing is a node
+        // that silently does not do what its operator configured.
+        for (line_number, text) in self.config.discarded() {
+            log(
+                &format!(
+                    "Config {} line {}: `{}` is outside every [section] and has been IGNORED. \
+                     Settings such as enable_transport belong under [reticulum].",
+                    self.config_path.display(), line_number, text,
+                ),
+                LOG_ERROR, false, false,
+            );
+        }
+
         if let Some(reticulum) = self.config.get_section("reticulum") {
             if let Some(share) = reticulum.get_bool("share_instance") {
                 self.share_instance = share;

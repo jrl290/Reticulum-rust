@@ -49,6 +49,11 @@ impl ConfigSection {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     sections: HashMap<String, ConfigSection>,
+    /// Lines that carried a setting but belong to no section, as
+    /// `(line number, text)`. They cannot take effect — every reader asks a
+    /// named section — so whoever loads the config MUST report them. See
+    /// `from_str`.
+    discarded: Vec<(usize, String)>,
 }
 
 impl Config {
@@ -63,7 +68,7 @@ impl Config {
         let mut current_section: Option<String> = None;
         let mut current_subsection: Option<String> = None;
 
-        for raw_line in content.lines() {
+        for (index, raw_line) in content.lines().enumerate() {
             let line = strip_comment(raw_line).trim().to_string();
             if line.is_empty() {
                 continue;
@@ -79,6 +84,8 @@ impl Config {
                         .entry(name.clone())
                         .or_default();
                     current_subsection = Some(name);
+                } else {
+                    cfg.discarded.push((index + 1, line.clone()));
                 }
                 continue;
             }
@@ -102,11 +109,28 @@ impl Config {
                     } else {
                         section.insert_item(key, value);
                     }
+                } else {
+                    // A setting above the first `[section]`. It used to vanish
+                    // here without a word. On the production gateway that was
+                    // `enable_transport = Yes` on line 1 of a config with no
+                    // `[reticulum]` header: the node ran with transport
+                    // DISABLED for its whole life while its config said
+                    // otherwise, and a non-reference announce forwarder was
+                    // written to make it relay anyway — the symptom patched,
+                    // the cause never seen. Silence is forbidden: keep the line
+                    // so the loader can say so.
+                    cfg.discarded.push((index + 1, line.clone()));
                 }
             }
         }
 
         cfg
+    }
+
+    /// Settings that were parsed but can never take effect because they sit
+    /// outside every section, as `(line number, text)`.
+    pub fn discarded(&self) -> &[(usize, String)] {
+        &self.discarded
     }
 
     pub fn get_section(&self, name: &str) -> Option<&ConfigSection> {
@@ -292,3 +316,35 @@ const DEFAULT_CONFIG: &[&str] = &[
     "    type = AutoInterface",
     "    enabled = Yes",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production gateway's config, as it was: `enable_transport` on line 1
+    /// with no `[reticulum]` header above it.
+    #[test]
+    fn a_setting_above_the_first_section_is_reported_not_swallowed() {
+        let cfg = Config::from_str("enable_transport = Yes\n\n[logging]\nloglevel = 3\n\n[interfaces]\n[[RMAP]]\ntype = TCPClientInterface\n");
+        assert!(cfg.get_section("reticulum").is_none(), "there is no [reticulum] section to read it from");
+        assert_eq!(
+            cfg.discarded(),
+            &[(1, "enable_transport = Yes".to_string())],
+            "a setting that cannot take effect must be surfaced to the loader, never dropped silently"
+        );
+    }
+
+    #[test]
+    fn a_subsection_above_the_first_section_is_reported() {
+        let cfg = Config::from_str("[[Orphan]]\ntype = TCPClientInterface\n[interfaces]\n");
+        let lines: Vec<usize> = cfg.discarded().iter().map(|(n, _)| *n).collect();
+        assert_eq!(lines, vec![1, 2], "the orphan header and the setting under it");
+    }
+
+    #[test]
+    fn a_well_formed_config_discards_nothing() {
+        let cfg = Config::from_str("# comment\n[reticulum]\nenable_transport = Yes\n[interfaces]\n[[RMAP]]\ntype = TCPClientInterface\n");
+        assert!(cfg.discarded().is_empty());
+        assert_eq!(cfg.get_section("reticulum").and_then(|s| s.get_bool("enable_transport")), Some(true));
+    }
+}
