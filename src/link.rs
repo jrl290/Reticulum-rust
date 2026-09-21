@@ -217,6 +217,13 @@ enum LinkMsg {
         request_id: Vec<u8>,
         plaintext: Vec<u8>,
     },
+    /// Fire-and-forget: a request that went out as a Resource has finished
+    /// uploading (`delivered`), or failed to. Python parity:
+    /// RNS/Link.py RequestReceipt.request_resource_concluded.
+    RequestResourceConcluded {
+        request_id: Vec<u8>,
+        delivered: bool,
+    },
 }
 
 /// Result from a Receive message — tells the dispatcher what happened.
@@ -532,6 +539,11 @@ impl LinkHandle {
     /// so the response is sent after the actor finishes processing `Receive`.
     pub fn send_response(&self, request_id: Vec<u8>, response: Vec<u8>) {
         let _ = self.tx.send(LinkMsg::SendResponse { request_id, response });
+    }
+
+    /// Report that a request sent as a Resource finished uploading, or failed.
+    fn request_resource_concluded(&self, request_id: Vec<u8>, delivered: bool) {
+        let _ = self.tx.send(LinkMsg::RequestResourceConcluded { request_id, delivered });
     }
 
     /// Dispatch an assembled REQUEST resource into the link's request handler.
@@ -896,6 +908,9 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 // Dispatch an assembled REQUEST resource — sent by the
                 // request_resource_concluded callback after a multi-segment
                 // inbound request has finished assembling.
+                LinkMsg::RequestResourceConcluded { request_id, delivered } => {
+                    link.request_resource_concluded(&request_id, delivered);
+                }
                 LinkMsg::HandleRequestPacket { request_id, plaintext } => {
                     let _ = link.handle_request_packet(request_id, &plaintext);
                 }
@@ -985,12 +1000,80 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
 }
 
 /// Request timeout checks — replaces the old request_timeout_watchdog thread.
+/// Send `data` over `link` as a Resource tied to `request_id` — the over-MDU
+/// form of a request (`is_response == false`) or of a response.
+///
+/// Runs on its own thread because building an outbound Resource encrypts
+/// through the link (`LinkHandle::encrypt`), a round-trip to the link's actor:
+/// done on the actor thread itself, where both callers live, it would wait on
+/// its own mailbox forever.
+///
+/// `concluded` fires exactly once with whether the peer proved receipt. The
+/// Resource's watchdog bounds the transfer, so it always fires.
+fn send_request_resource(
+    link: LinkHandle,
+    data: Vec<u8>,
+    request_id: Vec<u8>,
+    is_response: bool,
+    timeout: Option<f64>,
+    concluded: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+) {
+    thread::spawn(move || {
+        let resource_callback = concluded.clone().map(|concluded| {
+            Arc::new(move |resource: Arc<Mutex<Resource>>| {
+                let delivered = resource
+                    .lock()
+                    .map(|r| r.status == crate::resource::ResourceStatus::Complete)
+                    .unwrap_or(false);
+                concluded(delivered);
+            }) as Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>
+        });
+
+        match Resource::new_internal(
+            Some(crate::resource::ResourceData::Bytes(data)),
+            link,
+            None,
+            false,
+            crate::resource::AutoCompressOption::Enabled,
+            resource_callback,
+            None,
+            timeout,
+            1,
+            None,
+            Some(request_id.clone()),
+            is_response,
+            0,
+            None,
+        ) {
+            Ok(resource) => Resource::advertise_shared(Arc::new(Mutex::new(resource))),
+            Err(e) => {
+                crate::log(
+                    &format!(
+                        "[REQ] could not build {} resource for {}: {}",
+                        if is_response { "response" } else { "request" },
+                        crate::hexrep(&request_id, false),
+                        e,
+                    ),
+                    crate::LOG_ERROR, false, false,
+                );
+                if let Some(concluded) = concluded {
+                    concluded(false);
+                }
+            }
+        }
+    });
+}
+
 fn actor_check_request_timeouts(link: &mut Link) {
     let now = now_seconds();
     let mut timed_out = Vec::new();
     if let Ok(mut pending) = link.pending_requests.lock() {
         pending.retain(|req| {
-            if now >= req.sent_at + req.timeout {
+            let expired = match req.response_clock_started {
+                Some(started) => !req.receiving_response && now >= started + req.timeout,
+                None => false,
+            };
+            if expired {
                 timed_out.push(req.clone());
                 false
             } else {
@@ -1403,6 +1486,17 @@ struct PendingRequest {
     request_id: Vec<u8>,
     sent_at: f64,
     timeout: f64,
+    /// When the wait for a response began. `None` while the request is still
+    /// uploading as a Resource: RNS/Link.py `request_resource_concluded` only
+    /// starts the response timeout once the upload has concluded, because
+    /// until then the peer has nothing to answer. The upload itself is bounded
+    /// by the Resource's own watchdog, and its conclusion — success or
+    /// failure — is the event that moves this request on.
+    response_clock_started: Option<f64>,
+    /// The response is arriving as a Resource. RNS/Link.py moves the receipt
+    /// to RECEIVING, where `request_timed_out` no longer applies: the transfer
+    /// concludes through the Resource, not through this timer.
+    receiving_response: bool,
     response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
     failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
     #[allow(dead_code)]
@@ -2864,14 +2958,59 @@ impl Link {
                 // assembled we can route the data to the correct pending request callback.
                 // Python RNS encodes response resources as msgpack([request_id_bytes, response_value])
                 // — identical to the direct RESPONSE packet plaintext format.
+                // RNS/Link.py receive(): a response resource is accepted only
+                // for a request we are actually waiting on, and accepting it
+                // moves that request to RECEIVING, where the response timeout
+                // no longer applies — a large response on a slow link must not
+                // be failed by the timer while its parts are still arriving.
+                let awaited = request_id_opt.as_ref().map(|request_id| {
+                    self.pending_requests.lock().ok().map(|mut pending| {
+                        match pending.iter_mut().find(|p| &p.request_id == request_id) {
+                            Some(request) => { request.receiving_response = true; true }
+                            None => false,
+                        }
+                    }).unwrap_or(false)
+                }).unwrap_or(false);
+                if !awaited {
+                    crate::log("[RESP-RES] response resource matches no pending request — ignored (matches Python)", crate::LOG_NOTICE, false, false);
+                    return Ok(());
+                }
+
                 let pending_requests = Arc::clone(&self.pending_requests);
                 let link_arc = Arc::new(Mutex::new(self.clone()));
                 let concluded_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> =
                     Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
-                        let (data_opt, res_request_id_opt) = {
+                        let (data_opt, res_request_id_opt, status) = {
                             let res = resource.lock().unwrap();
-                            (res.data.clone(), res.request_id.clone())
+                            (res.data.clone(), res.request_id.clone(), res.status)
                         };
+
+                        // RNS/Link.py response_resource_concluded(): a response
+                        // transfer that did not complete fails the request. The
+                        // timer was stopped when the transfer began, so this is
+                        // the only thing that can.
+                        if status != crate::resource::ResourceStatus::Complete {
+                            crate::log(&format!("[RESP-RES] incoming response resource failed status={:?}", status), crate::LOG_NOTICE, false, false);
+                            let failed = res_request_id_opt.as_ref().and_then(|request_id| {
+                                let mut pending = pending_requests.lock().ok()?;
+                                let index = pending.iter().position(|p| &p.request_id == request_id)?;
+                                Some(pending.remove(index))
+                            });
+                            if let Some(request) = failed {
+                                if let Some(callback) = request.failed_callback {
+                                    let receipt = RequestReceipt {
+                                        request_id: request.request_id.clone(),
+                                        response: None,
+                                        link: Arc::clone(&link_arc),
+                                        sent_at: request.sent_at,
+                                        received_at: None,
+                                        progress: 0.0,
+                                    };
+                                    thread::spawn(move || { callback(receipt); });
+                                }
+                            }
+                            return;
+                        }
                         crate::log(&format!(
                             "[RESP-RES] concluded, data_len={:?}, res_request_id={}",
                             data_opt.as_ref().map(|d| d.len()),
@@ -3543,6 +3682,28 @@ impl Link {
         response_data.extend_from_slice(&response);
         crate::log(&format!("[REQ] response_data (msgpack) {} bytes: {:02x?}", response_data.len(), &response_data[..response_data.len().min(64)]), crate::LOG_NOTICE, false, false);
 
+        // RNS/Link.py handle_request(): `if len(packed_response) <= self.mdu`
+        // it is a single RESPONSE packet, otherwise the same bytes go as a
+        // Resource flagged as the response to `request_id`.
+        if response_data.len() > self.mdu {
+            let link_handle = match self.self_handle.clone() {
+                Some(handle) => handle,
+                None => {
+                    crate::log("[REQ] no actor handle — cannot send response as resource", crate::LOG_ERROR, false, false);
+                    return Ok(());
+                }
+            };
+            crate::log(
+                &format!(
+                    "[REQ] sending response to {} as resource: {} bytes > link MDU {}",
+                    crate::hexrep(request_id, false), response_data.len(), self.mdu,
+                ),
+                crate::LOG_DEBUG, false, false,
+            );
+            send_request_resource(link_handle, response_data, request_id.to_vec(), true, None, None);
+            return Ok(());
+        }
+
         // Encrypt directly via self (we already hold the link lock, so we MUST NOT
         // go through runtime_encrypt_for_destination which would try to re-acquire
         // the same mutex → deadlock).
@@ -3707,6 +3868,13 @@ impl Link {
         ]);
         let mut payload_data = Vec::new();
         rmpv_write_value(&mut payload_data, &outer_value).map_err(|e| format!("Failed to encode request payload: {}", e))?;
+
+        // RNS/Link.py request(): `if len(packed_request) <= self.mdu` it is a
+        // single REQUEST packet, otherwise the same bytes go as a Resource.
+        if payload_data.len() > self.mdu {
+            return self.request_as_resource(payload_data, response_callback, failed_callback, progress_callback);
+        }
+
         // Encrypt the payload using the link session key directly (via self.encrypt),
         // avoiding the self-deadlock that would occur if we went through
         // DestinationType::Link → runtime_encrypt_for_destination → link.lock()
@@ -3787,13 +3955,7 @@ impl Link {
             thread::spawn(move || { callback(initial); });
         }
 
-        // Calculate timeout based on RTT or default
-        let timeout = if let Some(rtt) = self.rtt {
-            rtt * self.traffic_timeout_factor + crate::resource::Resource::RESPONSE_MAX_GRACE_TIME * 1.125
-        } else {
-            // Default timeout when RTT not available
-            self.traffic_timeout_factor * 3.0 + crate::resource::Resource::RESPONSE_MAX_GRACE_TIME * 1.125
-        };
+        let timeout = self.request_timeout();
 
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
         
@@ -3804,12 +3966,121 @@ impl Link {
             request_id: request_id.clone(),
             sent_at,
             timeout,
+            response_clock_started: Some(sent_at),
+            receiving_response: false,
             response_callback,
             failed_callback,
             progress_callback,
         });
 
         Ok(request_id)
+    }
+
+    /// RNS/Link.py request(): `rtt * traffic_timeout_factor +
+    /// RESPONSE_MAX_GRACE_TIME * 1.125`.
+    fn request_timeout(&self) -> f64 {
+        if let Some(rtt) = self.rtt {
+            rtt * self.traffic_timeout_factor + crate::resource::Resource::RESPONSE_MAX_GRACE_TIME * 1.125
+        } else {
+            // Default timeout when RTT not available
+            self.traffic_timeout_factor * 3.0 + crate::resource::Resource::RESPONSE_MAX_GRACE_TIME * 1.125
+        }
+    }
+
+    /// The over-MDU half of RNS/Link.py request(): the packed request goes as
+    /// a Resource flagged as a request, and `request_id` is the truncated hash
+    /// of the packed request itself — the receiver derives the same id from
+    /// the assembled bytes (request_resource_concluded).
+    fn request_as_resource(
+        &self,
+        packed_request: Vec<u8>,
+        response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+    ) -> Result<Vec<u8>, String> {
+        let link_handle = self.self_handle.clone().ok_or("Link has no actor handle; cannot send request as resource")?;
+        let request_id = identity::truncated_hash(&packed_request);
+        let timeout = self.request_timeout();
+        crate::log(
+            &format!(
+                "[REQ] sending request {} as resource: {} bytes > link MDU {}",
+                crate::hexrep(&request_id, false), packed_request.len(), self.mdu,
+            ),
+            crate::LOG_DEBUG, false, false,
+        );
+
+        // Register BEFORE the upload starts (DESIGN_PRINCIPLES §5): the
+        // response must never be able to outrun the entry it is matched to.
+        self.pending_requests
+            .lock()
+            .map_err(|_| "Pending request lock poisoned")?
+            .push(PendingRequest {
+                request_id: request_id.clone(),
+                sent_at: current_time().unwrap_or(0) as f64,
+                timeout,
+                response_clock_started: None,
+                receiving_response: false,
+                response_callback,
+                failed_callback,
+                progress_callback,
+            });
+
+        let concluded_handle = link_handle.clone();
+        let concluded_id = request_id.clone();
+        send_request_resource(
+            link_handle,
+            packed_request,
+            request_id.clone(),
+            false,
+            Some(timeout),
+            Some(Arc::new(move |delivered: bool| {
+                concluded_handle.request_resource_concluded(concluded_id.clone(), delivered);
+            })),
+        );
+
+        Ok(request_id)
+    }
+
+    /// RNS/Link.py RequestReceipt.request_resource_concluded. Delivered: the
+    /// peer now holds the request, so the wait for its response starts here.
+    /// Not delivered: the request has failed, and says so.
+    fn request_resource_concluded(&mut self, request_id: &[u8], delivered: bool) {
+        let failed = {
+            let mut pending = match self.pending_requests.lock() {
+                Ok(pending) => pending,
+                Err(_) => return,
+            };
+            // Absent means the response already arrived and claimed the entry.
+            let Some(index) = pending.iter().position(|p| p.request_id == request_id) else { return };
+            if delivered {
+                pending[index].response_clock_started = Some(now_seconds());
+                None
+            } else {
+                Some(pending.remove(index))
+            }
+        };
+
+        if let Some(request) = failed {
+            crate::log(
+                &format!("[REQ] sending request {} as resource failed", crate::hexrep(request_id, false)),
+                crate::LOG_NOTICE, false, false,
+            );
+            self.fail_request(request);
+        }
+    }
+
+    fn fail_request(&self, request: PendingRequest) {
+        if let Some(callback) = request.failed_callback {
+            let receipt = RequestReceipt {
+                request_id: request.request_id.clone(),
+                response: None,
+                link: Arc::new(Mutex::new(self.clone())),
+                sent_at: request.sent_at,
+                received_at: None,
+                progress: 0.0,
+            };
+            thread::spawn(move || { callback(receipt); });
+        }
     }
     
     /// Handle LINKIDENTIFY packets - validate identity signature and establish remote identity
@@ -3958,37 +4229,43 @@ impl Link {
         if let Some(rtt) = self.rtt {
             let rtt_data = to_vec(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
 
-            let mut link_destination = self
-                .destination
-                .lock()
-                .map_err(|_| "Destination lock poisoned")?
-                .clone();
-            link_destination.dest_type = DestinationType::Link;
-            link_destination.hash = self.link_id.clone();
-            link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
-            link_destination.link = Some(crate::destination::LinkInfo {
-                rtt: self.rtt,
-                traffic_timeout_factor: self.traffic_timeout_factor,
-                status_closed: self.state == STATE_CLOSED,
-                mtu: Some(self.mtu),
-                attached_interface: self.attached_interface.clone(),
-            });
-
-            thread::spawn(move || {
-                let mut rtt_packet = Packet::new(
-                    Some(link_destination),
-                    rtt_data,
-                    DATA,
-                    packet::LRRTT,
-                    crate::transport::BROADCAST,
-                    packet::HEADER_1,
-                    None,
-                    None,
-                    false,
-                    0,
+            // LRRTT is the last packet of the handshake: the peer only moves
+            // the link to ACTIVE when it arrives, and RNS/Link.py ignores a
+            // REQUEST on a link that is not ACTIVE — silently. So it must be
+            // on the interface's writer queue BEFORE the established callback
+            // can put anything behind it (DESIGN_PRINCIPLES §5), which is the
+            // order RNS/Link.py validate_proof() guarantees by sending it
+            // inline and only then starting the callback.
+            //
+            // This used to be `thread::spawn(|| rtt_packet.send())`, racing the
+            // callback. A request sent from that callback regularly won, a
+            // Python peer dropped it, and the caller saw a request that timed
+            // out for no visible reason. tests/interop/run.sh with a
+            // single-packet request ("100 200") is the regression test.
+            //
+            // Encrypted and framed by hand for the same reason as
+            // send_request_response: Packet::send() would encrypt through the
+            // link's own actor, and we are on it.
+            let ciphertext = self.encrypt(&rtt_data)?;
+            let flags: u8 = (DestinationType::Link as u8) << 2;
+            let mut raw = vec![flags, 0u8];
+            raw.extend_from_slice(&self.link_id);
+            raw.push(packet::LRRTT);
+            raw.extend_from_slice(&ciphertext);
+            let sent = self
+                .attached_interface
+                .as_ref()
+                .map(|iface| crate::transport::Transport::dispatch_outbound(iface, &raw))
+                .unwrap_or(false);
+            if !sent {
+                crate::log(
+                    &format!(
+                        "LRRTT for link {} could not be sent on {:?} — the peer will never activate this link",
+                        crate::hexrep(&self.link_id, false), self.attached_interface,
+                    ),
+                    crate::LOG_ERROR, false, false,
                 );
-                let _ = rtt_packet.send();
-            });
+            }
             self.had_outbound(false);
         }
 
@@ -4548,6 +4825,90 @@ mod tests {
              and silently dropped the ping — the exact regression we are guarding \
              against"
         );
+    }
+
+    // ── Requests sent or answered as a Resource: the response clock ─────────
+    //
+    // RNS/Link.py runs the response timeout only while a request is DELIVERED:
+    // not while it is still uploading as a Resource (there is nothing for the
+    // peer to answer yet) and not once the response has started arriving as a
+    // Resource (RECEIVING). Wire behaviour is covered against the reference by
+    // tests/interop/run.sh; these pin the state machine.
+
+    fn pending_request_for_test(
+        clock: Option<f64>,
+        receiving: bool,
+        failed: mpsc::Sender<Vec<u8>>,
+    ) -> PendingRequest {
+        let failed = Mutex::new(failed);
+        PendingRequest {
+            request_id: vec![0xAB; 16],
+            sent_at: 0.0,
+            timeout: 0.0, // already expired the moment the clock is running
+            response_clock_started: clock,
+            receiving_response: receiving,
+            response_callback: None,
+            failed_callback: Some(Arc::new(move |receipt: RequestReceipt| {
+                let _ = failed.lock().unwrap().send(receipt.request_id);
+            })),
+            progress_callback: None,
+        }
+    }
+
+    #[test]
+    fn request_still_uploading_as_resource_is_not_timed_out() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(37)).collect());
+        let (tx, rx) = mpsc::channel();
+        link.pending_requests.lock().unwrap().push(pending_request_for_test(None, false, tx));
+
+        actor_check_request_timeouts(&mut link);
+
+        assert_eq!(link.pending_requests.lock().unwrap().len(), 1,
+            "the response clock must not run while the request is still uploading");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn response_arriving_as_resource_is_not_timed_out() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(41)).collect());
+        let (tx, rx) = mpsc::channel();
+        link.pending_requests.lock().unwrap().push(pending_request_for_test(Some(0.0), true, tx));
+
+        actor_check_request_timeouts(&mut link);
+
+        assert_eq!(link.pending_requests.lock().unwrap().len(), 1,
+            "a response that has started arriving as a Resource concludes through the \
+             Resource, never through the response timer");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn delivered_request_resource_starts_the_response_clock() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(43)).collect());
+        let (tx, rx) = mpsc::channel();
+        link.pending_requests.lock().unwrap().push(pending_request_for_test(None, false, tx));
+
+        link.request_resource_concluded(&[0xAB; 16], true);
+        assert!(link.pending_requests.lock().unwrap()[0].response_clock_started.is_some());
+        assert!(rx.try_recv().is_err(), "delivery is not a failure");
+
+        actor_check_request_timeouts(&mut link);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("failed callback"), vec![0xAB; 16],
+            "once delivered, an unanswered request times out like any other");
+        assert!(link.pending_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn undelivered_request_resource_fails_the_request() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(47)).collect());
+        let (tx, rx) = mpsc::channel();
+        link.pending_requests.lock().unwrap().push(pending_request_for_test(None, false, tx));
+
+        link.request_resource_concluded(&[0xAB; 16], false);
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("failed callback"), vec![0xAB; 16],
+            "a request whose upload failed must say so, not sit pending forever");
+        assert!(link.pending_requests.lock().unwrap().is_empty());
     }
 
     /// Companion regression: an initiator receiving a 0xFE pong must NOT
