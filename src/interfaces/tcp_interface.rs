@@ -1674,15 +1674,23 @@ impl TcpServerInterface {
                             iface.process_outgoing(raw.to_vec()).is_ok()
                         }),
                     );
-                    // Register as a local client interface FIRST, before
-                    // adding to state.interfaces.  This ensures the
-                    // outbound() announce broadcast filter sees the
-                    // interface in local_client_interfaces by the time it
-                    // appears in the interfaces list (eliminates a race
-                    // where jobs()/outbound() bursts announce retransmits
-                    // to the new interface before it's marked as a local
-                    // client).
-                    crate::transport::Transport::register_local_client_interface(&iface_name);
+                    // A peer that connected to a TCPServerInterface is an
+                    // ordinary interface, exactly as in RNS
+                    // (TCPServerInterface.incoming_connection appends it to
+                    // Transport.interfaces and nothing else). It is NOT a
+                    // local client: in the reference that means a program
+                    // attached to this node's shared instance, and only
+                    // LocalServerInterface adds to local_client_interfaces.
+                    //
+                    // Until 2026-09 every TCP client was registered as one.
+                    // That made outbound() skip it for untargeted announces,
+                    // so a listener never sent its OWN announces to the peers
+                    // connected to it; it also gave any remote TCP peer the
+                    // privileges of a local program — its path requests were
+                    // forwarded on every interface and its announces
+                    // rebroadcast at once, with transport disabled or not.
+                    // A listener that should discover paths for its peers
+                    // says so with `interface_mode = gateway`.
                     {
                         let mut stub_config = crate::transport::InterfaceStubConfig::default();
                         stub_config.name = iface_name.clone();

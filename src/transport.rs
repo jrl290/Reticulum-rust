@@ -5168,14 +5168,33 @@ impl Transport {
                             }
                         }
 
-                        // ── Announce table + local client forwarding (unchanged) ───────
-                        if state.transport_enabled && packet.context != crate::packet::PATH_RESPONSE {
+                        // ── Announce table: the ONLY way an announce is rebroadcast ────
+                        // RNS/Transport.py: `if (transport_enabled() or
+                        // from_local_client(packet)) and context != PATH_RESPONSE`.
+                        // A node that is neither a transport node nor relaying for
+                        // one of its own local clients does not rebroadcast
+                        // announces at all. An announce from a local client "is
+                        // announced immediately, but only one time"; everything
+                        // else waits out a random window so that neighbours do not
+                        // all rebroadcast in the same instant.
+                        let announce_from_local_client = packet
+                            .receiving_interface
+                            .as_deref()
+                            .map(|name| Transport::is_local_client_interface_locked(&state, name))
+                            .unwrap_or(false);
+                        if (state.transport_enabled || announce_from_local_client)
+                            && packet.context != crate::packet::PATH_RESPONSE
+                        {
                             let block_rebroadcasts = false;
-                            let initial_timeout = now() + (rand::random::<f64>() * PATHFINDER_RW);
+                            let (initial_timeout, initial_retries) = if announce_from_local_client {
+                                (now(), PATHFINDER_R)
+                            } else {
+                                (now() + (rand::random::<f64>() * PATHFINDER_RW), 0)
+                            };
                             let announce_entry = vec![
                                 AnnounceEntryValue::Timestamp(now()),
                                 AnnounceEntryValue::RetransmitTimeout(initial_timeout),
-                                AnnounceEntryValue::Retries(0),
+                                AnnounceEntryValue::Retries(initial_retries),
                                 AnnounceEntryValue::ReceivedFrom(received_from),
                                 AnnounceEntryValue::Hops(packet.hops),
                                 AnnounceEntryValue::Packet(packet.clone()),
@@ -5243,34 +5262,24 @@ impl Transport {
                             }
                         }
 
-                        // ── Forward to non-local outbound interfaces (ALWAYS) ──
-                        // This runs regardless of whether local clients exist.
-                        // Bridges that only connect WAN interfaces (TCPClient to
-                        // rmap.world + PostInterface to PHP) must forward announces
-                        // to all outbound interfaces so the wider mesh learns paths.
-                        let local_names: std::collections::HashSet<String> = state
-                            .local_client_interfaces.iter().map(|i| i.name.clone()).collect();
-                        for iface in &state.interfaces {
-                            // interface.OUT gate (Python Transport parity):
-                            // never re-forward an announce down an interface
-                            // that is offline.  Same rule as the outbound()
-                            // broadcast gate — a down interface is skipped
-                            // entirely, stopping announce-spam to dead links
-                            // (RMap/Beleth/EtherWhisperer) that would
-                            // otherwise be sent-then-dropped downstream.
-                            if iface.out
-                                && iface.online
-                                && !local_names.contains(&iface.name)
-                                && packet.receiving_interface.as_deref() != Some(&iface.name)
-                            {
-                                crate::log(
-                                    &format!("[ANNOUNCE-FWD] forwarding announce dest={} to non-local iface={}",
-                                        crate::hexrep(destination_hash, false), iface.name),
-                                    crate::LOG_DEBUG, false, false,
-                                );
-                                deferred_outbound.push((iface.name.clone(), announce_raw.clone()));
-                            }
-                        }
+                        // There is deliberately nothing here that forwards the
+                        // announce to the other interfaces. Rebroadcast happens in
+                        // jobs(), from the announce table above, exactly as in
+                        // RNS/Transport.py — after the random window, at most
+                        // PATHFINDER_R retries, stopping early once neighbours are
+                        // heard rebroadcasting it, and never on a node that is not
+                        // a transport node.
+                        //
+                        // Until 2026-09 an `[ANNOUNCE-FWD]` block sat here and sent
+                        // every accepted announce to every other online interface
+                        // at once, on every node. It was not gated on
+                        // transport_enabled, so each client app with several
+                        // backbones configured relayed announces between them —
+                        // stamped HEADER_2 with its own identity as transport_id,
+                        // advertising itself as the next hop for destinations it
+                        // would never route. On transport nodes it doubled every
+                        // announce: once here, once from the table.
+                        // `announce_rebroadcast_tests` keeps it from coming back.
                     }
                 }
             }
@@ -8529,6 +8538,11 @@ mod tests {
         let result = Transport::inbound(announce_packet.raw.clone(), Some(local_iface_name.clone()));
         assert!(result, "ANNOUNCE from local client must be accepted");
 
+        // RNS/Transport.py: an announce from a local client goes into the
+        // announce table with retransmit_timeout = now — "announced
+        // immediately, but only one time" — and leaves on the next jobs() pass.
+        run_announce_rebroadcast_pass();
+
         // The WAN handler runs on the async writer actor thread
         // (register_outbound_handler spawns one), so the forwarded packet is
         // not necessarily captured synchronously when inbound() returns.
@@ -8543,7 +8557,7 @@ mod tests {
         assert!(
             forwarded_len > 0,
             "ANNOUNCE from local client '{}' must be forwarded to WAN '{}'. Got {} packets. \
-             Regression: [ANNOUNCE-FWD] removed or broken.",
+             Regression: a local client's announce no longer reaches the announce table.",
             local_iface_name, wan_iface_name, forwarded_len,
         );
 
@@ -8835,9 +8849,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn announce_reforward_skips_offline_interfaces() {
-        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    /// What the other interfaces saw of one announce arriving on a source
+    /// interface: at the moment inbound() returned, and after one rebroadcast
+    /// pass of jobs().
+    struct RebroadcastOutcome {
+        online_at_inbound: usize,
+        online_after_jobs: usize,
+        offline_after_jobs: usize,
+    }
+
+    /// Make every announce-table entry due and run one jobs() pass. The random
+    /// rebroadcast window (PATHFINDER_RW) is real in production; forcing it here
+    /// makes "after the pass" an event instead of a sleep.
+    fn run_announce_rebroadcast_pass() {
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announces_last_checked = 0.0;
+            for entry in state.announce_table.values_mut() {
+                if let Some(AnnounceEntryValue::RetransmitTimeout(t)) = entry.get_mut(IDX_AT_RTRNS_TMO) {
+                    *t = 0.0;
+                }
+            }
+        }
+        Transport::jobs();
+    }
+
+    fn announce_rebroadcast_scenario(transport_enabled: bool, source_is_local_client: bool) -> RebroadcastOutcome {
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
@@ -8845,11 +8882,10 @@ mod tests {
         let online_wan = "test-arf-online-wan";
         let offline_wan = "test-arf-offline-wan";
 
-        // Transport must be enabled with an identity for the re-forward path.
         {
             let mut state = TRANSPORT.lock().unwrap();
             state.identity = Some(Identity::new(true));
-            state.transport_enabled = true;
+            state.transport_enabled = transport_enabled;
             state.is_connected_to_shared_instance = false;
             state.announce_table.clear();
             state.packet_hashlist.clear();
@@ -8860,6 +8896,9 @@ mod tests {
         register_test_iface(src_iface, true, None);
         register_test_iface(online_wan, true, None);
         register_test_iface(offline_wan, false, None);
+        if source_is_local_client {
+            Transport::register_local_client_interface(src_iface);
+        }
 
         let captured_online: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_offline: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -8914,19 +8953,95 @@ mod tests {
 
         let accepted = Transport::inbound(announce_packet.raw.clone(), Some(src_iface.to_string()));
         assert!(accepted, "inbound announce must be accepted");
+        let online_at_inbound = captured_online.lock().unwrap().len();
 
-        assert!(
-            !captured_online.lock().unwrap().is_empty(),
-            "online WAN interface must receive the re-forwarded announce"
-        );
-        assert!(
-            captured_offline.lock().unwrap().is_empty(),
-            "offline WAN interface must NOT receive the re-forwarded announce (interface.OUT gate)"
-        );
+        run_announce_rebroadcast_pass();
+        let outcome = RebroadcastOutcome {
+            online_at_inbound,
+            online_after_jobs: captured_online.lock().unwrap().len(),
+            offline_after_jobs: captured_offline.lock().unwrap().len(),
+        };
 
         uninstall_sync_outbound_handler(online_wan);
         uninstall_sync_outbound_handler(offline_wan);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.local_client_interfaces.retain(|i| i.name != src_iface);
+            state.announce_table.clear();
+        }
         let _ = std::fs::remove_file(&ratchet_file);
+        outcome
+    }
+
+    /// A peer connected to a TCPServerInterface is an ordinary interface. In
+    /// RNS only LocalServerInterface — programs attached to this node's shared
+    /// instance — adds to `local_client_interfaces`. Registering TCP peers there
+    /// made outbound() skip them for untargeted announces, so a listener never
+    /// announced to its own peers, and handed any remote TCP peer a local
+    /// program's privileges. `tests/interop/run.sh` (direct topology) checks the
+    /// behaviour end to end; this keeps the call from being pasted back.
+    #[test]
+    fn tcp_server_peers_are_not_registered_as_local_clients() {
+        let source = include_str!("interfaces/tcp_interface.rs");
+        assert!(
+            !source.contains("register_local_client_interface("),
+            "tcp_interface.rs must not register its peers as local clients (RNS parity)"
+        );
+    }
+
+    // ── Reference conformance: announce rebroadcast ───────────────────────
+    //
+    // RNS/Transport.py rebroadcasts an announce from exactly one place — the
+    // announce table, in jobs() — and only `if transport_enabled() or
+    // from_local_client(packet)`. inbound() itself forwards to local clients
+    // and to nobody else.
+    mod announce_rebroadcast_tests {
+        use super::*;
+
+        #[test]
+        fn transport_node_rebroadcasts_from_the_table_not_from_inbound() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = announce_rebroadcast_scenario(true, false);
+            assert_eq!(
+                outcome.online_at_inbound, 0,
+                "inbound() must not forward an announce to other interfaces itself. \
+                 Regression: the [ANNOUNCE-FWD] block is back, and every announce now \
+                 leaves twice — once at once and uncapped, once from the table."
+            );
+            assert_eq!(outcome.online_after_jobs, 1, "the announce table rebroadcasts it, once per pass");
+        }
+
+        #[test]
+        fn rebroadcast_skips_offline_interfaces() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = announce_rebroadcast_scenario(true, false);
+            assert_eq!(outcome.online_after_jobs, 1, "online interface must receive the rebroadcast");
+            assert_eq!(outcome.offline_after_jobs, 0, "offline interface must not (interface.OUT gate)");
+        }
+
+        #[test]
+        fn node_without_transport_never_rebroadcasts() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = announce_rebroadcast_scenario(false, false);
+            assert_eq!(
+                (outcome.online_at_inbound, outcome.online_after_jobs), (0, 0),
+                "a node with transport disabled must never relay an announce between its \
+                 interfaces — a client app with several backbones is not a router, and must \
+                 not advertise itself as the next hop (RNS/Transport.py)"
+            );
+        }
+
+        #[test]
+        fn local_client_announce_is_rebroadcast_without_transport() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = announce_rebroadcast_scenario(false, true);
+            assert_eq!(outcome.online_at_inbound, 0, "still through the table, not from inbound()");
+            assert_eq!(
+                outcome.online_after_jobs, 1,
+                "an announce from a program attached to this instance is rebroadcast even with \
+                 transport disabled: `transport_enabled() or from_local_client(packet)`"
+            );
+        }
     }
 
     // ── Reference conformance: path requests for unknown destinations ─────
