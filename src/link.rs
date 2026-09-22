@@ -286,6 +286,21 @@ impl LinkHandle {
         self.id.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// A handle with no actor behind it, for unit tests that drive a `Link`
+    /// directly and only need callbacks to have *something* to hold.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(tx: mpsc::Sender<LinkMsg>, link_id: Vec<u8>) -> Self {
+        LinkHandle {
+            tx,
+            id: Arc::new(Mutex::new(link_id)),
+            token: Arc::new(()),
+            status_atomic: Arc::new(AtomicU8::new(STATE_ACTIVE)),
+            dest_hash: Arc::new(Vec::new()),
+            initiator: false,
+            cancelled_for_better_path: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Read-only snapshot of link state.
     pub fn snapshot(&self) -> Result<LinkSnapshot, LinkGone> {
         debug_assert!(
@@ -3670,7 +3685,13 @@ impl Link {
                 // LinkHandle methods (snapshot, send_packet, request, etc.) without
                 // deadlocking the actor on its own channel.
                 let link_handle = self.self_handle.as_ref().unwrap().clone();
-                let path_hex = crate::hexrep(&path_hash, false);
+                // The handler receives the PATH it was registered under, as in
+                // RNS/Link.py handle_request(): `response_generator(path, ...)`
+                // with `path = request_handler[0]`. Until 2026-09-22 this passed
+                // the hex of the path's hash instead, so a handler serving more
+                // than one path - rfed's stream opens decide by
+                // `path == "/propagation/stream/open"` - could never tell which
+                // one it was answering, and silently took its legacy branch.
                 let handler_path = handler.path.clone();
                 let request_id_c = request_id.clone();
                 let request_data_c = request_data.clone();
@@ -3681,7 +3702,7 @@ impl Link {
                 std::thread::spawn(move || {
                     let identity_ref = remote_identity_owned.as_ref();
                     let response = callback(
-                        &path_hex,
+                        &handler_path,
                         &request_data_c,
                         &request_id_c,
                         identity_ref,
@@ -4899,6 +4920,45 @@ mod tests {
              and silently dropped the ping — the exact regression we are guarding \
              against"
         );
+    }
+
+    /// RNS/Link.py handle_request(): the response generator receives the
+    /// registered path string. Drive a REQUEST straight into the handler and
+    /// capture what the callback was given.
+    #[test]
+    fn request_handler_receives_the_registered_path_not_its_hash() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(53)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let seen_cb = Arc::clone(&seen);
+        link.destination.lock().unwrap().register_request_handler(
+            "/propagation/stream/open".to_string(),
+            Some(Arc::new(move |path: &str, _d: &[u8], _r: &[u8], _i: Option<&Identity>, _l: Option<&LinkHandle>, _t: f64| {
+                *seen_cb.lock().unwrap() = Some(path.to_string());
+                vec![0xc3] // msgpack true
+            })),
+            crate::destination::ALLOW_ALL, None, false,
+        ).unwrap();
+        // Wire form of the request: [timestamp, path_hash, data]
+        let path_hash = identity::truncated_hash(b"/propagation/stream/open");
+        let mut plaintext = Vec::new();
+        rmpv_write_value(&mut plaintext, &rmpv::Value::Array(vec![
+            rmpv::Value::F64(0.0), rmpv::Value::Binary(path_hash), rmpv::Value::Nil,
+        ])).unwrap();
+        // The handler runs on a thread that is handed the link's actor
+        // handle; a bare test Link has none, so give it one the way
+        // LinkHandle::spawn does.
+        let (tx, _rx) = mpsc::channel();
+        link.self_handle = Some(LinkHandle::from_parts_for_test(tx, link.link_id.clone()));
+        link.handle_request_packet(vec![7; 16], &plaintext).unwrap();
+        // The callback runs on a spawned thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("/propagation/stream/open"),
+            "the handler must be told which path it is serving, as the reference does");
     }
 
     // ── Requests sent or answered as a Resource: the response clock ─────────
