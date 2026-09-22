@@ -1,0 +1,107 @@
+# Contract parity audit against Python RNS 1.5.2
+
+Started 2026-09-22 after 8fb4f70 (a request handler received the path *hash*
+instead of the registered path string) reached a deployed build. That defect
+was a contract error, not a wire error: every interop test passed while every
+multi-path request handler took the wrong branch. This audit is the systematic
+pass that should have preceded the "ready" call.
+
+Reference: upstream `markqvist/Reticulum` at tag `1.5.2` (2026-08-29). The
+workspace mirror `Reticulum-master` is 1.1.3 with local edits and is not the
+reference any more. The interop harness (`tests/interop/run.sh`) passes 16/16
+against 1.5.2, which proves the wire, not the contract.
+
+Each item: what Python does, what Rust did, verdict, and what was done. Line
+numbers are at 1.5.2 for Python and at 8fb4f70 for Rust.
+
+## A. Application contract (Destination / Link / Resource / Packet / Transport)
+
+| # | Item | Python 1.5.2 | Rust at 8fb4f70 | Verdict | Action |
+|---|------|--------------|-----------------|---------|--------|
+| A1 | Destination-level REQUEST dispatch | `Destination.receive` (Destination.py:415) never handles REQUEST; a DATA packet with any context reaches the packet callback. Requests exist only on links. | `destination.rs:732` intercepts REQUEST, dispatches with `hex(path_hash)` as the path, no remote identity, no link, and ignores `allow`. | Non-canonical path, and the same defect as 8fb4f70 still live here. | **Removed.** A DATA packet now reaches the packet callback whatever its context, as in Python. |
+| A2 | `Link.get_remote_identity()` | Returns the `Identity` or `None` (Link.py:646). | Returns `Some("remote_identity")`, a literal string (link.rs:2549). | Placeholder shipped as API. | **Fixed:** returns `Option<Identity>`. |
+| A3 | `resource_started` callback | Fired from `Resource.accept` once the incoming resource is registered (Resource.py:228). | Stored (link.rs:998) and never called. | Dead callback. | **Fixed:** fired after every successful `Resource::accept` on a link. |
+| A4 | ACCEPT_APP `resource` callback | `callbacks.resource(advertisement) -> bool` decides acceptance (Link.py:1106). | Accepts first, then calls `Fn(Arc<Mutex<Resource>>)`; the app cannot refuse (link.rs:3195). | Semantics inverted; LXMF-rust worked around it by cancelling after acceptance. | **Fixed:** callback is `Fn(&ResourceAdvertisement) -> bool`, consulted before acceptance. Callers in LXMF-rust and RFed-rust updated. |
+| A5 | Request progress | `RequestReceipt.progress` follows the response Resource; `progress` callback fires on every part (Link.py:1417). | One synthetic call with `progress = 0.1` right after send (link.rs:4047); never again. | Fabricated value. | **Fixed:** progress callback fires from the response Resource's progress; the synthetic 0.1 is gone. |
+| A6 | `RequestReceipt` shape | `status` (FAILED/SENT/DELIVERED/RECEIVING/READY), `response_size`, `response_transfer_size`, `metadata`, `started_at`, `concluded_at`, `get_status/get_response/get_response_time/concluded`. | `request_id`, `response`, `sent_at`, `received_at`, `progress` only. | Apps cannot branch on request state. | **Fixed:** fields and accessors added with Python's values and semantics. |
+| A7 | `Link.request(..., timeout, max_response_size)` | Per-request timeout; oversized responses rejected with `response_rejected()` → `failed` callback (Link.py:473, :1407). | Neither parameter (link.rs:3936). | Missing since 1.5.0. | **Fixed:** `request_with_options` takes both; `request` delegates with `None`. Oversized response advertisements are rejected and fail the request. |
+| A8 | `Destination.set_max_request_size` | Oversized inbound requests (packet or Resource) are ignored/rejected before the handler (Destination.py:369, Link.py:998,1037). | Absent. | Missing since 1.5.0. | **Fixed:** added and enforced on both request forms. |
+| A9 | `PacketReceipt` returned by `send()` | The same object Transport tracks; callbacks set afterwards take effect. | A by-value clone (packet.rs:312); `set_delivery_callback` on it is a no-op. Siblings call `Transport::set_receipt_delivery_callback` as a workaround. | Contract trap. | **Fixed:** receipt state is shared between the returned receipt and Transport's copy. The Transport shim remains. |
+| A10 | `teardown_reason` | `INITIATOR_CLOSED` / `DESTINATION_CLOSED` set on teardown and on a received LINKCLOSE (Link.py:662-681). | Only `TIMEOUT` ever set. | Closed callback cannot tell a timeout from a close. | **Fixed.** |
+| A11 | `link_closed` cancels resources | Every in-flight incoming and outgoing Resource is cancelled (Link.py:686). | Not cancelled; they resolve through their own watchdogs or never. | Missing. | **Fixed.** |
+| A12 | Keepalive watchdog | Wakes when `last_inbound` **or** `last_outbound` is older than keepalive (Link.py:749, e64d8150). | Inbound only (link.rs:690). | 1.5.x fix not carried; false STALE against a peer that only streams. | **Fixed.** |
+| A13 | Keepalive reply | 0xFE only if `now >= last_outbound + keepalive` (Link.py:1132). | Always replies. | Minor behavioural drift. | **Fixed.** |
+| A14 | LINKIDENTIFY | Accepted once; a second identify does not re-fire the callback (Link.py:990). Blackholed identities are torn down. | Re-identifies every time. No blackhole list exists in Rust. | Identify-once fixed; blackholing is a missing feature (see C). | **Fixed** (identify-once). |
+| A15 | Malformed resource advertisement | Any exception while handling RESOURCE_ADV tears the link down (Link.py:1080). | Ignored. | 1.5.x hardening. | **Fixed.** |
+| A16 | `Destination` with `identity=None` (inbound, non-PLAIN) | Mints an Identity and appends its hexhash as an aspect (Destination.py:160). | Returns `Err`. | Divergent construction. | **Fixed.** |
+| A17 | Link established callback set after establishment | Same in Python: never fires. Python avoids the race by taking the callback in the constructor. | Handle-based set after `spawn`; the race window is the link RTT. | Same semantics; Rust's construction shape makes the race reachable. | Open. Callers set callbacks immediately after `spawn`; documented here. |
+| A18 | `Transport::request_path` parameter order | `(hash, on_interface, tag, recursive)`. | `(hash, request_tag, attached_interface, requestor_transport_id, tag)`. | Rust-idiomatic, 30+ callers, types differ (interface name, not object). | Open by choice. Not a semantic difference. |
+| A19 | `deregister_announce_handler` | By handler object. | By aspect filter string; removes all with that filter; unfiltered handlers cannot be removed. | Divergent. | Open. No sibling deregisters today. |
+| A20 | Destinations self-register with Transport | `Destination.__init__` calls `Transport.register_destination`. | App must call it; Transport stores a snapshot by value. | Ownership model differs. | Open by choice; every sibling registers explicitly. |
+| A21 | `path_is_unresponsive` and `path_states` | Real table, marked from link establishment failures. | Hard-coded `false`. | Stub. | Open. No sibling reads it. |
+| A22 | `Resource.data` / `Resource.metadata` | File-like data; metadata unpacked. | `Vec<u8>` in memory; metadata raw length-prefixed msgpack. | Type-system departure. | Open by choice; large transfers are bounded by A8/A7 sizes. |
+| A23 | File-handle responses `[file, metadata]` | Streams a metadata-bearing Resource. | Not expressible. | Missing. | Open. |
+| A24 | `Link.get_channel` / Channel / Buffer | Present. | Placeholder. | Missing subsystem. | Open. No sibling uses channels. |
+| A25 | `register_request_handler(auto_compress)` | bool or int size threshold. | bool. | Minor. | Open. |
+| A26 | `set_default_app_data(callable)` | Callable evaluated per announce. | Bytes only. | Minor. | Open. |
+| A27 | Announce handler dispatch | `received_announce` 3/4/5-arg by arity; Rust always passes 5. | Equivalent. | Same. | None. |
+| A28 | Request handler signature | 5- or 6-arg by arity; Rust fixed 6-arg with `Option<&LinkHandle>`. Path is the registered string (8fb4f70). | Equivalent. | Same. | None (test `request_handler_receives_the_registered_path_not_its_hash`). |
+
+## B. Wire and protocol behaviour changed upstream between 1.1.3 and 1.5.2
+
+No packet type, context, header flag, or Link/Packet/Resource status constant
+changed. What changed is validation, timing, and routing policy.
+
+| # | Item | Python 1.5.2 | Rust at 8fb4f70 | Action |
+|---|------|--------------|-----------------|--------|
+| B1 | bz2 decompression bound | Incremental decompressor capped at 64 MiB; overflow → CORRUPT, cancel, link teardown (Resource.py:700, 09b0469f). | Unbounded `read_to_end`. | **Fixed.** |
+| B2 | `Resource.REJECTED` | `0x09` (was `0x00`, colliding with NONE). | Already `0x09`. | None. |
+| B3 | Receiver-side cancel | Receiver sends RESOURCE_RCL on cancel; CORRUPT also rejects and tears the link down (Resource.py:1096). | Receiver sends nothing. | **Fixed.** |
+| B4 | HMU wait term | Watchdog sleep gains `expected_hmu_wait_remaining = sdu*8*3.5/eifr` while waiting for an HMU or with no outstanding parts (Resource.py:613). | Absent; retries fire early into 1.5.2 senders. | **Fixed.** |
+| B5 | HMU handling | Processed only while `waiting_for_hmu`; an HMU with no hashes cancels (Resource.py:490,506). | Processed unconditionally. | **Fixed.** |
+| B6 | `request_next` window start | `consecutive_completed_height + 1`. | Already `+1`. | None. |
+| B6a | `HASHMAP_IS_EXHAUSTED` request form | The RESOURCE_REQ carrying `HASHMAP_IS_EXHAUSTED` always includes the last map hash, and the receiver sets `waiting_for_hmu` (Resource.py:942-990). | `prepare_request_next_data` sends the exhausted marker without the trailing map hash and without setting `waiting_for_hmu` when the last-hash index is out of range, and tests for "no hash" as four zero bytes rather than `None`. | Open: found during B4/B5; needs its own interop evidence (multi-segment hashmaps). |
+| B7 | Advertisement size check | `unpack` raises when `t > MAX_EFFICIENT_SIZE*3` (Resource.py:1374). | No check. | **Fixed.** |
+| B8 | Packet validation | `unpack` drops `hops >= 128`, malformed hash fields, zero-length data; `send()` refuses `hops >= 128` (Packet.py:250,292). | Length checks only. | **Fixed.** |
+| B9 | Tagless path requests | Protocol violation, dropped; tag truncated to 16 bytes; dedupe against current and previous tag sets; `max_pr_tags` 16000 with whole-generation rotation (Transport.py:1840, :195, :850). | Tagless requests for own destinations were answered ("some clients"); the JS and PHP clients both tag. FIFO eviction of 32000 tags. | **Fixed:** canonical drop, truncation, previous-generation dedupe and rotation. |
+| B10 | Announce validated before queueing | `len(raw) > MTU` → drop; bad signature → drop (Transport.py:1804). | Signature checked; no size gate. | **Fixed:** oversized announces dropped in `Transport::inbound` before validation. |
+| B11 | Announce queue limits | `MAX_QUEUED_ANNOUNCES` 4096, `QUEUED_ANNOUNCE_LIFE` 3 h. | 16384 and 24 h. | **Aligned.** |
+| B12 | TCP framing bounds | Frame accepted only if `HEADER_MINSIZE < len <= HW_MTU + ifac`; buffer reset above `2*HW_MTU`. | Both read loops used a placeholder `HEADER_MINSIZE = 2` and had no upper bound: stub frames and arbitrarily large frames reached `Transport::inbound`. | **Fixed** in both read loops (`check_frame_len`, `frame_buffer_exceeded`). |
+| B13 | `optimise_mtu` thresholds | `>=` at each boundary. | Seven of eleven boundaries were `>`; an interface exactly on a boundary (including the default 62 500 bps) landed a tier low or got no `hw_mtu`. | **Fixed.** Remaining: the reference's final `else` clears `HW_MTU`; Rust leaves the existing value. Open. |
+| B14 | Announce gravity (Transport.py:2229) | Duplicate announce on a higher-gravity interface replaces the path. | Absent. | Open: transport policy, per-interface `gravity` config. |
+| B15 | Link-request path rebalance (Transport.py:2701) | Transport node updates path hops from an in-transit link proof. | Absent. | Open: transport policy. |
+| B16 | `MODE_INTERNAL`, `announces_to/from_internal`, `BOUNDARY_SEARCH_MODES`, `recursive_prs` | New interface mode and PR search rules. | Absent. | Open: transport policy. The gateway runs `mode = gateway`, unaffected. |
+| B17 | Traffic-class inbound queues, ingress/egress retune, PR egress limiting | Bounded prioritised queues; new Hz estimator. | Different rate-control implementation. | Open: performance policy. |
+| B18 | Blackholing (`Reticulum.is_blackholed`) | Identities can be blackholed by config; announces and links from them are dropped. | Absent. | Open: missing feature. |
+| B19 | `local_hops_delta` | Off by default; rewrites hop byte on egress. | Absent. | Open: off by default upstream. |
+| B20 | `known_destinations` on-disk format | 5-tuple with `last_used`; `recall` marks in-use; pruning of unused entries. | Own format; no pruning by use. | Open: internal. |
+| B21 | Channel window check | Out-of-window envelopes rejected. | No Channel. | n/a (A24). |
+
+## C. How this was tested
+
+- `cargo test` (unit) after each area.
+- `tests/interop/run.sh` against Python 1.5.2 (the workspace `.venv` was upgraded from rns 1.3.8 to 1.5.2 and lxmf 1.0.1 to 1.1.1 on 2026-09-22): 16/16 before and after.
+- Staging network (`test-harnesses/staging`): chain check, `stage_browser.mjs`, flood.
+
+Staging observations on 2026-09-22, recorded because the first two stage runs
+failed before the third passed:
+
+- `stage_browser.mjs` had a race of its own: B sent to the distro address
+  before rfed's announce for it had given selectiv a path (the path from the
+  previous day's runs had expired). The stage now waits for B to see that
+  announce before sending.
+- In the first gateway instance of the day, four of rfed's seventeen startup
+  announces (among them `lxmf.propagation`) were received by the gateway but
+  never reached selectiv, so neither browser could open its propagation link
+  and the distro fan-out (which rfed intercepts on the propagation upload)
+  never happened. A fresh gateway instance relayed all seventeen, and the
+  stage passed. The first instance ran at notice level, so the rebroadcast
+  decision is not in its log; not reproduced since. Worth watching on the
+  production gateway (`GATEWAY_VERBOSE=1 staging.sh up` now runs the staging
+  gateway at debug level).
+
+## D. Remaining departures, by choice or deferred
+
+A17–A26 and B14–B20 above. The transport-policy items (B14–B17) are the next
+pass once the contract is settled; they change what a transport node
+rebroadcasts and how paths are chosen, and need their own staging evidence.

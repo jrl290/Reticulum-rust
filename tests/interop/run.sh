@@ -10,7 +10,8 @@
 # (which is also the regression test for LRRTT reaching the wire before the
 # established callback can send a request), one Resource window, and many.
 #
-# Needs the workspace venv (../.venv with `rns`). Exit 0 only if all pass.
+# Needs the workspace venv (../.venv with `rns` at the reference version,
+# 1.5.2 since 2026-09-22). Exit 0 only if all pass.
 set -u
 cd "$(dirname "$0")/../.."
 PY="${PYTHON:-../.venv/bin/python}"
