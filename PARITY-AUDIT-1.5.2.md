@@ -76,6 +76,7 @@ changed. What changed is validation, timing, and routing policy.
 | B19 | `local_hops_delta` | Off by default; rewrites hop byte on egress. | Absent. | Open: off by default upstream. |
 | B20 | `known_destinations` on-disk format | 5-tuple with `last_used`; `recall` marks in-use; pruning of unused entries. | Own format; no pruning by use. | Open: internal. |
 | B21 | Channel window check | Out-of-window envelopes rejected. | No Channel. | n/a (A24). |
+| B22 | Announces on interface state changes | None. A destination announces only when the application asks (LXMF: at start and on its own interval). Public transport nodes rate-limit announces per destination (`announce_rate_target/grace/penalty`, Transport.py:1782) and BLOCK a chatty destination. | `Transport::set_interface_online` re-announces every IN/SINGLE destination on each up-transition of any interface, and on every down-transition via all other interfaces (`transport.rs:1726`, `:1750`). The Android app (three TCP backbones) announced its lxmf.delivery 24 times in 40 min on 2026-09-22; the fcm bridge, in a TCP reconnect loop, 46×3 times in 35 min. | **Open — evidence gathered 2026-09-22 (section C).** rns.michmesh.net:7822 forwarded a fresh identity's first 7 announces (12 s apart) and blocked the 8th; forwarded none of the phone's four re-announces; forwarded the harness browser's first announce (3 hops) but not its second a minute later. A blocked direct copy leaves only copies that wander in via other backbones: the phone learned the browser at 7 hops and retichat.com learned the phone at 8, against rfed's 2–3 (it announces every 6 h). The down-transition re-announce is marked NEVER REMOVE by design; the up-transition one and the per-reconnect cadence are James's call. |
 
 ## C. How this was tested
 
@@ -108,8 +109,20 @@ failed before the third passed:
   production gateway (`GATEWAY_VERBOSE=1 staging.sh up` now runs the staging
   gateway at debug level).
 
+Announce rate limiting on public nodes, 2026-09-22 (B22): a passive rns 1.5.2
+client attached to rns.michmesh.net:7822 logged the wire hop count of every
+announce copy the node forwarded (`scratchpad mmobs/observe.py`, a wrapper on
+`Transport.inbound`). A second fresh client announced a new destination eight
+times, 12 s apart: copies 1–7 arrived at wire hops 1, the 8th never did. In
+the same window the phone re-announced four times (app relaunch + airplane
+toggle) and none arrived; the harness browser's first announce arrived at wire
+hops 3 (browser → retichat.com → gateway → node) and its second, 69 s later,
+did not. So the 7-hop path the phone held for the browser was not topology:
+the direct copies were being dropped at the node for announcing too often,
+and the copies that survived came round through the other backbones.
+
 ## D. Remaining departures, by choice or deferred
 
-A17–A26 and B14–B20 above. The transport-policy items (B14–B17) are the next
+A17–A26 and B14–B22 above. The transport-policy items (B14–B17) are the next
 pass once the contract is settled; they change what a transport node
 rebroadcasts and how paths are chosen, and need their own staging evidence.
