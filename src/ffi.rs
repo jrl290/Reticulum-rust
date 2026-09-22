@@ -705,7 +705,7 @@ pub fn receipt_get_rtt(receipt_handle: u64) -> Option<f64> {
 /// Get the receipt status: 0 = FAILED, 1 = SENT, 2 = DELIVERED.
 pub fn receipt_get_status(receipt_handle: u64) -> Option<u8> {
     let receipt: crate::packet::PacketReceipt = get_handle(receipt_handle)?;
-    Some(receipt.status)
+    Some(receipt.get_status())
 }
 
 /// Get the receipt's packet hash (for matching with Transport callbacks).

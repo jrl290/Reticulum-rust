@@ -258,27 +258,31 @@ impl Interface {
     }
 
     /// Optimize MTU based on bitrate
+    ///
+    /// RNS/Interfaces/Interface.py:250-262 — every boundary is `>=` in the
+    /// reference. Half of these were `>` here, which put an interface sitting
+    /// exactly on a boundary bitrate (e.g. the default 62500) one tier low.
     pub fn optimise_mtu(&mut self) {
         if self.autoconfigure_mtu {
             self.hw_mtu = Some(if self.bitrate >= 1_000_000_000 {
                 524288
-            } else if self.bitrate > 750_000_000 {
+            } else if self.bitrate >= 750_000_000 {
                 262144
-            } else if self.bitrate > 400_000_000 {
+            } else if self.bitrate >= 400_000_000 {
                 131072
-            } else if self.bitrate > 200_000_000 {
+            } else if self.bitrate >= 200_000_000 {
                 65536
             } else if self.bitrate >= 100_000_000 {
                 32768
-            } else if self.bitrate > 10_000_000 {
+            } else if self.bitrate >= 10_000_000 {
                 16384
-            } else if self.bitrate > 5_000_000 {
+            } else if self.bitrate >= 5_000_000 {
                 8192
-            } else if self.bitrate > 2_000_000 {
+            } else if self.bitrate >= 2_000_000 {
                 4096
             } else if self.bitrate >= 1_000_000 {
                 2048
-            } else if self.bitrate > 62_500 {
+            } else if self.bitrate >= 62_500 {
                 1024
             } else {
                 return; // Set to None for very low bitrates
@@ -505,6 +509,36 @@ mod tests {
         iface.bitrate = 1_000_000;
         iface.optimise_mtu();
         assert_eq!(iface.hw_mtu, Some(2048));
+    }
+
+    // RNS/Interfaces/Interface.py:250-262 — every tier boundary is `>=`.
+    // Exercises exactly the boundaries that used to be `>` here, so a
+    // regression to `>` drops each of them one tier.
+    #[test]
+    fn test_mtu_optimization_boundaries_are_inclusive() {
+        let mut iface = Interface::new();
+        iface.autoconfigure_mtu = true;
+
+        for (bitrate, expected) in [
+            (750_000_000u64, 262144usize),
+            (400_000_000, 131072),
+            (200_000_000, 65536),
+            (10_000_000, 16384),
+            (5_000_000, 8192),
+            (2_000_000, 4096),
+            (62_500, 1024),
+        ] {
+            iface.hw_mtu = None;
+            iface.bitrate = bitrate;
+            iface.optimise_mtu();
+            assert_eq!(
+                iface.hw_mtu,
+                Some(expected),
+                "a bitrate of exactly {} must land on the {} tier, not the one below it",
+                bitrate,
+                expected
+            );
+        }
     }
 
     #[test]

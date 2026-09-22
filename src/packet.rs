@@ -252,10 +252,18 @@ impl Packet {
 
     pub fn unpack(&mut self) -> bool {
         if self.raw.len() < 2 {
-            return false;
+            return Self::malformed("Truncated header");
         }
         self.flags = self.raw[0];
         self.hops = self.raw[1];
+
+        // RNS/Packet.py:249-250 — a hop count at or beyond the pathfinder
+        // maximum is not a packet we can ever process, so it is dropped
+        // here rather than carried into Transport.
+        if self.hops >= crate::transport::PATHFINDER_M {
+            return Self::malformed(&format!("Invalid hop count {}", self.hops));
+        }
+
         self.header_type = (self.flags & 0b0100_0000) >> 6;
         self.context_flag = (self.flags & 0b0010_0000) >> 5;
         self.transport_type = (self.flags & 0b0001_0000) >> 4;
@@ -271,16 +279,19 @@ impl Packet {
 
         let dst_len = reticulum::TRUNCATED_HASHLENGTH / 8;
         if self.header_type == HEADER_2 {
+            // RNS/Packet.py:267-268 — "Malformed Transport ID field" /
+            // "Malformed destination hash field".
             if self.raw.len() < 2 + dst_len * 2 + 1 {
-                return false;
+                return Self::malformed("Malformed destination hash field");
             }
             self.transport_id = Some(self.raw[2..2 + dst_len].to_vec());
             self.destination_hash = Some(self.raw[2 + dst_len..2 + dst_len * 2].to_vec());
             self.context = self.raw[2 + dst_len * 2];
             self.data = self.raw[2 + dst_len * 2 + 1..].to_vec();
         } else {
+            // RNS/Packet.py:274 — "Malformed destination hash field".
             if self.raw.len() < 2 + dst_len + 1 {
-                return false;
+                return Self::malformed("Malformed destination hash field");
             }
             self.transport_id = None;
             self.destination_hash = Some(self.raw[2..2 + dst_len].to_vec());
@@ -288,9 +299,27 @@ impl Packet {
             self.data = self.raw[2 + dst_len + 1..].to_vec();
         }
 
+        // RNS/Packet.py:276 — "Zero-length data field".
+        if self.data.is_empty() {
+            return Self::malformed("Zero-length data field");
+        }
+
         self.packed = false;
         self.update_hash();
         true
+    }
+
+    /// RNS/Packet.py:281-283 — one place where every `unpack` rejection is
+    /// logged and turned into a drop, so the log line reads the same as the
+    /// reference does.
+    fn malformed(reason: &str) -> bool {
+        log(
+            &format!("Received malformed packet, dropping it. The contained exception was: {}", reason),
+            crate::LOG_DEBUG,
+            false,
+            false,
+        );
+        false
     }
 
     pub fn send(&mut self) -> Result<Option<PacketReceipt>, String> {
@@ -300,6 +329,18 @@ impl Packet {
 
         if self.destination.is_none() {
             return Err("Packet has no destination".to_string());
+        }
+
+        // RNS/Packet.py:293 — `if self.hops >= RNS.Transport.PATHFINDER_M: return False`.
+        // Refuse to put a packet on the wire that no receiver would accept.
+        if self.hops >= crate::transport::PATHFINDER_M {
+            log(
+                &format!("Refusing to send packet with hop count {} at or beyond PATHFINDER_M", self.hops),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+            return Ok(None);
         }
 
         if !self.packed {
@@ -515,35 +556,52 @@ impl ProofDestination {
     }
 }
 
+type ReceiptCallback = Arc<dyn Fn(&PacketReceipt) + Send + Sync>;
+
+/// The mutable half of a receipt.
+///
+/// RNS/Packet.py `send` returns `self.receipt` — the very same object that
+/// `Transport.receipts` holds. Python gets that for free; here the receipt
+/// was a plain struct, so `Packet::send` handed the caller a by-value copy
+/// and `Transport` tracked a different one. A `set_delivery_callback` on the
+/// returned copy was set on an object nothing ever proved, and a
+/// `get_status()` on it read a status nothing ever advanced. Everything that
+/// mutates now lives behind one `Arc<Mutex<_>>`, so `Clone` shares it and
+/// the caller's receipt IS the tracked receipt.
+struct PacketReceiptInner {
+    sent: bool,
+    sent_at: f64,
+    proved: bool,
+    status: u8,
+    concluded_at: Option<f64>,
+    timeout: f64,
+    delivery_callback: Option<ReceiptCallback>,
+    timeout_callback: Option<ReceiptCallback>,
+}
+
 #[derive(Clone)]
 pub struct PacketReceipt {
     pub hash: Vec<u8>,
     pub truncated_hash: Vec<u8>,
-    pub sent: bool,
-    pub sent_at: f64,
-    pub proved: bool,
-    pub status: u8,
     pub destination: Destination,
-    pub concluded_at: Option<f64>,
-    pub timeout: f64,
-    pub delivery_callback: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
-    pub timeout_callback: Option<Arc<dyn Fn(&PacketReceipt) + Send + Sync>>,
+    inner: Arc<std::sync::Mutex<PacketReceiptInner>>,
 }
 
 impl std::fmt::Debug for PacketReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("PacketReceipt")
             .field("hash", &self.hash)
             .field("truncated_hash", &self.truncated_hash)
-            .field("sent", &self.sent)
-            .field("sent_at", &self.sent_at)
-            .field("proved", &self.proved)
-            .field("status", &self.status)
+            .field("sent", &inner.sent)
+            .field("sent_at", &inner.sent_at)
+            .field("proved", &inner.proved)
+            .field("status", &inner.status)
             .field("destination", &self.destination)
-            .field("concluded_at", &self.concluded_at)
-            .field("timeout", &self.timeout)
-            .field("delivery_callback", &self.delivery_callback.is_some())
-            .field("timeout_callback", &self.timeout_callback.is_some())
+            .field("concluded_at", &inner.concluded_at)
+            .field("timeout", &inner.timeout)
+            .field("delivery_callback", &inner.delivery_callback.is_some())
+            .field("timeout_callback", &inner.timeout_callback.is_some())
             .finish()
     }
 }
@@ -584,19 +642,75 @@ impl PacketReceipt {
         let hash = packet.get_hash();
         let truncated = packet.get_truncated_hash();
         let destination = packet.destination.clone().unwrap_or_default();
+        PacketReceipt::from_parts(hash, truncated, destination, timeout)
+    }
+
+    /// Build a receipt for a packet hash that is already known, without a
+    /// `Packet` to derive it from. The state starts exactly where
+    /// `new_with_timeout` leaves it: sent, unproved, SENT.
+    pub fn from_parts(
+        hash: Vec<u8>,
+        truncated_hash: Vec<u8>,
+        destination: Destination,
+        timeout: f64,
+    ) -> Self {
         PacketReceipt {
             hash,
-            truncated_hash: truncated,
-            sent: true,
-            sent_at: now_seconds(),
-            proved: false,
-            status: PacketReceipt::SENT,
+            truncated_hash,
             destination,
-            concluded_at: None,
-            timeout,
-            delivery_callback: None,
-            timeout_callback: None,
+            inner: Arc::new(std::sync::Mutex::new(PacketReceiptInner {
+                sent: true,
+                sent_at: now_seconds(),
+                proved: false,
+                status: PacketReceipt::SENT,
+                concluded_at: None,
+                timeout,
+                delivery_callback: None,
+                timeout_callback: None,
+            })),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PacketReceiptInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True when this receipt and `other` share the same tracked state —
+    /// i.e. one is a clone of the other rather than a look-alike copy.
+    pub fn shares_state_with(&self, other: &PacketReceipt) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    // ── Accessors for the state that moved behind the shared inner ──────
+    pub fn sent(&self) -> bool { self.lock().sent }
+    pub fn sent_at(&self) -> f64 { self.lock().sent_at }
+    pub fn proved(&self) -> bool { self.lock().proved }
+    pub fn status(&self) -> u8 { self.lock().status }
+    pub fn concluded_at(&self) -> Option<f64> { self.lock().concluded_at }
+    pub fn timeout(&self) -> f64 { self.lock().timeout }
+    pub fn has_delivery_callback(&self) -> bool { self.lock().delivery_callback.is_some() }
+    pub fn has_timeout_callback(&self) -> bool { self.lock().timeout_callback.is_some() }
+
+    pub fn set_sent(&self, sent: bool) { self.lock().sent = sent; }
+    pub fn set_sent_at(&self, sent_at: f64) { self.lock().sent_at = sent_at; }
+    pub fn set_proved(&self, proved: bool) { self.lock().proved = proved; }
+    pub fn set_status(&self, status: u8) { self.lock().status = status; }
+    pub fn set_concluded_at(&self, concluded_at: Option<f64>) { self.lock().concluded_at = concluded_at; }
+
+    /// Mark the receipt delivered and run the delivery callback.
+    ///
+    /// The inner lock is released before the callback runs: the callback is
+    /// handed `&PacketReceipt` and will typically call `get_status()` on it,
+    /// which would deadlock against a still-held guard.
+    fn mark_delivered(&self) {
+        let callback = {
+            let mut inner = self.lock();
+            inner.status = PacketReceipt::DELIVERED;
+            inner.proved = true;
+            inner.concluded_at = Some(now_seconds());
+            inner.delivery_callback.clone()
+        };
+        self.fire_delivery_callback(callback);
     }
 
     pub fn validate_proof(&mut self, proof: &[u8]) -> bool {
@@ -608,10 +722,7 @@ impl PacketReceipt {
                 if let Some(identity) = &self.destination.identity {
                     let valid = Self::validate_with_identity_variants(identity, signature, &self.hash);
                     if valid {
-                        self.status = PacketReceipt::DELIVERED;
-                        self.proved = true;
-                        self.concluded_at = Some(now_seconds());
-                        self.fire_delivery_callback();
+                        self.mark_delivered();
                         return true;
                     }
                 }
@@ -621,10 +732,7 @@ impl PacketReceipt {
             if let Some(identity) = &self.destination.identity {
                 let valid = Self::validate_with_identity_variants(identity, proof, &self.hash);
                 if valid {
-                    self.status = PacketReceipt::DELIVERED;
-                    self.proved = true;
-                    self.concluded_at = Some(now_seconds());
-                    self.fire_delivery_callback();
+                    self.mark_delivered();
                     return true;
                 }
             }
@@ -675,11 +783,8 @@ impl PacketReceipt {
                 // In full implementation: link.validate(signature, &self.hash)
                 // For now, use basic validation
                 if link.validate(signature, &self.hash).unwrap_or(false) {
-                    self.status = PacketReceipt::DELIVERED;
-                    self.proved = true;
-                    self.concluded_at = Some(now_seconds());
                     // link.last_proof = self.concluded_at
-                    self.fire_delivery_callback();
+                    self.mark_delivered();
                     return true;
                 }
             }
@@ -693,44 +798,57 @@ impl PacketReceipt {
     }
 
     pub fn is_timed_out(&self) -> bool {
-        self.sent_at + self.timeout < now_seconds()
+        let inner = self.lock();
+        inner.sent_at + inner.timeout < now_seconds()
     }
 
     pub fn check_timeout(&mut self) {
-        if self.status == PacketReceipt::SENT && self.is_timed_out() {
-            let age = now_seconds() - self.sent_at;
-            if self.timeout == -1.0 {
-                self.status = PacketReceipt::CULLED;
+        let timeout_callback = {
+            let mut inner = self.lock();
+            if inner.status != PacketReceipt::SENT {
+                return;
+            }
+            if inner.sent_at + inner.timeout >= now_seconds() {
+                return;
+            }
+            let age = now_seconds() - inner.sent_at;
+            if inner.timeout == -1.0 {
+                inner.status = PacketReceipt::CULLED;
             } else {
                 crate::log(&format!("Receipt TIMEOUT hash={} timeout={:.3}s age={:.3}s",
-                    crate::hexrep(&self.hash, false), self.timeout, age), crate::LOG_WARNING, false, false);
-                self.status = PacketReceipt::FAILED;
+                    crate::hexrep(&self.hash, false), inner.timeout, age), crate::LOG_WARNING, false, false);
+                inner.status = PacketReceipt::FAILED;
             }
-            self.concluded_at = Some(now_seconds());
-            
-            // Call timeout callback if set
-            if let Some(callback) = &self.timeout_callback {
-                // Spawn thread to avoid blocking
-                let cb = callback.clone();
-                let receipt_clone = self.clone();
-                std::thread::spawn(move || {
-                    cb(&receipt_clone);
-                });
-            }
+            inner.concluded_at = Some(now_seconds());
+            inner.timeout_callback.clone()
+        };
+
+        // Call timeout callback if set, with the inner lock released.
+        if let Some(cb) = timeout_callback {
+            // Spawn thread to avoid blocking
+            let receipt_clone = self.clone();
+            std::thread::spawn(move || {
+                cb(&receipt_clone);
+            });
         }
     }
 
     pub fn get_rtt(&self) -> Option<f64> {
-        self.concluded_at.map(|t| t - self.sent_at)
+        let inner = self.lock();
+        inner.concluded_at.map(|t| t - inner.sent_at)
     }
 
     pub fn get_status(&self) -> u8 {
-        self.status
+        self.lock().status
     }
 
-    /// Set a function that gets called when successful delivery is proven
-    pub fn set_delivery_callback(&mut self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
-        self.delivery_callback = Some(callback);
+    /// Set a function that gets called when successful delivery is proven.
+    ///
+    /// Takes `&self`: the receipt a caller got back from `Packet::send` is
+    /// the tracked receipt, so setting the callback on it is what makes it
+    /// fire. Callers holding a `mut` binding are unaffected.
+    pub fn set_delivery_callback(&self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
+        self.lock().delivery_callback = Some(callback);
     }
 
     /// Single, asserting entry-point for delivery-callback invocation.
@@ -738,23 +856,25 @@ impl PacketReceipt {
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
     /// Every "send proved" path in this file routes through here so the
     /// 5-second send-latency assertion runs at exactly one place.
-    fn fire_delivery_callback(&self) {
+    /// The callback is passed in by `mark_delivered`, which has already
+    /// released the inner lock — the callback re-enters this receipt.
+    fn fire_delivery_callback(&self, callback: Option<ReceiptCallback>) {
         crate::send_assertion::assert_send_completed_in_time(
-            "packet.receipt", self.sent_at,
+            "packet.receipt", self.sent_at(),
         );
-        if let Some(callback) = &self.delivery_callback {
+        if let Some(callback) = callback {
             callback(self);
         }
     }
 
     /// Set a function that gets called if delivery times out
-    pub fn set_timeout_callback(&mut self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
-        self.timeout_callback = Some(callback);
+    pub fn set_timeout_callback(&self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
+        self.lock().timeout_callback = Some(callback);
     }
 
     /// Set the timeout in seconds
-    pub fn set_timeout(&mut self, timeout: f64) {
-        self.timeout = timeout;
+    pub fn set_timeout(&self, timeout: f64) {
+        self.lock().timeout = timeout;
     }
 }
 
@@ -772,22 +892,107 @@ mod tests {
 
     fn make_receipt(identity: Identity) -> PacketReceipt {
         let hash = vec![0x42; 32];
-        PacketReceipt {
-            hash: hash.clone(),
-            truncated_hash: hash[..(reticulum::TRUNCATED_HASHLENGTH / 8)].to_vec(),
-            sent: true,
-            sent_at: 0.0,
-            proved: false,
-            status: PacketReceipt::SENT,
-            destination: Destination {
+        let receipt = PacketReceipt::from_parts(
+            hash.clone(),
+            hash[..(reticulum::TRUNCATED_HASHLENGTH / 8)].to_vec(),
+            Destination {
                 identity: Some(identity),
                 ..Destination::default()
             },
-            concluded_at: None,
-            timeout: 1.0,
-            delivery_callback: None,
-            timeout_callback: None,
-        }
+            1.0,
+        );
+        receipt.set_sent_at(0.0);
+        receipt
+    }
+
+    const DST_LEN: usize = reticulum::TRUNCATED_HASHLENGTH / 8;
+
+    /// A minimal well-formed HEADER_1 frame: flags, hops, destination hash,
+    /// context, then `data_len` bytes of data.
+    fn raw_header_1(hops: u8, data_len: usize) -> Vec<u8> {
+        let mut raw = vec![0u8, hops];
+        raw.extend_from_slice(&[0xAB; DST_LEN]);
+        raw.push(NONE);
+        raw.extend(std::iter::repeat(0x5Au8).take(data_len));
+        raw
+    }
+
+    fn unpack_raw(raw: Vec<u8>) -> (bool, Packet) {
+        let mut packet = Packet::new(None, Vec::new(), 0, 0, 0, HEADER_1, None, None, false, 0);
+        packet.raw = raw;
+        let ok = packet.unpack();
+        (ok, packet)
+    }
+
+    // RNS/Packet.py:249-250 — `if self.hops >= RNS.Transport.PATHFINDER_M:
+    // raise ValueError`, which unpack turns into a drop.
+    #[test]
+    fn unpack_drops_a_packet_at_the_pathfinder_hop_limit() {
+        let (ok, _) = unpack_raw(raw_header_1(crate::transport::PATHFINDER_M, 4));
+        assert!(
+            !ok,
+            "a hop count of PATHFINDER_M ({}) must be dropped in unpack — it is a packet no \
+             receiver can ever forward, and letting it through hands Transport a packet whose \
+             hop counter has already wrapped past the limit",
+            crate::transport::PATHFINDER_M
+        );
+    }
+
+    #[test]
+    fn unpack_accepts_one_hop_below_the_pathfinder_limit() {
+        let (ok, packet) = unpack_raw(raw_header_1(crate::transport::PATHFINDER_M - 1, 4));
+        assert!(ok, "127 hops is still a legal packet — the bound is `>=`, not `>`");
+        assert_eq!(packet.hops, crate::transport::PATHFINDER_M - 1);
+    }
+
+    // RNS/Packet.py:276 — "Zero-length data field".
+    #[test]
+    fn unpack_drops_a_zero_length_data_field() {
+        let (ok, _) = unpack_raw(raw_header_1(0, 0));
+        assert!(
+            !ok,
+            "a frame that ends at the context byte has no data field and must be dropped; \
+             without this check every downstream `data[0]` is reading a packet that carries \
+             nothing"
+        );
+    }
+
+    #[test]
+    fn unpack_accepts_a_minimal_valid_packet() {
+        let (ok, packet) = unpack_raw(raw_header_1(0, 1));
+        assert!(ok, "one byte of data is enough — the drop is for a *zero*-length field");
+        assert_eq!(packet.data, vec![0x5A]);
+        assert_eq!(packet.destination_hash.as_deref(), Some(&[0xABu8; DST_LEN][..]));
+        assert_eq!(packet.context, NONE);
+    }
+
+    // RNS/Packet.py:293 — `if self.hops >= RNS.Transport.PATHFINDER_M: return False`
+    #[test]
+    fn send_refuses_a_packet_at_the_pathfinder_hop_limit() {
+        let mut packet = Packet::new(
+            Some(Destination::default()),
+            vec![0x01, 0x02, 0x03],
+            DATA,
+            NONE,
+            0,
+            HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        packet.hops = crate::transport::PATHFINDER_M;
+
+        let result = packet.send().expect("send must not error");
+        assert!(result.is_none(), "no receipt is produced for a packet that was never sent");
+        assert!(!packet.sent, "and the packet is not marked sent");
+        assert!(
+            !packet.packed && packet.raw.is_empty(),
+            "send() must bail out BEFORE packing when hops >= PATHFINDER_M — the reference \
+             returns False on the very first line of send(). Regression: the gate is gone, \
+             this packet got packed, and on a node with a live interface it would now be on \
+             the wire for every receiver to drop in unpack()."
+        );
     }
 
     #[test]
@@ -806,8 +1011,8 @@ mod tests {
         proof.extend_from_slice(&signature);
 
         assert!(receipt.validate_proof(&proof));
-        assert_eq!(receipt.status, PacketReceipt::DELIVERED);
-        assert!(receipt.proved);
+        assert_eq!(receipt.status(), PacketReceipt::DELIVERED);
+        assert!(receipt.proved());
         assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
     }
 
@@ -821,7 +1026,7 @@ mod tests {
         invalid_proof.extend_from_slice(&signature);
 
         assert!(!receipt.validate_proof(&invalid_proof));
-        assert_eq!(receipt.status, PacketReceipt::SENT);
-        assert!(!receipt.proved);
+        assert_eq!(receipt.status(), PacketReceipt::SENT);
+        assert!(!receipt.proved());
     }
 }

@@ -37,8 +37,9 @@ pub const MDU: usize = MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE;
 pub const DEFAULT_PER_HOP_TIMEOUT: f64 = 6.0;
 
 pub const LINK_MTU_DISCOVERY: bool = true;
-pub const MAX_QUEUED_ANNOUNCES: usize = 16384;
-pub const QUEUED_ANNOUNCE_LIFE: f64 = 60.0 * 60.0 * 24.0;
+// RNS/Reticulum.py:111-112
+pub const MAX_QUEUED_ANNOUNCES: usize = 4096;
+pub const QUEUED_ANNOUNCE_LIFE: f64 = 60.0 * 60.0 * 3.0;
 pub const ANNOUNCE_CAP: f64 = 2.0;
 pub const MINIMUM_BITRATE: u64 = 5;
 
@@ -2460,5 +2461,20 @@ fn from_hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RNS/Reticulum.py:111-112. These two bound the announce queue an
+    // interface builds up while it is inside its announce cap window, and
+    // they were 4x and 8x the reference respectively — a slow interface held
+    // 16384 announces for a day instead of 4096 for three hours.
+    #[test]
+    fn queued_announce_constants_match_the_reference() {
+        assert_eq!(MAX_QUEUED_ANNOUNCES, 4096, "RNS/Reticulum.py:111");
+        assert_eq!(QUEUED_ANNOUNCE_LIFE, 60.0 * 60.0 * 3.0, "RNS/Reticulum.py:112");
     }
 }

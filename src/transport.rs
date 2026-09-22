@@ -435,6 +435,11 @@ pub struct TransportState {
     /// to avoid an O(n) linear scan per inbound path-request packet, which
     /// previously starved the Transport mutex under path-request floods.
     pub discovery_pr_tags_set: HashSet<Vec<u8>>,
+    /// RNS/Transport.py:194 `discovery_pr_tags_prev` — the generation of tags
+    /// that was current before the last rotation. A tag stays suppressed for
+    /// one extra full generation, so a rotation can never re-open the door to
+    /// a path request that was already answered.
+    pub discovery_pr_tags_prev: HashSet<Vec<u8>>,
     pub max_pr_tags: usize,
     pub control_destinations: Vec<Destination>,
     pub control_hashes: Vec<Vec<u8>>,
@@ -814,7 +819,8 @@ impl<T> FastMutex<T> {
 }
 
 pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| FastMutex::new(TransportState {
-    max_pr_tags: 32000,
+    // RNS/Transport.py:195
+    max_pr_tags: 16000,
     hashlist_maxsize: 1_000_000,
     job_interval: 0.250,
     links_check_interval: 1.0,
@@ -923,7 +929,7 @@ impl Transport {
         for receipt in state.receipts.iter_mut() {
             if receipt.hash == receipt_hash {
                 receipt.set_delivery_callback(callback.clone());
-                if receipt.status == crate::packet::PacketReceipt::DELIVERED {
+                if receipt.status() == crate::packet::PacketReceipt::DELIVERED {
                     immediate = Some(receipt.clone());
                 }
                 break;
@@ -945,8 +951,8 @@ impl Transport {
         for receipt in state.receipts.iter_mut() {
             if receipt.hash == receipt_hash {
                 receipt.set_timeout_callback(callback.clone());
-                if receipt.status == crate::packet::PacketReceipt::FAILED
-                    || receipt.status == crate::packet::PacketReceipt::CULLED
+                if receipt.status() == crate::packet::PacketReceipt::FAILED
+                    || receipt.status() == crate::packet::PacketReceipt::CULLED
                 {
                     immediate = Some(receipt.clone());
                 }
@@ -1022,11 +1028,11 @@ impl Transport {
         if let Ok(mut state) = TRANSPORT.lock() {
             for receipt in state.receipts.iter_mut() {
                 if receipt.hash == receipt_hash {
-                    if delivery_callback.is_some() {
-                        receipt.delivery_callback = delivery_callback;
+                    if let Some(callback) = delivery_callback {
+                        receipt.set_delivery_callback(callback);
                     }
-                    if timeout_callback.is_some() {
-                        receipt.timeout_callback = timeout_callback;
+                    if let Some(callback) = timeout_callback {
+                        receipt.set_timeout_callback(callback);
                     }
                     return true;
                 }
@@ -1885,57 +1891,67 @@ impl Transport {
         
         let is_from_local_client = Transport::from_local_client(packet);
 
-        // If the requested destination is one of ours, always respond —
-        // even if the request has no tag (tagless format used by some clients).
-        // For all other cases, use the tag to deduplicate relay responses.
-        let is_own_dest = {
-            let state = TRANSPORT.lock().unwrap();
-            state.destinations.iter().any(|d| d.hash == destination_hash)
+        // RNS/Transport.py:1838-1840 — a path request without a tag is a
+        // protocol violation, full stop. There is no "tagless format used by
+        // some clients" exemption in the reference, and there was no
+        // exemption for our own destinations either: a tagless request is
+        // the one shape of request that cannot be deduplicated, so answering
+        // it turns every replay into another announce off this node.
+        let tag_bytes = match tag_bytes {
+            Some(tag) => tag,
+            None => {
+                crate::log(
+                    &format!(
+                        "Ignoring tagless path request for {}",
+                        crate::hexrep(destination_hash, true)
+                    ),
+                    crate::LOG_DEBUG,
+                    false,
+                    false,
+                );
+                return;
+            }
         };
-        if is_own_dest {
+
+        // RNS/Transport.py:1847-1858 — destination_hash + tag is the only
+        // loop suppression path requests have. It is checked against the
+        // current generation of tags AND the previous one, so a rotation
+        // cannot re-open a request that was already answered.
+        let unique_tag = [destination_hash, tag_bytes.as_slice()].concat();
+        let is_new = {
+            let mut state = TRANSPORT.lock().unwrap();
+            if state.discovery_pr_tags_prev.contains(&unique_tag) {
+                false
+            } else if state.discovery_pr_tags_set.insert(unique_tag.clone()) {
+                state.discovery_pr_tags.push(unique_tag);
+                true
+            } else {
+                false
+            }
+        };
+        if !is_new {
             crate::log(
                 &format!(
-                    "[PR-SELF] iface={} dst={} hops={}",
-                    packet.receiving_interface.as_deref().unwrap_or("?"),
-                    crate::hexrep(&destination_hash[..destination_hash.len().min(4)], false),
-                    packet.hops
+                    "Ignoring duplicate path request for {}",
+                    crate::hexrep(destination_hash, true)
                 ),
-                crate::LOG_NOTICE,
+                crate::LOG_EXTREME,
                 false,
                 false,
-            );
-            Transport::path_request(
-                destination_hash.to_vec(),
-                is_from_local_client,
-                packet.receiving_interface.clone(),
-                requesting_transport_instance.map(|b| b.to_vec()),
-                tag_bytes,
             );
             return;
         }
 
-        if let Some(tag_bytes) = tag_bytes {
-            let unique_tag = [destination_hash, tag_bytes.as_slice()].concat();
-            let is_new = {
-                let mut state = TRANSPORT.lock().unwrap();
-                if state.discovery_pr_tags_set.insert(unique_tag.clone()) {
-                    state.discovery_pr_tags.push(unique_tag);
-                    true
-                } else {
-                    false
-                }
-            };
-            if is_new {
-                Transport::path_request(
-                    destination_hash.to_vec(),
-                    is_from_local_client,
-                    packet.receiving_interface.clone(),
-                    requesting_transport_instance.map(|b| b.to_vec()),
-                    Some(tag_bytes),
-                );
-            }
-        }
-        // tagless path requests for non-owned destinations: nothing to do
+        // Own destinations are answered from inside `path_request` (the
+        // `local_dest_index` branch), reached through this same tagged,
+        // deduplicated path as every other request.
+        Transport::path_request(
+            destination_hash.to_vec(),
+            is_from_local_client,
+            packet.receiving_interface.clone(),
+            requesting_transport_instance.map(|b| b.to_vec()),
+            Some(tag_bytes),
+        );
     }
     
     fn from_local_client(packet: &Packet) -> bool {
@@ -2904,13 +2920,14 @@ impl Transport {
             state.pending_prs_last_checked = now();
         }
 
+        // RNS/Transport.py:850-853 — the tag table is rotated a whole
+        // generation at a time, not evicted oldest-first. A FIFO eviction
+        // dropped the oldest tags outright, so a path request replayed just
+        // after an eviction was answered a second time; keeping the previous
+        // generation around closes that window.
         if state.discovery_pr_tags.len() > state.max_pr_tags {
-            let keep_from = state.discovery_pr_tags.len().saturating_sub(state.max_pr_tags);
-            // Drain evicted entries and remove them from the lookup set as well.
-            let evicted: Vec<Vec<u8>> = state.discovery_pr_tags.drain(..keep_from).collect();
-            for tag in &evicted {
-                state.discovery_pr_tags_set.remove(tag);
-            }
+            state.discovery_pr_tags_prev = std::mem::take(&mut state.discovery_pr_tags_set);
+            state.discovery_pr_tags.clear();
         }
 
         if now() > state.cache_last_cleaned + state.cache_clean_interval {
@@ -4714,6 +4731,24 @@ impl Transport {
                 }
             }
         }
+        // RNS/Transport.py:1805 — an announce frame larger than Reticulum.MTU
+        // is a protocol violation and is dropped before any validation work is
+        // spent on it. Signature validation over an oversized announce is
+        // exactly the work an attacker wants us to do.
+        if packet.packet_type == ANNOUNCE && packet.raw.len() > crate::reticulum::MTU {
+            crate::log(
+                &format!(
+                    "Excessive announce packet frame size of {} bytes on {}, dropping it",
+                    packet.raw.len(),
+                    packet.receiving_interface.as_deref().unwrap_or("?")
+                ),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+            return false;
+        }
+
         // Early-drop: when drop_announces is enabled, silently discard
         // announce packets before any logging or processing. Two exceptions
         // always pass through:
@@ -6076,7 +6111,7 @@ impl Transport {
                                 proof_hash_hex, receipt_count), LOG_WARNING, false, false);
                             // Log all receipt hashes for debugging
                             for r in &state.receipts {
-                                log(&format!("  receipt hash={} status={}", crate::hexrep(&r.hash, false), r.status), LOG_DEBUG, false, false);
+                                log(&format!("  receipt hash={} status={}", crate::hexrep(&r.hash, false), r.status()), LOG_DEBUG, false, false);
                             }
                         }
                     }
@@ -6498,19 +6533,16 @@ mod tests {
 
     fn make_receipt(hash_byte: u8, status: u8) -> crate::packet::PacketReceipt {
         let hash = vec![hash_byte; 32];
-        crate::packet::PacketReceipt {
-            hash: hash.clone(),
-            truncated_hash: hash[..(crate::reticulum::TRUNCATED_HASHLENGTH / 8)].to_vec(),
-            sent: true,
-            sent_at: 0.0,
-            proved: status == crate::packet::PacketReceipt::DELIVERED,
-            status,
-            destination: Destination::default(),
-            concluded_at: None,
-            timeout: 1.0,
-            delivery_callback: None,
-            timeout_callback: None,
-        }
+        let receipt = crate::packet::PacketReceipt::from_parts(
+            hash.clone(),
+            hash[..(crate::reticulum::TRUNCATED_HASHLENGTH / 8)].to_vec(),
+            Destination::default(),
+            1.0,
+        );
+        receipt.set_sent_at(0.0);
+        receipt.set_status(status);
+        receipt.set_proved(status == crate::packet::PacketReceipt::DELIVERED);
+        receipt
     }
 
     #[test]
@@ -6673,7 +6705,7 @@ mod tests {
             .iter()
             .find(|r| r.hash == receipt.hash)
             .expect("receipt should exist");
-        assert_eq!(updated.status, crate::packet::PacketReceipt::DELIVERED);
+        assert_eq!(updated.status(), crate::packet::PacketReceipt::DELIVERED);
         assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
     }
 
@@ -6736,7 +6768,7 @@ mod tests {
             .iter()
             .find(|r| r.hash == receipt.hash)
             .expect("receipt should exist");
-        assert_eq!(updated.status, crate::packet::PacketReceipt::SENT);
+        assert_eq!(updated.status(), crate::packet::PacketReceipt::SENT);
         assert_eq!(callback_hits.load(Ordering::SeqCst), 0);
     }
 
@@ -6826,7 +6858,7 @@ mod tests {
             .iter()
             .find(|r| r.hash == receipt.hash)
             .expect("receipt should exist");
-        assert_eq!(updated.status, crate::packet::PacketReceipt::DELIVERED);
+        assert_eq!(updated.status(), crate::packet::PacketReceipt::DELIVERED);
         assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
         drop(runtime_link_handle);
     }
@@ -9574,4 +9606,469 @@ mod tests {
             );
         }
     }
+
+    // ── Reference conformance: inbound path requests must carry a tag ─────
+    //
+    // RNS/Transport.py:1838-1858. A path request without a tag is a protocol
+    // violation and is ignored — including one for a destination we own. The
+    // tag is what makes a path request deduplicable; without it every replay
+    // of the same request pulls another announce out of this node.
+    mod tagged_path_request_tests {
+        use super::*;
+
+        const PR_IFACE: &str = "tpr-iface";
+        const HASH_LEN: usize = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+
+        struct Fixture {
+            captured: Arc<Mutex<Vec<Vec<u8>>>>,
+            own_hash: Vec<u8>,
+            saved_interfaces: Vec<InterfaceStub>,
+            saved_destinations: Vec<Destination>,
+            saved_tags: Vec<Vec<u8>>,
+            saved_tags_set: HashSet<Vec<u8>>,
+            saved_tags_prev: HashSet<Vec<u8>>,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let own = Destination::new_inbound(
+                    None,
+                    crate::destination::DestinationType::Single,
+                    "tprtest".to_string(),
+                    vec!["own".to_string()],
+                )
+                .expect("own destination");
+                let own_hash = own.hash.clone();
+
+                let mut state = TRANSPORT.lock().unwrap();
+                let saved_interfaces = std::mem::take(&mut state.interfaces);
+                let saved_destinations = std::mem::take(&mut state.destinations);
+                let saved_tags = std::mem::take(&mut state.discovery_pr_tags);
+                let saved_tags_set = std::mem::take(&mut state.discovery_pr_tags_set);
+                let saved_tags_prev = std::mem::take(&mut state.discovery_pr_tags_prev);
+
+                let mut stub = InterfaceStub::default();
+                stub.name = PR_IFACE.to_string();
+                stub.out = true;
+                stub.online = true;
+                stub.mode = InterfaceStub::MODE_FULL;
+                stub.bitrate = Some(1_000_000.0);
+                stub.announce_cap = crate::reticulum::ANNOUNCE_CAP / 100.0;
+                state.interfaces.push(stub);
+                state.destinations.push(own);
+                drop(state);
+
+                install_sync_outbound_handler(PR_IFACE, captured.clone());
+                Fixture {
+                    captured,
+                    own_hash,
+                    saved_interfaces,
+                    saved_destinations,
+                    saved_tags,
+                    saved_tags_set,
+                    saved_tags_prev,
+                }
+            }
+
+            /// Deliver a path request with this exact data field, as if it had
+            /// arrived on PR_IFACE.
+            fn deliver(&self, data: &[u8]) {
+                let mut packet = Packet::new(
+                    None,
+                    data.to_vec(),
+                    DATA,
+                    crate::packet::NONE,
+                    BROADCAST,
+                    crate::packet::HEADER_1,
+                    None,
+                    None,
+                    false,
+                    0,
+                );
+                packet.receiving_interface = Some(PR_IFACE.to_string());
+                Transport::path_request_handler(data, &packet);
+            }
+
+            /// How many frames carrying our own destination hash left the wire.
+            fn answers(&self) -> usize {
+                let own = &self.own_hash;
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|raw| raw.windows(own.len()).any(|w| w == own.as_slice()))
+                    .count()
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                uninstall_sync_outbound_handler(PR_IFACE);
+                if let Ok(mut state) = TRANSPORT.lock() {
+                    state.interfaces = std::mem::take(&mut self.saved_interfaces);
+                    state.destinations = std::mem::take(&mut self.saved_destinations);
+                    state.discovery_pr_tags = std::mem::take(&mut self.saved_tags);
+                    state.discovery_pr_tags_set = std::mem::take(&mut self.saved_tags_set);
+                    state.discovery_pr_tags_prev = std::mem::take(&mut self.saved_tags_prev);
+                }
+            }
+        }
+
+        #[test]
+        fn tagless_request_for_an_own_destination_is_not_answered() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new();
+
+            fixture.deliver(&fixture.own_hash.clone());
+
+            assert_eq!(
+                fixture.answers(), 0,
+                "RNS/Transport.py:1838-1840 ignores a tagless path request outright. The \
+                 'always respond for our own destinations' tolerance is a replay amplifier: \
+                 a tagless request cannot be deduplicated, so every repeat pulls another \
+                 announce out of this node. Regression: the tolerance is back."
+            );
+        }
+
+        #[test]
+        fn tagged_request_for_an_own_destination_is_answered() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new();
+
+            let mut data = fixture.own_hash.clone();
+            data.extend_from_slice(&Identity::get_random_hash());
+            fixture.deliver(&data);
+
+            assert_eq!(
+                fixture.answers(), 1,
+                "own destinations are still answered — through the tagged, deduplicated path"
+            );
+        }
+
+        #[test]
+        fn the_same_tag_is_answered_only_once() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new();
+
+            let mut data = fixture.own_hash.clone();
+            data.extend_from_slice(&Identity::get_random_hash());
+            fixture.deliver(&data);
+            fixture.deliver(&data);
+
+            assert_eq!(
+                fixture.answers(), 1,
+                "destination_hash + tag is checked against discovery_pr_tags before answering \
+                 (RNS/Transport.py:1847-1858); the second copy must be dropped"
+            );
+        }
+
+        #[test]
+        fn an_oversized_tag_is_truncated_to_sixteen_bytes_and_dedupes() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new();
+
+            let transport_id = Identity::get_random_hash();
+            let long_tag: Vec<u8> = (0u8..20).collect();
+
+            // destination_hash + transport instance id + a 20-byte tag
+            let mut long = fixture.own_hash.clone();
+            long.extend_from_slice(&transport_id);
+            long.extend_from_slice(&long_tag);
+            fixture.deliver(&long);
+            assert_eq!(fixture.answers(), 1, "the first request is answered");
+
+            // The same request carrying only the first 16 bytes of that tag
+            // must collide with the truncated form already recorded.
+            let mut short = fixture.own_hash.clone();
+            short.extend_from_slice(&transport_id);
+            short.extend_from_slice(&long_tag[..HASH_LEN]);
+            fixture.deliver(&short);
+
+            assert_eq!(
+                fixture.answers(), 1,
+                "RNS/Transport.py:1855-1856 truncates a tag longer than \
+                 TRUNCATED_HASHLENGTH//8 before building the unique tag, so a 20-byte tag and \
+                 its 16-byte prefix are the same request. Regression: the tag is being used \
+                 untruncated and dedup no longer catches the pair."
+            );
+        }
+
+        #[test]
+        fn the_previous_tag_generation_still_suppresses() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new();
+
+            let mut data = fixture.own_hash.clone();
+            data.extend_from_slice(&Identity::get_random_hash());
+            fixture.deliver(&data);
+            assert_eq!(fixture.answers(), 1);
+
+            // Rotate the tag table exactly as the job loop does once the
+            // current generation passes max_pr_tags (RNS/Transport.py:850-853).
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                state.discovery_pr_tags_prev = std::mem::take(&mut state.discovery_pr_tags_set);
+                state.discovery_pr_tags.clear();
+            }
+
+            fixture.deliver(&data);
+            assert_eq!(
+                fixture.answers(), 1,
+                "a rotation must not re-open a request that was already answered — that is \
+                 what discovery_pr_tags_prev is for (RNS/Transport.py:1850)"
+            );
+        }
+    }
+
+
+    // ── Reference conformance: the announce size gate ─────────────────────
+    //
+    // RNS/Transport.py:1805 — an announce frame larger than Reticulum.MTU is
+    // a protocol violation and is dropped BEFORE its signature is validated.
+    // Without the gate an attacker gets to pick how much Ed25519 work this
+    // node does per frame.
+    mod announce_size_gate_tests {
+        use super::*;
+
+        const GATE_IFACE: &str = "asg-iface";
+
+        /// A structurally valid, correctly signed SINGLE announce whose
+        /// app_data is `app_data_len` bytes. Assembled by hand rather than
+        /// through `Packet::pack`, which refuses to build a frame over MTU —
+        /// only an attacker's frame gets to be this big, and that is exactly
+        /// the frame under test.
+        fn signed_announce(app_data_len: usize) -> (Vec<u8>, Vec<u8>) {
+            let identity = Identity::new(true);
+            let destination = Destination::new_inbound(
+                Some(identity.clone()),
+                DestinationType::Single,
+                "asgtest".to_string(),
+                vec!["announce".to_string()],
+            )
+            .expect("announce destination");
+            let public_key = identity.get_public_key().expect("pubkey");
+            let random_hash = [0x3Cu8; 10];
+            let app_data: Vec<u8> = std::iter::repeat(0x6Bu8).take(app_data_len).collect();
+
+            let mut signed_data = Vec::new();
+            signed_data.extend_from_slice(&destination.hash);
+            signed_data.extend_from_slice(&public_key);
+            signed_data.extend_from_slice(&destination.name_hash);
+            signed_data.extend_from_slice(&random_hash);
+            signed_data.extend_from_slice(&app_data);
+            let signature = identity.sign(&signed_data);
+
+            let mut announce_data = Vec::new();
+            announce_data.extend_from_slice(&public_key);
+            announce_data.extend_from_slice(&destination.name_hash);
+            announce_data.extend_from_slice(&random_hash);
+            announce_data.extend_from_slice(&signature);
+            announce_data.extend_from_slice(&app_data);
+
+            let flags = (crate::packet::HEADER_1 << 6)
+                | (crate::packet::FLAG_UNSET << 5)
+                | (BROADCAST << 4)
+                | ((DestinationType::Single as u8) << 2)
+                | ANNOUNCE;
+            let mut raw = vec![flags, 0u8];
+            raw.extend_from_slice(&destination.hash);
+            raw.push(crate::packet::NONE);
+            raw.extend_from_slice(&announce_data);
+
+            (raw, destination.hash.clone())
+        }
+
+        fn deliver(raw: Vec<u8>) -> bool {
+            Transport::inbound(raw, Some(GATE_IFACE.to_string()))
+        }
+
+        fn fresh_state() -> (ReceiptStateRestore, InterfacesRestore) {
+            let restore = ReceiptStateRestore::new();
+            let ifaces = InterfacesRestore::new();
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                state.identity = Some(Identity::new(true));
+                state.transport_enabled = false;
+                state.drop_announces = false;
+                state.announce_table.clear();
+            }
+            register_test_iface(GATE_IFACE, true, None);
+            (restore, ifaces)
+        }
+
+        #[test]
+        fn an_announce_within_the_mtu_is_processed() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let _state = fresh_state();
+
+            let (raw, dest_hash) = signed_announce(100);
+            assert!(raw.len() <= crate::reticulum::MTU, "control frame must be inside the MTU");
+
+            assert!(deliver(raw), "a valid announce inside the MTU is accepted");
+            let known = {
+                let state = TRANSPORT.lock().unwrap();
+                state.path_table.contains_key(&dest_hash)
+            };
+            assert!(known, "and its path is learned");
+            TRANSPORT.lock().unwrap().path_table.remove(&dest_hash);
+        }
+
+        #[test]
+        fn an_announce_over_the_mtu_is_dropped_before_validation() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let _state = fresh_state();
+
+            let (raw, dest_hash) = signed_announce(400);
+            assert!(
+                raw.len() > crate::reticulum::MTU,
+                "the frame under test must exceed Reticulum.MTU, got {}",
+                raw.len()
+            );
+
+            let accepted = deliver(raw);
+            let known = {
+                let state = TRANSPORT.lock().unwrap();
+                state.path_table.contains_key(&dest_hash)
+            };
+            TRANSPORT.lock().unwrap().path_table.remove(&dest_hash);
+
+            assert!(
+                !accepted && !known,
+                "RNS/Transport.py:1805 drops an announce frame larger than Reticulum.MTU ({} \
+                 bytes) before spending any signature validation on it. This announce is \
+                 perfectly well-signed — only its size disqualifies it. Regression: the gate \
+                 is gone and frame size is again an attacker-chosen multiplier on this node's \
+                 Ed25519 work.",
+                crate::reticulum::MTU
+            );
+        }
+    }
+
+    // ── Reference conformance: the receipt is ONE object ──────────────────
+    //
+    // RNS/Packet.py `send` returns `self.receipt` — the same object
+    // `Transport.receipts` tracks. A by-value copy silently drops every
+    // callback the caller registers and never advances the caller's status.
+    mod shared_receipt_tests {
+        use super::*;
+
+        const RCPT_IFACE: &str = "rcpt-iface";
+
+        #[test]
+        fn callback_set_on_the_receipt_from_send_fires_when_transport_proves_it() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let _restore = ReceiptStateRestore::new();
+            let _ifaces = InterfacesRestore::new();
+
+            let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            register_test_iface(RCPT_IFACE, true, None);
+            install_sync_outbound_handler(RCPT_IFACE, captured.clone());
+
+            let identity = Identity::new(true);
+            let destination = Destination::new_outbound(
+                Some(identity.clone()),
+                DestinationType::Single,
+                "rcpttest".to_string(),
+                vec!["delivery".to_string()],
+            )
+            .expect("outbound destination");
+
+            let mut packet = Packet::new(
+                Some(destination),
+                b"receipt sharing".to_vec(),
+                DATA,
+                crate::packet::NONE,
+                BROADCAST,
+                crate::packet::HEADER_1,
+                None,
+                Some(RCPT_IFACE.to_string()),
+                true, // create_receipt
+                0,
+            );
+
+            let returned = packet
+                .send()
+                .expect("send must not error")
+                .expect("a DATA packet to a SINGLE destination produces a receipt");
+            uninstall_sync_outbound_handler(RCPT_IFACE);
+
+            // The callback is registered AFTER the send, on the object the
+            // caller was handed — which is the whole point.
+            let callback_hits = Arc::new(AtomicUsize::new(0));
+            let hits_clone = callback_hits.clone();
+            returned.set_delivery_callback(Arc::new(move |_| {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+            }));
+
+            {
+                let state = TRANSPORT.lock().unwrap();
+                let tracked = state
+                    .receipts
+                    .iter()
+                    .find(|r| r.hash == returned.hash)
+                    .expect("Transport must be tracking this receipt");
+                assert!(
+                    tracked.shares_state_with(&returned),
+                    "Transport's receipt and the one send() returned must be the same object \
+                     (RNS/Packet.py send: `return self.receipt`)"
+                );
+            }
+
+            // Exactly what Transport::inbound does on an inbound PROOF.
+            let mut proof = returned.hash.clone();
+            proof.extend_from_slice(&identity.sign(&returned.hash));
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                for receipt in &mut state.receipts {
+                    if receipt.validate_proof(&proof) {
+                        break;
+                    }
+                }
+            }
+
+            assert_eq!(
+                callback_hits.load(Ordering::SeqCst), 1,
+                "the delivery callback registered on the caller's receipt must fire. \
+                 Regression: PacketReceipt is a by-value copy again, so set_delivery_callback \
+                 on the object send() returned writes into an object nothing ever proves."
+            );
+            assert_eq!(
+                returned.get_status(), crate::packet::PacketReceipt::DELIVERED,
+                "and get_status() on the caller's receipt must read DELIVERED"
+            );
+            assert!(returned.proved(), "and proved() must be set on it too");
+            assert!(returned.get_rtt().is_some(), "and the RTT must be readable from it");
+        }
+
+        #[test]
+        fn set_timeout_on_the_caller_copy_reaches_the_tracked_receipt() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let _restore = ReceiptStateRestore::new();
+
+            let receipt = make_receipt(0x5E, crate::packet::PacketReceipt::SENT);
+            let caller_copy = receipt.clone();
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                state.receipts.push(receipt);
+            }
+
+            caller_copy.set_timeout(1234.5);
+
+            let tracked_timeout = {
+                let state = TRANSPORT.lock().unwrap();
+                state
+                    .receipts
+                    .iter()
+                    .find(|r| r.hash == caller_copy.hash)
+                    .expect("tracked")
+                    .timeout()
+            };
+            assert_eq!(
+                tracked_timeout, 1234.5,
+                "set_timeout on a clone must change the timeout Transport actually enforces"
+            );
+        }
+    }
+
 }

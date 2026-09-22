@@ -562,6 +562,28 @@ impl TcpClientInterface {
         // TODO: RNS.Transport.synthesize_tunnel(self) if not kiss_framing
     }
 
+    /// RNS/Interfaces/TCPInterface.py:337-340 `check_frame_len`.
+    ///
+    /// A decoded frame is only handed to Transport when it is strictly
+    /// larger than a minimum Reticulum header and no larger than what this
+    /// interface can carry. The inline check this replaces used a
+    /// `HEADER_MINSIZE = 2` placeholder and had no upper bound at all, so
+    /// stub frames and oversized frames both reached `Transport::inbound`.
+    pub fn check_frame_len(frame_len: usize, hw_mtu: usize, ifac_size: usize) -> bool {
+        if frame_len <= crate::reticulum::HEADER_MINSIZE {
+            false
+        } else {
+            frame_len <= hw_mtu + ifac_size
+        }
+    }
+
+    /// RNS/Interfaces/TCPInterface.py:408 — a frame buffer that has grown
+    /// past `HW_MTU*2` without yielding a closing flag is never going to,
+    /// so it is dropped rather than grown without bound.
+    pub fn frame_buffer_exceeded(buffer_len: usize, hw_mtu: usize) -> bool {
+        buffer_len > hw_mtu * 2
+    }
+
     /// Process incoming data
     fn process_incoming(&mut self, data: Vec<u8>) {
         if self.base.online && !self.detached {
@@ -754,9 +776,16 @@ impl TcpClientInterface {
                                             }
                                         }
 
-                                        const HEADER_MINSIZE: usize = 2; // Placeholder
-                                        if unescaped.len() > HEADER_MINSIZE {
+                                        // RNS/Interfaces/TCPInterface.py:401-403
+                                        let hw_mtu = self.base.hw_mtu.unwrap_or(Self::HW_MTU);
+                                        let ifac_size = self.base.ifac_size;
+                                        if Self::check_frame_len(unescaped.len(), hw_mtu, ifac_size) {
                                             self.process_incoming(unescaped);
+                                        } else if !unescaped.is_empty() {
+                                            crate::log(
+                                                &format!("Invalid HDLC frame of {} bytes received, dropping frame", unescaped.len()),
+                                                crate::LOG_DEBUG, false, false,
+                                            );
                                         }
 
                                         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
@@ -766,9 +795,15 @@ impl TcpClientInterface {
                                         // other frame the remote sends. drain(..frame_end) keeps it.
                                         frame_buffer.drain(..frame_end);
                                     } else {
+                                        // RNS/Interfaces/TCPInterface.py:408
+                                        let hw_mtu = self.base.hw_mtu.unwrap_or(Self::HW_MTU);
+                                        if Self::frame_buffer_exceeded(frame_buffer.len(), hw_mtu) {
+                                            frame_buffer.clear();
+                                        }
                                         break;
                                     }
                                 } else {
+                                    frame_buffer.clear();
                                     break;
                                 }
                             }
@@ -912,7 +947,7 @@ impl TcpClientInterface {
             // reading again in the same thread.
             'running: loop {
                 // ── Clone current socket and read static config ───────────────
-                let socket_result: Option<(TcpStream, Option<String>, bool, usize, bool, Arc<AtomicBool>)> = {
+                let socket_result: Option<(TcpStream, Option<String>, bool, usize, usize, bool, Arc<AtomicBool>)> = {
                     let iface = interface.lock().unwrap();
                     if let Some(socket_ref) = iface.socket.as_ref() {
                         if let Ok(cloned_socket) = socket_ref.try_clone() {
@@ -929,6 +964,7 @@ impl TcpClientInterface {
                                 iface.base.name.clone(),
                                 iface.kiss_framing,
                                 iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
+                                iface.base.ifac_size,
                                 iface.initiator,
                                 Arc::clone(&iface.force_read_exit),
                             ))
@@ -953,7 +989,7 @@ impl TcpClientInterface {
                     );
                 } else {
 
-                let (raw_socket, interface_name, kiss_framing, hw_mtu, is_initiator, force_read_exit) = socket_result.unwrap();
+                let (raw_socket, interface_name, kiss_framing, hw_mtu, ifac_size, is_initiator, force_read_exit) = socket_result.unwrap();
                 // Wrap in ManuallyDrop so we control when close() is called.
                 // If the OS reclaims our fd (e.g., iOS background), Rust's
                 // automatic Drop would call close() on a potentially-reused fd
@@ -1082,8 +1118,8 @@ impl TcpClientInterface {
                                                 }
                                             }
 
-                                            const HEADER_MINSIZE: usize = 2;
-                                            if unescaped.len() > HEADER_MINSIZE {
+                                            // RNS/Interfaces/TCPInterface.py:401-403
+                                            if Self::check_frame_len(unescaped.len(), hw_mtu, ifac_size) {
                                                 crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_DEBUG, false, false);
                                                 let _ = std::io::Write::flush(&mut std::io::stderr());
                                                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1105,18 +1141,23 @@ impl TcpClientInterface {
                                                         crate::log(&format!("TCP frame: Transport::inbound PANICKED: {}", detail), crate::LOG_ERROR, false, false);
                                                     }
                                                 }
-                                            } else {
-                                                crate::log(&format!("TCP frame: {} bytes TOO SMALL, skipping", unescaped.len()), crate::LOG_DEBUG, false, false);
+                                            } else if !unescaped.is_empty() {
+                                                crate::log(&format!("Invalid HDLC frame of {} bytes received, dropping frame", unescaped.len()), crate::LOG_DEBUG, false, false);
                                             }
 
                                             frame_buffer.drain(..frame_end);
                                             crate::log(&format!("TCP HDLC: drained to frame_end={} (FLAG retained as next frame start), remaining={}", frame_end, frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                         } else {
                                             crate::log(&format!("TCP HDLC: partial frame, waiting (buf={})", frame_buffer.len()), crate::LOG_DEBUG, false, false);
+                                            // RNS/Interfaces/TCPInterface.py:408
+                                            if Self::frame_buffer_exceeded(frame_buffer.len(), hw_mtu) {
+                                                frame_buffer.clear();
+                                            }
                                             break;
                                         }
                                     } else {
                                         crate::log(&format!("TCP HDLC: no flag byte in buffer (buf={})", frame_buffer.len()), crate::LOG_DEBUG, false, false);
+                                        frame_buffer.clear();
                                         break;
                                     }
                                 }
@@ -1773,6 +1814,44 @@ impl std::fmt::Display for TcpServerInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RNS/Interfaces/TCPInterface.py:337-340 `check_frame_len`.
+    // Before this gate the read loops used a `HEADER_MINSIZE = 2`
+    // placeholder and had no upper bound at all.
+    #[test]
+    fn frame_len_bounds_match_the_reference() {
+        let hw_mtu = 1024usize;
+        let ifac_size = 16usize;
+        let min = crate::reticulum::HEADER_MINSIZE;
+
+        assert!(!TcpClientInterface::check_frame_len(0, hw_mtu, ifac_size));
+        assert!(
+            !TcpClientInterface::check_frame_len(min, hw_mtu, ifac_size),
+            "HEADER_MINSIZE itself is rejected — the reference bound is `<=`"
+        );
+        assert!(
+            !TcpClientInterface::check_frame_len(3, hw_mtu, ifac_size),
+            "a 3-byte stub frame must be dropped; it only passed under the HEADER_MINSIZE=2 placeholder"
+        );
+        assert!(TcpClientInterface::check_frame_len(min + 1, hw_mtu, ifac_size));
+        assert!(
+            TcpClientInterface::check_frame_len(hw_mtu + ifac_size, hw_mtu, ifac_size),
+            "exactly HW_MTU + ifac_size is still accepted — the reference bound is `>`"
+        );
+        assert!(
+            !TcpClientInterface::check_frame_len(hw_mtu + ifac_size + 1, hw_mtu, ifac_size),
+            "one byte over HW_MTU + ifac_size must be dropped; there was no upper bound at all before"
+        );
+    }
+
+    // RNS/Interfaces/TCPInterface.py:408 — the accumulating frame buffer is
+    // reset once it passes HW_MTU*2 without a closing flag.
+    #[test]
+    fn frame_buffer_is_reset_past_twice_hw_mtu() {
+        let hw_mtu = 1024usize;
+        assert!(!TcpClientInterface::frame_buffer_exceeded(hw_mtu * 2, hw_mtu));
+        assert!(TcpClientInterface::frame_buffer_exceeded(hw_mtu * 2 + 1, hw_mtu));
+    }
 
     #[test]
     fn test_hdlc_escape() {
