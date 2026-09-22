@@ -1247,4 +1247,139 @@ mod tests {
 
 		Identity::forget_destination_in_memory(&destination.hash);
 	}
+
+	/// A1: RNS/Destination.py:415 `receive()` never handles REQUEST — a DATA
+	/// packet reaches the packet callback whatever its context, and requests
+	/// exist only on links (RNS/Link.py handle_request). Until 2026-09-22 a
+	/// REQUEST-context packet was intercepted here and dispatched at the
+	/// destination with the hex of the path hash as the path, no remote
+	/// identity and no allow check.
+	#[test]
+	fn a_request_context_data_packet_reaches_the_packet_callback() {
+		let mut destination = Destination::new_inbound(
+			None,
+			DestinationType::Plain,
+			"test".to_string(),
+			vec!["a1".to_string()],
+		)
+		.expect("plain inbound destination");
+
+		let handled = Arc::new(Mutex::new(0usize));
+		let handled_cb = Arc::clone(&handled);
+		destination
+			.register_request_handler(
+				"/a1".to_string(),
+				Some(Arc::new(
+					move |_p: &str,
+					      _d: &[u8],
+					      _r: &[u8],
+					      _i: Option<&Identity>,
+					      _l: Option<&crate::link::LinkHandle>,
+					      _t: f64| {
+						*handled_cb.lock().unwrap() += 1;
+						Vec::new()
+					},
+				)),
+				ALLOW_ALL,
+				None,
+				false,
+			)
+			.expect("request handler");
+
+		let seen = Arc::new(Mutex::new(None::<Vec<u8>>));
+		let seen_cb = Arc::clone(&seen);
+		destination.callbacks.packet = Some(Arc::new(move |data: &[u8], _p: &Packet| {
+			*seen_cb.lock().unwrap() = Some(data.to_vec());
+		}));
+
+		// The wire form of a request: [timestamp, path_hash, data]. If this
+		// were dispatched as a request, the handler above would run.
+		let mut plaintext = Vec::new();
+		rmpv::encode::write_value(
+			&mut plaintext,
+			&rmpv::Value::Array(vec![
+				rmpv::Value::F64(0.0),
+				rmpv::Value::Binary(crate::identity::truncated_hash(b"/a1")),
+				rmpv::Value::Nil,
+			]),
+		)
+		.unwrap();
+
+		let mut packet = Packet::new(
+			Some(destination.clone()),
+			plaintext.clone(),
+			DATA,
+			crate::packet::REQUEST,
+			crate::transport::BROADCAST,
+			crate::packet::HEADER_1,
+			None,
+			None,
+			false,
+			0,
+		);
+		packet.data = plaintext.clone();
+
+		assert!(destination.receive(&packet).expect("receive"), "a DATA packet is handled");
+
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while seen.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		assert_eq!(
+			seen.lock().unwrap().as_deref(),
+			Some(&plaintext[..]),
+			"a REQUEST-context DATA packet must reach the packet callback, as in Python"
+		);
+		assert_eq!(
+			*handled.lock().unwrap(),
+			0,
+			"a destination must never dispatch a request; requests exist only on links"
+		);
+	}
+
+	/// A16: RNS/Destination.py:160 — an IN destination of any type but PLAIN
+	/// created without an identity mints one, and its hexhash becomes the
+	/// last aspect. An OUT destination without an identity is still an error.
+	#[test]
+	fn inbound_destination_without_an_identity_mints_one_and_appends_its_hexhash() {
+		let destination = Destination::new_inbound(
+			None,
+			DestinationType::Single,
+			"test".to_string(),
+			vec!["a16".to_string()],
+		)
+		.expect("an inbound SINGLE destination mints its own identity");
+
+		let identity_hash = destination
+			.identity
+			.as_ref()
+			.expect("an identity was minted")
+			.hash
+			.as_ref()
+			.expect("identity hash")
+			.clone();
+		let hexhash = crate::hexrep(&identity_hash, false);
+
+		assert_eq!(
+			destination.aspects,
+			vec!["a16".to_string(), hexhash.clone()],
+			"the minted identity's hexhash is appended as the last aspect"
+		);
+		assert_eq!(
+			destination.hash,
+			Destination::hash(Some(&identity_hash), "test", &["a16", hexhash.as_str()]),
+			"the appended aspect is part of the destination hash"
+		);
+
+		assert!(
+			Destination::new_outbound(
+				None,
+				DestinationType::Single,
+				"test".to_string(),
+				vec!["a16".to_string()],
+			)
+			.is_err(),
+			"an outbound SINGLE destination still cannot be created without an identity"
+		);
+	}
 }

@@ -2995,6 +2995,21 @@ impl Link {
         request_id: Option<Vec<u8>>,
     ) -> Option<Arc<Mutex<Resource>>> {
         let link_handle = self.self_handle.as_ref()?.clone();
+        // RNS/Resource.py:222 `if not resource.link.has_incoming_resource(resource)`:
+        // a re-advertised resource that is already being received is not
+        // accepted a second time — the transfer in flight keeps its parts,
+        // and `resource_started` does not fire again.
+        if let Some(plaintext) = advertisement_packet.plaintext.as_ref() {
+            if let Ok(advertisement) = crate::resource::ResourceAdvertisement::unpack(plaintext) {
+                if self.has_incoming_resource_hash(&advertisement.h) {
+                    crate::log(&format!(
+                        "Ignoring advertisement for resource {} already being received on link {}",
+                        crate::hexrep(&advertisement.h, false), crate::hexrep(&self.link_id, false)
+                    ), crate::LOG_DEBUG, false, false);
+                    return None;
+                }
+            }
+        }
         let link_ctx = self.resource_link_context();
         let resource = Resource::accept(advertisement_packet, link_handle, concluded, progress, request_id, Some(link_ctx))?;
         // Register on the real link so RESOURCE data packets find it.
@@ -3004,6 +3019,15 @@ impl Link {
             thread::spawn(move || started(started_resource));
         }
         Some(resource)
+    }
+
+    /// RNS/Link.py:1284 `has_incoming_resource()`, by hash: the advertisement
+    /// is checked before a Resource is built from it.
+    fn has_incoming_resource_hash(&self, resource_hash: &[u8]) -> bool {
+        let Ok(resources) = self.incoming_resources.lock() else { return false };
+        resources.iter().any(|resource| {
+            resource.try_lock().map(|r| r.hash == resource_hash).unwrap_or(false)
+        })
     }
 
     /// Handle link closure cleanup
@@ -3213,10 +3237,23 @@ impl Link {
                 is_req, is_resp), crate::LOG_NOTICE, false, false);
 
             if is_req {
+                // RNS/Link.py:1036 (1.5.2) `if self.destination.request_handlers:`
+                // — a request Resource is only accepted when the destination
+                // has handlers at all. With none registered the advertisement
+                // is ignored (Python does not reject it either).
+                let (has_request_handlers, max_request_size) = self.destination.lock().ok()
+                    .map(|d| (!d.request_handlers.is_empty(), d.max_request_size))
+                    .unwrap_or((false, None));
+                if !has_request_handlers {
+                    crate::log(&format!(
+                        "Ignoring request resource on link {}: the destination has no request handlers",
+                        crate::hexrep(&self.link_id, false)
+                    ), crate::LOG_DEBUG, false, false);
+                    return Ok(());
+                }
                 // RNS/Link.py:1037-1042: a request larger than the
                 // destination's max_request_size is rejected before it is
                 // ever assembled.
-                let max_request_size = self.destination.lock().ok().and_then(|d| d.max_request_size);
                 let request_size = crate::resource::ResourceAdvertisement::read_size(&advertisement_packet).unwrap_or(0);
                 if let Some(max) = max_request_size {
                     if request_size > max {
@@ -3340,17 +3377,34 @@ impl Link {
                             Err(_) => return,
                         };
                         let Some(request_id) = resource_request_id else { return };
+                        let mut cancel_resource = false;
                         let receipt = {
                             let Ok(mut pending) = progress_pending.lock() else { return };
                             let Some(request) = pending.iter_mut().find(|p| p.request_id == request_id) else { return };
-                            if request.status == REQUEST_FAILED { return }
-                            request.status = REQUEST_RECEIVING;
-                            request.progress = progress;
-                            match request.progress_callback.clone() {
-                                Some(callback) => Some((callback, request.receipt(Arc::clone(&progress_link), None, None, None, None))),
-                                None => None,
+                            // RNS/Link.py:1435 response_resource_progress():
+                            // `else: resource.cancel()` — a request that has
+                            // already failed does not just stop following the
+                            // response, it stops the transfer. Cancelling here
+                            // would take the Resource's lock while holding the
+                            // pending-requests lock, so it happens below.
+                            if request.status == REQUEST_FAILED {
+                                cancel_resource = true;
+                                None
+                            } else {
+                                request.status = REQUEST_RECEIVING;
+                                request.progress = progress;
+                                match request.progress_callback.clone() {
+                                    Some(callback) => Some((callback, request.receipt(Arc::clone(&progress_link), None, None, None, None))),
+                                    None => None,
+                                }
                             }
                         };
+                        if cancel_resource {
+                            if let Ok(mut resource) = resource.lock() {
+                                resource.cancel();
+                            }
+                            return;
+                        }
                         if let Some((callback, receipt)) = receipt {
                             callback(receipt);
                         }
@@ -5622,4 +5676,245 @@ mod tests {
         assert_eq!(*seen_size.lock().unwrap(), Some(2000), "the callback was handed the advertisement");
     }
 
+    // ── Resource advertisements on a link ───────────────────────────────────
+    //
+    // Everything below drives a packed advertisement into `handle_data_packet`
+    // and looks at what the link did with it: whether a Resource was
+    // registered as incoming, whether `resource_started` fired, and what the
+    // pending request was told.
+
+    /// A packed advertisement for `size` bytes of data.
+    ///
+    /// `flags` is RNS's flag byte as `ResourceAdvertisement::apply_flags`
+    /// reads it: bit 3 (`u`) marks a request, bit 4 (`p`) a response. Both
+    /// forms also carry the request id in `q`.
+    fn packed_advertisement(hash_byte: u8, size: u64, flags: u8, request_id: Option<Vec<u8>>) -> Vec<u8> {
+        crate::resource::ResourceAdvertisement {
+            t: size, d: size, n: 1,
+            h: vec![hash_byte; 32], r: vec![2; 4], o: vec![hash_byte; 32],
+            i: 0, l: 1, q: request_id, f: flags,
+            m: vec![0; crate::resource::Resource::MAPHASH_LEN],
+            e: false, c: false, s: false, u: false, p: false, x: false,
+            link: None,
+        }.pack(0).expect("pack advertisement")
+    }
+
+    /// An ACTIVE inbound link that can decrypt, with an actor handle whose
+    /// receiver is gone: the Resource machinery talks to the link through
+    /// that handle, and with no actor behind it every send fails fast
+    /// instead of parking a background thread on a reply that never comes.
+    fn resource_test_link(seed: u8) -> Link {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(seed)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        link.self_handle = Some(LinkHandle::from_parts_for_test(tx, link.link_id.clone()));
+        link
+    }
+
+    fn advertise(link: &mut Link, advertisement: &[u8]) {
+        let packet = link_packet(link, crate::packet::RESOURCE_ADV, advertisement);
+        link.handle_data_packet(&packet).expect("advertisement is handled");
+    }
+
+    fn incoming_count(link: &Link) -> usize {
+        link.incoming_resources.lock().unwrap().len()
+    }
+
+    /// A3: RNS/Resource.py:228 — `resource_started` fires once the accepted
+    /// resource is registered on the link. It was stored and never called
+    /// until 2026-09-22.
+    #[test]
+    fn resource_started_fires_for_an_accepted_advertisement() {
+        let mut link = resource_test_link(109);
+        link.resource_strategy = ACCEPT_ALL;
+        let started = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let started_cb = Arc::clone(&started);
+        link.callbacks.resource_started = Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
+            let hash = resource.lock().unwrap().hash.clone();
+            started_cb.lock().unwrap().push(hash);
+        }));
+
+        advertise(&mut link, &packed_advertisement(0xA1, 64, 0, None));
+
+        assert!(wait_until(5, || started.lock().unwrap().len() == 1),
+            "resource_started must fire for an accepted advertisement");
+        assert_eq!(started.lock().unwrap()[0], vec![0xA1u8; 32],
+            "the callback is handed the resource that started");
+        assert_eq!(incoming_count(&link), 1);
+    }
+
+    /// A3: RNS/Resource.py:222 `if not resource.link.has_incoming_resource(resource)`
+    /// — an advertisement for a resource already being received is not
+    /// accepted a second time.
+    #[test]
+    fn a_re_advertised_incoming_resource_is_not_accepted_twice() {
+        let mut link = resource_test_link(113);
+        link.resource_strategy = ACCEPT_ALL;
+        let started = Arc::new(Mutex::new(0usize));
+        let started_cb = Arc::clone(&started);
+        link.callbacks.resource_started = Some(Arc::new(move |_r: Arc<Mutex<Resource>>| {
+            *started_cb.lock().unwrap() += 1;
+        }));
+
+        let advertisement = packed_advertisement(0xA2, 64, 0, None);
+        advertise(&mut link, &advertisement);
+        assert!(wait_until(5, || *started.lock().unwrap() == 1), "the first advertisement is accepted");
+
+        advertise(&mut link, &advertisement);
+
+        assert!(!wait_until(1, || *started.lock().unwrap() > 1),
+            "a resource already being received must not start a second transfer");
+        assert_eq!(incoming_count(&link), 1,
+            "the resource in flight keeps its parts; no second Resource is registered");
+    }
+
+    /// A7: RNS/Link.py:1047-1053 — a response Resource larger than the
+    /// request's `max_response_size` is rejected and fails the request.
+    #[test]
+    fn oversized_response_resource_advertisement_fails_the_request() {
+        let mut link = resource_test_link(127);
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let push = |link: &Link, request_id: Vec<u8>, tx: &mpsc::Sender<&'static str>| {
+            let (r, f) = (tx.clone(), tx.clone());
+            link.pending_requests.lock().unwrap().push(PendingRequest::new(
+                request_id, 0.0, 60.0, Some(64), Some(0.0),
+                Some(Arc::new(move |_| { let _ = r.send("response"); })),
+                Some(Arc::new(move |_| { let _ = f.send("failed"); })),
+                None,
+            ));
+        };
+
+        let oversized = vec![0x7Au8; 16];
+        push(&link, oversized.clone(), &tx);
+        advertise(&mut link, &packed_advertisement(0xE1, 65, 0x10, Some(oversized)));
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("the request concludes"), "failed",
+            "a response one byte over max_response_size must fail the request");
+        assert_eq!(incoming_count(&link), 0,
+            "a rejected response must not be registered as an incoming resource");
+        assert!(link.pending_requests.lock().unwrap().is_empty(), "the request is concluded");
+
+        // At the limit the same response is accepted — the rejection above is
+        // the size, not the path.
+        let at_limit = vec![0x7Bu8; 16];
+        push(&link, at_limit.clone(), &tx);
+        advertise(&mut link, &packed_advertisement(0xE2, 64, 0x10, Some(at_limit)));
+
+        assert!(wait_until(5, || incoming_count(&link) == 1),
+            "exactly max_response_size is still accepted");
+        assert!(rx.try_recv().is_err(), "an accepted response does not conclude the request");
+    }
+
+    /// A8: RNS/Link.py:1037-1042 — a request Resource larger than the
+    /// destination's `max_request_size` is rejected before it is assembled.
+    #[test]
+    fn oversized_request_resource_advertisement_is_rejected() {
+        let mut link = resource_test_link(131);
+        {
+            let mut dest = link.destination.lock().unwrap();
+            dest.register_request_handler("/big".to_string(),
+                Some(Arc::new(|_p: &str, _d: &[u8], _r: &[u8], _i: Option<&Identity>, _l: Option<&LinkHandle>, _t: f64| Vec::new())),
+                crate::destination::ALLOW_ALL, None, false).unwrap();
+            dest.set_max_request_size(Some(64));
+        }
+
+        advertise(&mut link, &packed_advertisement(0xB1, 65, 0x08, Some(vec![1u8; 16])));
+        assert!(!wait_until(1, || incoming_count(&link) > 0),
+            "a request one byte over max_request_size must not be accepted");
+
+        advertise(&mut link, &packed_advertisement(0xB2, 64, 0x08, Some(vec![2u8; 16])));
+        assert!(wait_until(5, || incoming_count(&link) == 1),
+            "exactly max_request_size is still accepted");
+    }
+
+    /// A8: RNS/Link.py:1036 `if self.destination.request_handlers:` — a
+    /// request Resource is only accepted when the destination has handlers
+    /// at all. With none registered the advertisement is ignored.
+    #[test]
+    fn a_request_resource_is_ignored_when_the_destination_has_no_handlers() {
+        let mut link = resource_test_link(137);
+
+        advertise(&mut link, &packed_advertisement(0xB3, 64, 0x08, Some(vec![3u8; 16])));
+        assert!(!wait_until(1, || incoming_count(&link) > 0),
+            "with no request handlers there is nobody to answer; the advertisement is ignored");
+
+        link.destination.lock().unwrap().register_request_handler("/small".to_string(),
+            Some(Arc::new(|_p: &str, _d: &[u8], _r: &[u8], _i: Option<&Identity>, _l: Option<&LinkHandle>, _t: f64| Vec::new())),
+            crate::destination::ALLOW_ALL, None, false).unwrap();
+
+        advertise(&mut link, &packed_advertisement(0xB4, 64, 0x08, Some(vec![4u8; 16])));
+        assert!(wait_until(5, || incoming_count(&link) == 1),
+            "the same advertisement is accepted once a handler exists");
+    }
+
+    /// A5: RNS/Link.py:1435 `else: resource.cancel()` — once the request has
+    /// failed, the response Resource still arriving is cancelled, not merely
+    /// ignored.
+    #[test]
+    fn a_failed_request_cancels_the_response_resource_still_arriving() {
+        let mut link = resource_test_link(139);
+        let request_id = vec![0x5Au8; 16];
+        link.pending_requests.lock().unwrap().push(PendingRequest::new(
+            request_id.clone(), 0.0, 60.0, None, Some(0.0), None, None, None,
+        ));
+
+        advertise(&mut link, &packed_advertisement(0xD1, 64, 0x10, Some(request_id)));
+        assert!(wait_until(5, || incoming_count(&link) == 1), "the response resource is accepted");
+
+        let resource = link.incoming_resources.lock().unwrap()[0].clone();
+        let progress = resource.lock().unwrap().progress_callback.clone()
+            .expect("a response resource carries the request's progress callback");
+
+        // The request fails while the response is still arriving.
+        link.pending_requests.lock().unwrap()[0].status = REQUEST_FAILED;
+        progress(Arc::clone(&resource));
+
+        assert_eq!(resource.lock().unwrap().status, crate::resource::ResourceStatus::Failed,
+            "a failed request must cancel the transfer, not leave it running");
+    }
+
+    /// A11: RNS/Link.py:686 — closing the link cancels every in-flight
+    /// resource, incoming and outgoing, so each concludes instead of waiting
+    /// on its own watchdog.
+    #[test]
+    fn link_closed_cancels_in_flight_resources() {
+        let mut link = resource_test_link(149);
+        let concluded = Arc::new(Mutex::new(Vec::<(Vec<u8>, crate::resource::ResourceStatus)>::new()));
+        let concluded_cb = Arc::clone(&concluded);
+        let callback: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource: Arc<Mutex<Resource>>| {
+            let resource = resource.lock().unwrap();
+            concluded_cb.lock().unwrap().push((resource.hash.clone(), resource.status));
+        });
+
+        // Built directly rather than accepted from an advertisement: an
+        // accepted Resource starts its own watchdog, which would conclude it
+        // on this actor-less test link whether the link cancelled it or not.
+        let context = link.resource_link_context();
+        let mut in_flight = |hash_byte: u8, initiator: bool| -> Arc<Mutex<Resource>> {
+            let mut resource = Resource::new_internal(
+                None, link.self_handle.clone().unwrap(), None, false,
+                crate::resource::AutoCompressOption::Disabled,
+                Some(Arc::clone(&callback)), None, Some(0.0), 0, None, None, false, 0, Some(&context),
+            ).expect("in-flight resource");
+            resource.hash = vec![hash_byte; 32];
+            resource.status = crate::resource::ResourceStatus::Transferring;
+            resource.initiator = initiator;
+            Arc::new(Mutex::new(resource))
+        };
+        link.incoming_resources.lock().unwrap().push(in_flight(0xC1, false));
+        link.outgoing_resources.lock().unwrap().push(in_flight(0xC2, true));
+
+        link.teardown();
+
+        assert!(wait_until(5, || concluded.lock().unwrap().len() == 2),
+            "both the incoming and the outgoing resource must conclude when the link closes");
+        for (hash, status) in concluded.lock().unwrap().iter() {
+            assert_ne!(*status, crate::resource::ResourceStatus::Complete,
+                "resource {} was cancelled by the link closing; it cannot have completed",
+                crate::hexrep(hash, false));
+        }
+    }
 }

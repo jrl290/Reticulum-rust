@@ -135,6 +135,16 @@ pub enum AutoCompressOption {
     Limit(usize),
 }
 
+/// `(context, resource_hash)` for every packet `send_control_packet` emitted
+/// on this thread. A Resource under test has no interface to put a packet
+/// on, so this is how a test sees the RESOURCE_ICL/RESOURCE_RCL a cancel
+/// sends. Per-thread, so tests running in parallel do not see each other's.
+#[cfg(test)]
+thread_local! {
+    static SENT_CONTROL_PACKETS: std::cell::RefCell<Vec<(u8, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Resource {
     // Constants
     pub const WINDOW: usize = 4;
@@ -1910,6 +1920,30 @@ impl Resource {
         }
     }
 
+    /// A packet a Resource sends about itself — RESOURCE_ICL or RESOURCE_RCL,
+    /// carrying this resource's hash (RNS/Resource.py:1096, 1105, 1114).
+    ///
+    /// One place, so the tests can see what a cancel emits: a Resource under
+    /// test has no interface to put a packet on, so the wire itself cannot be
+    /// observed.
+    fn send_control_packet(&self, context: u8) {
+        #[cfg(test)]
+        SENT_CONTROL_PACKETS.with(|sent| sent.borrow_mut().push((context, self.hash.clone())));
+        let mut packet = Packet::new(
+            self.packet_destination(),
+            self.hash.clone(),
+            crate::packet::DATA,
+            context,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        let _ = packet.send();
+    }
+
     pub fn cancel(&mut self) {
         // RNS/Resource.py:1093
         if let Some(next_segment) = self.next_segment.clone() {
@@ -1925,56 +1959,20 @@ impl Resource {
             // does not keep the advertisement packet on the Resource, so send
             // the same RESOURCE_RCL that `Resource::reject` sends, carrying
             // this resource's hash.
-            let mut reject_packet = Packet::new(
-                self.packet_destination(),
-                self.hash.clone(),
-                crate::packet::DATA,
-                RESOURCE_RCL,
-                BROADCAST,
-                crate::packet::HEADER_1,
-                None,
-                None,
-                false,
-                0,
-            );
-            let _ = reject_packet.send();
+            self.send_control_packet(RESOURCE_RCL);
             self.link.teardown();
         } else if (self.status as u8) < (ResourceStatus::Complete as u8) {
             self.status = ResourceStatus::Failed;
             if self.initiator {
                 if self.link.is_active() {
-                    let mut packet = Packet::new(
-                        self.packet_destination(),
-                        self.hash.clone(),
-                        crate::packet::DATA,
-                        RESOURCE_ICL,
-                        BROADCAST,
-                        crate::packet::HEADER_1,
-                        None,
-                        None,
-                        false,
-                        0,
-                    );
-                    let _ = packet.send();
+                    self.send_control_packet(RESOURCE_ICL);
                 }
                 self.link.cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
             } else {
                 // RNS/Resource.py:1112-1118 — the receiving end tells the
                 // sender it is cancelling before dropping the resource.
                 if self.link.is_active() {
-                    let mut packet = Packet::new(
-                        self.packet_destination(),
-                        self.hash.clone(),
-                        crate::packet::DATA,
-                        RESOURCE_RCL,
-                        BROADCAST,
-                        crate::packet::HEADER_1,
-                        None,
-                        None,
-                        false,
-                        0,
-                    );
-                    let _ = packet.send();
+                    self.send_control_packet(RESOURCE_RCL);
                 }
                 self.link.cancel_incoming_resource(Arc::new(Mutex::new(self.clone())));
             }
@@ -2523,6 +2521,90 @@ fn ensure_resource_path() {
 mod tests {
     use super::*;
     use serde_bytes::ByteBuf;
+
+    /// Build a Resource on a live, ACTIVE link actor. The bare
+    /// `test_resource()` link is never established, so `link.is_active()` is
+    /// false there and the cancel paths below would send nothing.
+    fn resource_on_active_link() -> (Resource, crate::link::LinkHandle) {
+        let mut link = crate::link::Link::new_inbound(crate::destination::Destination::default())
+            .expect("test link");
+        link.state = crate::link::STATE_ACTIVE;
+        link.status = crate::link::STATE_ACTIVE;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        link.activated_at = Some(now);
+        link.last_inbound = now;
+        link.last_outbound = now;
+        link.last_proof = now;
+        let handle = crate::link::LinkHandle::spawn(link);
+        let ctx = ResourceLinkContext {
+            mtu: 500,
+            rtt: Some(0.1),
+            traffic_timeout_factor: 4.0,
+            establishment_cost: 0,
+            last_resource_window: None,
+            last_resource_eifr: None,
+        };
+        let resource = Resource::new_internal(
+            None, handle.clone(), None, false, AutoCompressOption::Disabled,
+            None, None, Some(0.0), 0, None, None, false, 0, Some(&ctx),
+        )
+        .expect("test resource");
+        (resource, handle)
+    }
+
+    fn control_packets() -> Vec<(u8, Vec<u8>)> {
+        SENT_CONTROL_PACKETS.with(|sent| sent.borrow().clone())
+    }
+
+    /// B3: RNS/Resource.py:1112-1118 — the receiving end tells the sender it
+    /// is cancelling, with a RESOURCE_RCL carrying the resource hash. This
+    /// port sent nothing at all until 2026-09.
+    #[test]
+    fn a_receiver_cancel_sends_resource_rcl_with_the_resource_hash() {
+        let (mut resource, link) = resource_on_active_link();
+        SENT_CONTROL_PACKETS.with(|sent| sent.borrow_mut().clear());
+        resource.hash = vec![0x3Bu8; 32];
+        resource.status = ResourceStatus::Transferring;
+        resource.initiator = false;
+
+        resource.cancel();
+
+        assert_eq!(
+            control_packets(),
+            vec![(RESOURCE_RCL, vec![0x3Bu8; 32])],
+            "a receiving side that cancels must say so, carrying the resource hash"
+        );
+        assert_eq!(resource.status, ResourceStatus::Failed);
+        assert_ne!(link.status(), crate::link::STATE_CLOSED,
+            "an ordinary receiver cancel does not tear the link down");
+    }
+
+    /// B3: RNS/Resource.py:1095-1098 — a CORRUPT resource is rejected the
+    /// same way and additionally tears the link down.
+    #[test]
+    fn a_corrupt_cancel_rejects_and_tears_the_link_down() {
+        let (mut resource, link) = resource_on_active_link();
+        SENT_CONTROL_PACKETS.with(|sent| sent.borrow_mut().clear());
+        resource.hash = vec![0x3Cu8; 32];
+        resource.status = ResourceStatus::Corrupt;
+        resource.initiator = false;
+
+        resource.cancel();
+
+        assert_eq!(
+            control_packets(),
+            vec![(RESOURCE_RCL, vec![0x3Cu8; 32])],
+            "a corrupt resource is rejected with the same RESOURCE_RCL"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while link.status() != crate::link::STATE_CLOSED && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(link.status(), crate::link::STATE_CLOSED,
+            "a corrupt transfer takes the link with it (RNS/Resource.py:1098)");
+    }
+
 
     /// A resource attached to a bare, never-established inbound link: the
     /// actor answers, but the link is not ACTIVE, so no packet ever goes out.

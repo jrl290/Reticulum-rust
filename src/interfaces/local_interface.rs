@@ -298,12 +298,27 @@ impl LocalClientInterface {
 
     /// Handle HDLC framing
     fn handle_hdlc(&mut self) {
+        for frame in self.drain_frames() {
+            self.process_incoming(frame);
+        }
+    }
+
+    /// Decode every complete HDLC frame currently buffered, dropping the ones
+    /// the frame bounds reject.
+    ///
+    /// Split out of `handle_hdlc` so the bounds can be exercised without a
+    /// socket. Buffer handling is unchanged: a complete frame is removed up
+    /// to and including its closing flag.
+    fn drain_frames(&mut self) -> Vec<Vec<u8>> {
+        let hw_mtu = self.base.hw_mtu.unwrap_or(crate::reticulum::MTU);
+        let ifac_size = self.base.ifac_size;
+        let mut frames: Vec<Vec<u8>> = Vec::new();
         loop {
             if let Some(frame_start) = self.frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
                 if let Some(frame_end) = self.frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG) {
                     let frame_end = frame_start + 1 + frame_end;
                     let frame = self.frame_buffer[frame_start + 1..frame_end].to_vec();
-                    
+
                     // Unescape frame
                     let mut unescaped = Vec::new();
                     let mut escape_next = false;
@@ -322,19 +337,42 @@ impl LocalClientInterface {
                         }
                     }
 
-                    // Process if frame is large enough (HEADER_MINSIZE)
-                    const HEADER_MINSIZE: usize = 2; // Placeholder
-                    if unescaped.len() > HEADER_MINSIZE {
-                        self.process_incoming(unescaped);
+                    // RNS/Interfaces/TCPInterface.py:337-340 check_frame_len().
+                    // Until 2026-09-22 this was a `HEADER_MINSIZE = 2`
+                    // placeholder with no upper bound, so stub frames and
+                    // arbitrarily large frames both reached Transport.
+                    if crate::interfaces::interface::check_frame_len(unescaped.len(), hw_mtu, ifac_size) {
+                        frames.push(unescaped);
                     }
 
                     self.frame_buffer.drain(..frame_end + 1);
                 } else {
+                    self.discard_overlong_frame_buffer(hw_mtu);
                     break;
                 }
             } else {
+                self.discard_overlong_frame_buffer(hw_mtu);
                 break;
             }
+        }
+        frames
+    }
+
+    /// RNS/Interfaces/TCPInterface.py:408 — a buffer that has grown past
+    /// `HW_MTU*2` without a closing flag is never going to produce a frame.
+    fn discard_overlong_frame_buffer(&mut self, hw_mtu: usize) {
+        if crate::interfaces::interface::frame_buffer_exceeded(self.frame_buffer.len(), hw_mtu) {
+            crate::log(
+                &format!(
+                    "Dropping {} B of unterminated frame data on {}",
+                    self.frame_buffer.len(),
+                    self.base.name.as_deref().unwrap_or("LocalInterface")
+                ),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+            self.frame_buffer.clear();
         }
     }
 
@@ -623,6 +661,59 @@ impl std::fmt::Display for LocalServerInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![Hdlc::FLAG];
+        frame.extend_from_slice(&Hdlc::escape(payload));
+        frame.push(Hdlc::FLAG);
+        frame
+    }
+
+    /// B12: RNS/Interfaces/TCPInterface.py:337-340 — this read loop carried a
+    /// `HEADER_MINSIZE = 2` placeholder and no upper bound at all, so stub
+    /// frames and arbitrarily large frames both reached `Transport::inbound`.
+    #[test]
+    fn local_frame_bounds_reject_stub_and_oversized_frames() {
+        let mut iface = LocalClientInterface::new_disconnected("test-local-bounds".to_string());
+        iface.base.hw_mtu = Some(64);
+        iface.base.ifac_size = 0;
+        let min = crate::reticulum::HEADER_MINSIZE;
+
+        // A 3-byte frame passed the placeholder; it must not now.
+        iface.frame_buffer.extend_from_slice(&framed(&[0x41u8; 3]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x41u8; min]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x42u8; min + 1]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x43u8; 64]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x44u8; 65]));
+
+        let frames = iface.drain_frames();
+        assert_eq!(
+            frames,
+            vec![vec![0x42u8; min + 1], vec![0x43u8; 64]],
+            "only frames larger than HEADER_MINSIZE and no larger than hw_mtu + ifac_size \
+             may reach Transport"
+        );
+        assert!(iface.frame_buffer.is_empty(), "every complete frame is consumed");
+    }
+
+    /// B12: RNS/Interfaces/TCPInterface.py:408 — an unterminated buffer is
+    /// dropped once it passes HW_MTU*2 instead of growing without bound.
+    #[test]
+    fn local_unterminated_frame_buffer_is_dropped_past_twice_hw_mtu() {
+        let mut iface = LocalClientInterface::new_disconnected("test-local-buffer".to_string());
+        iface.base.hw_mtu = Some(64);
+
+        iface.frame_buffer = vec![0x41u8; 128];
+        assert!(iface.drain_frames().is_empty());
+        assert_eq!(iface.frame_buffer.len(), 128, "exactly HW_MTU*2 is still kept");
+
+        iface.frame_buffer.push(0x41);
+        assert!(iface.drain_frames().is_empty());
+        assert!(
+            iface.frame_buffer.is_empty(),
+            "one byte past HW_MTU*2 without a closing flag must be dropped"
+        );
+    }
 
     #[test]
     fn test_hdlc_escape() {

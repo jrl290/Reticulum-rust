@@ -479,6 +479,30 @@ fn calculate_frequency(deque: &VecDeque<f64>) -> f64 {
     }
 }
 
+/// RNS/Interfaces/TCPInterface.py:337-340 `check_frame_len`.
+///
+/// A decoded frame is only handed to Transport when it is strictly larger
+/// than a minimum Reticulum header and no larger than what the interface can
+/// carry. Every HDLC read loop in this port needs the same gate — the bound
+/// lived on `TcpClientInterface` until 2026-09-22, and the LocalInterface and
+/// BackboneInterface loops still carried a `HEADER_MINSIZE = 2` placeholder
+/// (or no minimum of their own) and no upper bound at all, so stub frames and
+/// arbitrarily large frames reached `Transport::inbound` on those two.
+pub fn check_frame_len(frame_len: usize, hw_mtu: usize, ifac_size: usize) -> bool {
+    if frame_len <= crate::reticulum::HEADER_MINSIZE {
+        false
+    } else {
+        frame_len <= hw_mtu + ifac_size
+    }
+}
+
+/// RNS/Interfaces/TCPInterface.py:408 — a frame buffer that has grown past
+/// `HW_MTU*2` without yielding a closing flag is never going to, so it is
+/// dropped rather than grown without bound.
+pub fn frame_buffer_exceeded(buffer_len: usize, hw_mtu: usize) -> bool {
+    buffer_len > hw_mtu * 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

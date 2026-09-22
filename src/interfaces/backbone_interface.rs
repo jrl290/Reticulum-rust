@@ -486,6 +486,32 @@ impl BackboneClientInterface {
         Ok(interface)
     }
 
+    /// A client interface with no socket, for exercising the framing.
+    #[cfg(test)]
+    fn disconnected_for_test(name: &str) -> Self {
+        let mut base = Interface::new();
+        base.name = Some(name.to_string());
+        base.hw_mtu = Some(Self::HW_MTU);
+        BackboneClientInterface {
+            base,
+            target_ip: String::new(),
+            target_port: 0,
+            initiator: true,
+            reconnecting: false,
+            never_connected: true,
+            detached: false,
+            max_reconnect_tries: None,
+            connect_timeout: Self::INITIAL_CONNECT_TIMEOUT,
+            prefer_ipv6: false,
+            i2p_tunneled: false,
+            socket: None,
+            frame_buffer: Vec::new(),
+            transmit_buffer: Arc::new(Mutex::new(Vec::new())),
+            force_read_exit: Arc::new(AtomicBool::new(false)),
+            heartbeat_running: false,
+        }
+    }
+
     fn initial_connect(&mut self) -> Result<(), String> {
         log(
             &format!("Establishing TCP connection for {}...", self.to_string()),
@@ -823,15 +849,32 @@ impl BackboneClientInterface {
         self.frame_buffer.extend_from_slice(data);
         self.base.rxb += data.len() as u64;
 
+        for frame in self.drain_frames() {
+            let interface_name = self.base.name.clone();
+            let _ = RnsTransport::inbound(frame, interface_name);
+        }
+    }
+
+    /// Decode every complete HDLC frame currently buffered, dropping the ones
+    /// the frame bounds reject.
+    ///
+    /// Split out of `receive` so the bounds can be exercised without a
+    /// socket. Buffer handling is unchanged.
+    fn drain_frames(&mut self) -> Vec<Vec<u8>> {
+        let hw_mtu = self.base.hw_mtu.unwrap_or(Self::HW_MTU);
+        let ifac_size = self.base.ifac_size;
+        let mut frames: Vec<Vec<u8>> = Vec::new();
         loop {
             let frame_start = self.frame_buffer.iter().position(|&b| b == Hdlc::FLAG);
             if frame_start.is_none() {
+                self.discard_overlong_frame_buffer(hw_mtu);
                 break;
             }
             let frame_start = frame_start.unwrap();
 
             let frame_end = self.frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG);
             if frame_end.is_none() {
+                self.discard_overlong_frame_buffer(hw_mtu);
                 break;
             }
             let frame_end = frame_start + 1 + frame_end.unwrap();
@@ -859,10 +902,31 @@ impl BackboneClientInterface {
                 }
             }
 
-            if unescaped.len() > crate::reticulum::HEADER_MINSIZE {
-                let interface_name = self.base.name.clone();
-                let _ = RnsTransport::inbound(unescaped, interface_name);
+            // RNS/Interfaces/TCPInterface.py:337-340 check_frame_len(). The
+            // minimum was already here; the upper bound was not, so a frame
+            // of any size at all reached Transport until 2026-09-22.
+            if crate::interfaces::interface::check_frame_len(unescaped.len(), hw_mtu, ifac_size) {
+                frames.push(unescaped);
             }
+        }
+        frames
+    }
+
+    /// RNS/Interfaces/TCPInterface.py:408 — a buffer that has grown past
+    /// `HW_MTU*2` without a closing flag is never going to produce a frame.
+    fn discard_overlong_frame_buffer(&mut self, hw_mtu: usize) {
+        if crate::interfaces::interface::frame_buffer_exceeded(self.frame_buffer.len(), hw_mtu) {
+            crate::log(
+                &format!(
+                    "Dropping {} B of unterminated frame data on {}",
+                    self.frame_buffer.len(),
+                    self.base.name.as_deref().unwrap_or("BackboneInterface")
+                ),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+            self.frame_buffer.clear();
         }
     }
 
@@ -1013,7 +1077,57 @@ fn _now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::BackboneClientInterface;
+    use super::{BackboneClientInterface, Hdlc};
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![Hdlc::FLAG];
+        frame.extend_from_slice(&Hdlc::escape(payload));
+        frame.push(Hdlc::FLAG);
+        frame
+    }
+
+    /// B12: RNS/Interfaces/TCPInterface.py:337-340 — this read loop had the
+    /// minimum but no upper bound, so a frame of any size at all reached
+    /// `Transport::inbound`.
+    #[test]
+    fn backbone_frame_bounds_reject_stub_and_oversized_frames() {
+        let mut iface = BackboneClientInterface::disconnected_for_test("test-backbone-bounds");
+        iface.base.hw_mtu = Some(64);
+        iface.base.ifac_size = 0;
+        let min = crate::reticulum::HEADER_MINSIZE;
+
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x41u8; min]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x42u8; min + 1]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x43u8; 64]));
+        iface.frame_buffer.extend_from_slice(&framed(&vec![0x44u8; 65]));
+
+        let frames = iface.drain_frames();
+        assert_eq!(
+            frames,
+            vec![vec![0x42u8; min + 1], vec![0x43u8; 64]],
+            "only frames larger than HEADER_MINSIZE and no larger than hw_mtu + ifac_size \
+             may reach Transport"
+        );
+    }
+
+    /// B12: RNS/Interfaces/TCPInterface.py:408 — an unterminated buffer is
+    /// dropped once it passes HW_MTU*2 instead of growing without bound.
+    #[test]
+    fn backbone_unterminated_frame_buffer_is_dropped_past_twice_hw_mtu() {
+        let mut iface = BackboneClientInterface::disconnected_for_test("test-backbone-buffer");
+        iface.base.hw_mtu = Some(64);
+
+        iface.frame_buffer = vec![0x41u8; 128];
+        assert!(iface.drain_frames().is_empty());
+        assert_eq!(iface.frame_buffer.len(), 128, "exactly HW_MTU*2 is still kept");
+
+        iface.frame_buffer.push(0x41);
+        assert!(iface.drain_frames().is_empty());
+        assert!(
+            iface.frame_buffer.is_empty(),
+            "one byte past HW_MTU*2 without a closing flag must be dropped"
+        );
+    }
 
     #[test]
     fn resolve_target_addr_accepts_ip_literals() {

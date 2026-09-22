@@ -564,24 +564,17 @@ impl TcpClientInterface {
 
     /// RNS/Interfaces/TCPInterface.py:337-340 `check_frame_len`.
     ///
-    /// A decoded frame is only handed to Transport when it is strictly
-    /// larger than a minimum Reticulum header and no larger than what this
-    /// interface can carry. The inline check this replaces used a
-    /// `HEADER_MINSIZE = 2` placeholder and had no upper bound at all, so
-    /// stub frames and oversized frames both reached `Transport::inbound`.
+    /// The bound itself lives in `interfaces::interface` so that every HDLC
+    /// read loop in this port shares one definition; this stays as the name
+    /// the TCP read loops (and their tests) already use.
     pub fn check_frame_len(frame_len: usize, hw_mtu: usize, ifac_size: usize) -> bool {
-        if frame_len <= crate::reticulum::HEADER_MINSIZE {
-            false
-        } else {
-            frame_len <= hw_mtu + ifac_size
-        }
+        super::interface::check_frame_len(frame_len, hw_mtu, ifac_size)
     }
 
-    /// RNS/Interfaces/TCPInterface.py:408 — a frame buffer that has grown
-    /// past `HW_MTU*2` without yielding a closing flag is never going to,
-    /// so it is dropped rather than grown without bound.
+    /// RNS/Interfaces/TCPInterface.py:408 — see
+    /// `interfaces::interface::frame_buffer_exceeded`.
     pub fn frame_buffer_exceeded(buffer_len: usize, hw_mtu: usize) -> bool {
-        buffer_len > hw_mtu * 2
+        super::interface::frame_buffer_exceeded(buffer_len, hw_mtu)
     }
 
     /// Process incoming data
