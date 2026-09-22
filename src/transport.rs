@@ -675,8 +675,8 @@ pub type AnnounceCallback = Arc<dyn Fn(&[u8], &Identity, &[u8], Option<Vec<u8>>,
 /// See `Transport::publish_destination` for usage.
 #[derive(Clone, Debug)]
 pub struct PublishedDestination {
-    /// Refresh interval in seconds. `None` = no periodic announce; only
-    /// re-announce on interface up-edge.
+    /// Refresh interval in seconds. `None` = no periodic announce; the
+    /// destination is announced only when the application announces it.
     pub refresh_interval: Option<f64>,
     /// Wall-clock (seconds since UNIX epoch) of the last announce dispatch.
     /// `0.0` means "never announced yet" — the next jobs() tick will
@@ -1295,84 +1295,13 @@ impl Transport {
         Transport::persist_data();
     }
 
-    /// Synthesize a tunnel on a TCP interface so the remote transport
-    /// daemon (rnsd) associates this connection with our transport
-    /// identity.  This must be called after the initial connection and
-    /// after every reconnection for non-KISS TCP interfaces.
-    ///
-    /// `interface_name` is the InterfaceStub name (used for
-    /// `attached_interface` routing).
-    ///
-    /// Re-announce all locally registered IN/SINGLE destinations to a specific
-    /// interface.  Called after a new interface connects so that the remote
-    /// transport node learns about all local destinations immediately, without
-    /// waiting for the periodic announce cycle.
-    pub fn announce_all_destinations(interface_name: &str) {
-        // If the application has opted in to library-managed publication,
-        // only re-announce the published set on interface up-edges.  This
-        // avoids leaking ephemeral / request-only IN destinations onto the
-        // network on every reconnect.  When the published set is empty
-        // (legacy callers), fall back to the historical "all IN/SINGLE"
-        // behaviour for backwards compatibility.
-        let (destinations, published_filter, published_app_data) = {
-            let state = TRANSPORT.lock().unwrap();
-            let filter: Option<HashSet<Vec<u8>>> = if state.published_destinations.is_empty() {
-                None
-            } else {
-                Some(state.published_destinations.keys().cloned().collect())
-            };
-            let app_data_map: HashMap<Vec<u8>, Option<Vec<u8>>> = state.published_destinations
-                .iter()
-                .map(|(h, e)| (h.clone(), e.app_data.clone()))
-                .collect();
-            (state.destinations.clone(), filter, app_data_map)
-        };
-        let iface = interface_name.to_string();
-        let mut announced: Vec<Vec<u8>> = Vec::new();
-        for mut dest in destinations {
-            if dest.direction != crate::destination::Direction::IN { continue; }
-            if dest.dest_type != crate::destination::DestinationType::Single { continue; }
-            if let Some(ref allowed) = published_filter {
-                if !allowed.contains(&dest.hash) { continue; }
-            }
-            log(
-                &format!("Re-announcing {} to interface {}", crate::hexrep(&dest.hash, true), iface),
-                LOG_NOTICE, false, false,
-            );
-            // Carry the app_data the application registered via
-            // `publish_destination` so interface-up re-announces stay
-            // consistent with the periodic-refresh schedule (which also
-            // uses this app_data).  Falls back to the destination's
-            // default_app_data when `None`.
-            let app_data_ref = published_app_data
-                .get(&dest.hash)
-                .and_then(|o| o.as_deref());
-            if dest.announce(app_data_ref, false, Some(iface.clone()), None, true).is_ok() {
-                announced.push(dest.hash.clone());
-            }
-        }
-        // Bump last_announced_at for any published entries we just
-        // announced — piggy-backing the up-edge announce against the
-        // periodic-refresh schedule prevents an immediate double-announce
-        // if the refresh timer was about to fire anyway.
-        if !announced.is_empty() {
-            let now_ts = now();
-            let mut state = TRANSPORT.lock().unwrap();
-            for hash in &announced {
-                if let Some(entry) = state.published_destinations.get_mut(hash) {
-                    entry.last_announced_at = now_ts;
-                }
-            }
-        }
-    }
-
     /// Opt a locally-registered IN/SINGLE destination into Transport's
     /// announce daemon.
     ///
-    /// Once published, the destination is automatically announced:
-    ///   * once on every false→true `online` transition of any
-    ///     interface (covers reconnects and post-handshake events), and
-    ///   * every `refresh_interval` if `Some(...)` is supplied.
+    /// Once published, the destination is announced every
+    /// `refresh_interval` if `Some(...)` is supplied (the first sweep
+    /// announces it immediately). Nothing else announces on its own: as in
+    /// the reference, interface state changes never trigger announces.
     ///
     /// Calling `publish_destination` with the same hash a second time
     /// updates the existing entry (e.g. to change the refresh interval
@@ -1420,6 +1349,14 @@ impl Transport {
         state.published_destinations.contains_key(destination_hash)
     }
 
+    /// Synthesize a tunnel on a TCP interface so the remote transport
+    /// daemon (rnsd) associates this connection with our transport
+    /// identity.  This must be called after the initial connection and
+    /// after every reconnection for non-KISS TCP interfaces.
+    ///
+    /// `interface_name` is the InterfaceStub name (used for
+    /// `attached_interface` routing).
+    ///
     /// `interface_repr` is the full string representation matching
     /// Python's `str(interface)`, e.g.
     /// `"TCPInterface[LOCAL/192.168.2.113:4242]"`.  It is used to
@@ -1716,53 +1653,21 @@ impl Transport {
                 iface.online = online;
             }
         }
-        // On false→true transition, re-announce locally-registered
-        // destinations on this interface so any announces attempted while it
-        // was offline are delivered now that the link is up. When the
-        // application has opted in via `publish_destination`, only the
-        // published set is re-announced; otherwise (legacy callers) all
-        // IN/SINGLE destinations are re-announced.  See
-        // `announce_all_destinations` for filter logic.
+        // As in RNS/Transport.py, an interface state change announces
+        // nothing. Destinations are announced only when the application
+        // asks (or on the refresh interval it chose via
+        // `publish_destination`). Until 2026-09-22 this re-announced every
+        // IN/SINGLE destination on each up-transition and, on each
+        // down-transition, via every other interface; public transport
+        // nodes rate-limit announces per destination and blocked the
+        // Android app (24 announces in 40 min over three flapping
+        // backbones) and the fcm bridge (138 in 35 min in a reconnect
+        // loop), so their direct paths vanished. PARITY-AUDIT-1.5.2.md B22.
         if transitioned_up {
-            log(
-                &format!("Interface {} transitioned online — re-announcing local destinations", name),
-                LOG_NOTICE, false, false,
-            );
-            Self::announce_all_destinations(name);
+            log(&format!("Interface {} transitioned online", name), LOG_NOTICE, false, false);
         }
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§2
-        //
-        // On true→false transition, re-announce on every other online
-        // interface so remote nodes can update their path-to-us immediately.
-        //
-        // Without this, a remote peer (e.g. Meshchat) that last heard about
-        // us via the now-dead interface will still try to route LINKPROOF
-        // packets back via that interface — they'll be silently dropped and
-        // link establishment will time out.  Re-announcing via still-online
-        // interfaces (e.g. RMap) updates remote routing tables so proofs
-        // can reach us.  This is deterministic: interface offline IS the
-        // "routing stale" signal.
         if transitioned_down {
-            let other_ifaces: Vec<String> = {
-                let state = TRANSPORT.lock().unwrap();
-                state.interfaces.iter()
-                    .chain(state.local_client_interfaces.iter())
-                    .filter(|i| i.online && i.name.as_str() != name)
-                    .map(|i| i.name.clone())
-                    .collect()
-            };
-            if !other_ifaces.is_empty() {
-                log(
-                    &format!(
-                        "Interface {} transitioned offline — re-announcing via {} other interface(s)",
-                        name, other_ifaces.len()
-                    ),
-                    LOG_NOTICE, false, false,
-                );
-                for iface_name in &other_ifaces {
-                    Self::announce_all_destinations(iface_name);
-                }
-            }
+            log(&format!("Interface {} transitioned offline", name), LOG_NOTICE, false, false);
         }
     }
 
@@ -8144,6 +8049,70 @@ mod tests {
 
     fn uninstall_sync_outbound_handler(iface_name: &str) {
         OUTBOUND_HANDLERS.lock().unwrap().remove(iface_name);
+    }
+
+    /// RNS/Transport.py has no announce of its own: a destination is
+    /// announced only when the application asks. Until 2026-09-22
+    /// `set_interface_online` re-announced every IN/SINGLE destination on
+    /// each up-transition and, on each down-transition, via every other
+    /// interface. Public transport nodes rate-limit announces per
+    /// destination (Transport.py:1782) and block a chatty one: the Android
+    /// app announced 24 times in 40 min over three flapping backbones and
+    /// the fcm bridge, in a TCP reconnect loop, 138 times in 35 min; both
+    /// were blocked at rns.michmesh.net and their direct paths vanished
+    /// (PARITY-AUDIT-1.5.2.md B22).
+    #[test]
+    fn interface_transitions_do_not_announce() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-no-announce-on-transition";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+        }
+        let destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "transition_test".to_string(),
+            vec!["parity".to_string()],
+        )
+        .expect("inbound destination");
+        let mut app_copy = destination.clone();
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        // Published without a refresh interval: the daemon has nothing to do.
+        Transport::publish_destination(dest_hash.clone(), None, None);
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface_name.to_string();
+        stub_config.online = Some(false);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+
+        Transport::set_interface_online(iface_name, true);
+        Transport::set_interface_online(iface_name, false);
+        Transport::set_interface_online(iface_name, true);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an interface state change must not announce anything; got {} frame(s)",
+            captured.lock().unwrap().len()
+        );
+
+        // The application's own announce still reaches the (online) interface,
+        // so the empty capture above is not an artefact of the harness.
+        app_copy
+            .announce(None, false, Some(iface_name.to_string()), None, true)
+            .expect("application announce");
+        assert_eq!(captured.lock().unwrap().len(), 1, "the application's announce goes out");
+
+        Transport::unpublish_destination(&dest_hash);
+        uninstall_sync_outbound_handler(iface_name);
     }
 
     #[test]

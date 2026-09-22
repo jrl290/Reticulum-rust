@@ -219,10 +219,8 @@ impl KissInterface {
                 return;
             }
 
-            // Notify Transport so the false→true transition triggers an
-            // automatic re-announce of all locally registered destinations on
-            // this interface (covers initial open and any later re-open
-            // after a reconnect).
+            // Notify Transport of the online transition (initial open and
+            // any later re-open after a reconnect).
             if let Some(name) = iface_name {
                 RnsTransport::set_interface_online(&name, true);
             }
