@@ -1,7 +1,6 @@
 use crate::identity::{Identity, full_hash, truncated_hash, Token};
 use crate::packet::{Packet, LINKREQUEST, DATA, PATH_RESPONSE as PATHRESPONSE, NONE, FLAG_SET, FLAG_UNSET};
 use rmp_serde::{decode::from_slice, encode::to_vec};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,16 +66,6 @@ pub struct RequestHandler {
 	pub callback: Option<RequestHandlerCallback>,
 }
 
-/// Python RNS wire format for a REQUEST packet payload:
-/// msgpack array [timestamp_f64, path_hash_16bytes, data_bytes]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RequestPayload(f64, serde_bytes::ByteBuf, serde_bytes::ByteBuf);
-
-/// Python RNS wire format for a RESPONSE packet payload:
-/// msgpack array [request_id_16bytes, response_bytes]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ResponsePayload(serde_bytes::ByteBuf, serde_bytes::ByteBuf);
-
 #[derive(Clone, Default)]
 pub struct Callbacks {
 	pub packet: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
@@ -118,6 +107,11 @@ pub struct Destination {
 	pub enforce_ratchets: bool,
 	pub callbacks: Callbacks,
 	pub request_handlers: HashMap<Vec<u8>, RequestHandler>,
+	/// RNS/Destination.py set_max_request_size(): requests larger than this
+	/// (packet or Resource) are ignored before any handler runs. `None`
+	/// means unlimited, as upstream. Read by the link at request time from
+	/// the destination it was accepted on, so set it before links exist.
+	pub max_request_size: Option<usize>,
 	pub links: Vec<crate::link::Link>,
 	// GROUP destination fields
 	pub prv_bytes: Option<Vec<u8>>,  // Symmetric key for GROUP destinations
@@ -157,6 +151,7 @@ impl Clone for Destination {
 			enforce_ratchets: self.enforce_ratchets,
 			callbacks: self.callbacks.clone(),
 			request_handlers: self.request_handlers.clone(),
+			max_request_size: self.max_request_size,
 			links: self.links.clone(),
 			prv_bytes: self.prv_bytes.clone(),
 			token: Arc::clone(&self.token),
@@ -206,6 +201,7 @@ impl Default for Destination {
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
+			max_request_size: None,
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
@@ -402,6 +398,7 @@ impl Destination {
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
+			max_request_size: None,
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
@@ -421,9 +418,19 @@ impl Destination {
 			return Err("Dots can't be used in app names".to_string());
 		}
 		
-		if dest_type != DestinationType::Plain && identity.is_none() {
-			return Err("Can't create inbound SINGLE/GROUP/LINK destination without an identity".to_string());
-		}
+		// RNS/Destination.py __init__: an IN destination of any type but
+		// PLAIN created without an identity gets a fresh one, and its hexhash
+		// becomes the last aspect.
+		let mut aspects = aspects;
+		let identity = if dest_type != DestinationType::Plain && identity.is_none() {
+			let minted = Identity::new(true);
+			if let Some(hash) = minted.hash.as_ref() {
+				aspects.push(crate::hexrep(hash, false));
+			}
+			Some(minted)
+		} else {
+			identity
+		};
 		
 		if dest_type == DestinationType::Plain && identity.is_some() {
 			return Err("Selected destination type PLAIN cannot hold an identity".to_string());
@@ -486,6 +493,7 @@ impl Destination {
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
+			max_request_size: None,
 			links: Vec::new(),
 			prv_bytes: None,
 			token: Arc::new(Mutex::new(None)),
@@ -560,6 +568,11 @@ impl Destination {
 	}
 	
 	/// Deregister a request handler for a path
+	/// RNS/Destination.py set_max_request_size(). `None` removes the limit.
+	pub fn set_max_request_size(&mut self, max_request_size: Option<usize>) {
+		self.max_request_size = max_request_size;
+	}
+
 	pub fn deregister_request_handler(&mut self, path: &str) -> bool {
 		let path_hash = truncated_hash(path.as_bytes());
 		self.request_handlers.remove(&path_hash).is_some()
@@ -728,11 +741,11 @@ impl Destination {
 			// Decrypt packet data
 			let _plaintext = self.decrypt(&packet.data)?;
 
-			if packet.packet_type == DATA && packet.context == crate::packet::REQUEST {
-				self.handle_request_packet(packet, &_plaintext)?;
-				return Ok(true);
-			}
-			
+			// RNS/Destination.py receive(): a DATA packet reaches the packet
+			// callback whatever its context. Requests exist only on links
+			// (Link.py handle_request); until 2026-09-22 a REQUEST-context
+			// packet was intercepted here and dispatched with the hex of the
+			// path hash as the path, no remote identity, and no allow check.
 			// Update ratchet ID if present
 			if let Some(ratchet_id) = &packet.ratchet_id {
 				self.latest_ratchet_id = Some(ratchet_id.clone());
@@ -754,65 +767,6 @@ impl Destination {
 		}
 	}
 
-	fn handle_request_packet(&self, packet: &Packet, plaintext: &[u8]) -> Result<(), String> {
-		// Python RNS wire format: [timestamp_f64, path_hash_16bytes, data_bytes]
-		let payload: RequestPayload = match from_slice(plaintext) {
-			Ok(parsed) => parsed,
-			Err(e) => {
-				eprintln!("[DEST] handle_request_packet: failed to decode payload: {} len={}", e, plaintext.len());
-				return Ok(());
-			}
-		};
-
-		let path_hash: Vec<u8> = payload.1.to_vec();
-		let request_data: Vec<u8> = payload.2.to_vec();
-		// request_id = truncated hash of the raw packet (Python: packet.getTruncatedHash())
-		let request_id = packet.get_truncated_hash();
-
-		let handler = match self.request_handlers.get(&path_hash) {
-			Some(handler) => handler,
-			None => return Ok(()),
-		};
-
-		let callback = handler.callback.clone();
-		let path_hex = crate::hexrep(&path_hash, false);
-		let destination = packet.destination.clone();
-		thread::spawn(move || {
-			let response = if let Some(callback) = callback {
-				let remote_identity: Option<&Identity> = None;
-				callback(&path_hex, &request_data, &request_id, remote_identity, None, payload.0)
-			} else {
-				Vec::new()
-			};
-
-			// Python RNS response wire format: [request_id_bytes, response_bytes]
-			let response_payload = ResponsePayload(
-				serde_bytes::ByteBuf::from(request_id),
-				serde_bytes::ByteBuf::from(response),
-			);
-
-			let response_data = match to_vec(&response_payload) {
-				Ok(data) => data,
-				Err(_) => return,
-			};
-
-			let mut response_packet = Packet::new(
-				destination,
-				response_data,
-				DATA,
-				crate::packet::RESPONSE,
-				crate::transport::BROADCAST,
-				crate::packet::HEADER_1,
-				None,
-				None,
-				false,
-				0,
-			);
-			let _ = response_packet.send();
-		});
-		Ok(())
-	}
-	
 	/// Handle incoming link request
 	pub fn incoming_link_request(&mut self, _data: &[u8], _packet: &Packet) -> Result<(), String> {
 		if !self.accept_link_requests {

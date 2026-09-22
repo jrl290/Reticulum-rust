@@ -164,6 +164,8 @@ enum LinkMsg {
         response_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         failed_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         progress_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        timeout: Option<f64>,
+        max_response_size: Option<usize>,
         reply: Reply<Result<Vec<u8>, LinkGone>>,
     },
     SendPacket(Vec<u8>, Reply<Result<(), LinkGone>>),
@@ -189,11 +191,17 @@ enum LinkMsg {
     SetRemoteIdentifiedCallback(Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>),
     SetResourceStrategy(u8),
     SetResourceCallbacks {
-        resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        resource: Option<ResourceAcceptCallback>,
         started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     },
     SetTrackPhyStats(bool),
+    SetResourceCallback(Option<ResourceAcceptCallback>),
+    SetResourceStartedCallback(Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>),
+    SetResourceConcludedCallback(Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>),
+    /// The application's ACCEPT_APP verdict on an advertisement, returned
+    /// to the actor from the thread the callback ran on.
+    AdvertisedResourceDecision { advertisement_packet: Packet, accept: bool },
 
     // --- Internal (used by dispatch_runtime_packet) ---
     Receive(Packet, Reply<ReceiveResult>),
@@ -386,6 +394,23 @@ impl LinkHandle {
         failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
     ) -> Result<Vec<u8>, LinkGone> {
+        self.request_with_options(path, data, response_callback, failed_callback, progress_callback, None, None)
+    }
+
+    /// RNS/Link.py request() with its last two keyword arguments: `timeout`
+    /// overrides the link's own response timeout for this request, and
+    /// `max_response_size` rejects a response larger than that many bytes
+    /// (the failed callback fires, as with `response_rejected()`).
+    pub fn request_with_options(
+        &self,
+        path: String,
+        data: Vec<u8>,
+        response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        timeout: Option<f64>,
+        max_response_size: Option<usize>,
+    ) -> Result<Vec<u8>, LinkGone> {
         let (tx, rx) = oneshot();
         self.tx.send(LinkMsg::Request {
             path,
@@ -393,6 +418,8 @@ impl LinkHandle {
             response_cb: response_callback,
             failed_cb: failed_callback,
             progress_cb: progress_callback,
+            timeout,
+            max_response_size,
             reply: tx,
         }).map_err(|_| LinkGone)?;
         rx.recv().map_err(|_| LinkGone)?
@@ -499,11 +526,30 @@ impl LinkHandle {
 
     pub fn set_resource_callbacks(
         &self,
-        resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        resource: Option<ResourceAcceptCallback>,
         started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     ) {
         let _ = self.tx.send(LinkMsg::SetResourceCallbacks { resource, started, concluded });
+    }
+
+    /// RNS/Link.py set_resource_callback(): decides ACCEPT_APP acceptance.
+    pub fn set_resource_callback(&self, callback: Option<ResourceAcceptCallback>) {
+        let _ = self.tx.send(LinkMsg::SetResourceCallback(callback));
+    }
+
+    /// RNS/Link.py set_resource_started_callback().
+    pub fn set_resource_started_callback(&self, callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>) {
+        let _ = self.tx.send(LinkMsg::SetResourceStartedCallback(callback));
+    }
+
+    /// RNS/Link.py set_resource_concluded_callback().
+    pub fn set_resource_concluded_callback(&self, callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>) {
+        let _ = self.tx.send(LinkMsg::SetResourceConcludedCallback(callback));
+    }
+
+    fn advertised_resource_decision(&self, advertisement_packet: Packet, accept: bool) {
+        let _ = self.tx.send(LinkMsg::AdvertisedResourceDecision { advertisement_packet, accept });
     }
 
     pub fn set_track_phy_stats(&self, track: bool) {
@@ -687,7 +733,10 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
                 .max(activated_at);
             let keepalive_secs = link.keepalive as u64;
 
-            if now >= last_inbound + keepalive_secs {
+            // RNS/Link.py:749 (1.5.2): the destination side streaming data
+            // with the initiator never sending would otherwise let the
+            // initiator's own silence pass for staleness.
+            if now >= last_inbound + keepalive_secs || now >= link.last_outbound + keepalive_secs {
                 // Send keepalive if due
                 if link.initiator && now >= link.last_keepalive + keepalive_secs {
                     if let Some((dest, _link_id)) = link.prepare_keepalive() {
@@ -886,9 +935,9 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
         // All of these are bounded-latency, so replying
         // synchronously to the caller is safe — the FFI / UI
         // thread is never blocked on socket RTT.
-        LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, reply } => {
+        LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, timeout, max_response_size, reply } => {
             let result = link
-                .request(path, data, response_cb, failed_cb, progress_cb)
+                .request(path, data, response_cb, failed_cb, progress_cb, timeout, max_response_size)
                 .map_err(|e| {
                     crate::log(
                         &format!("[LINK] request submission failed: {}", e),
@@ -997,6 +1046,24 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
             link.callbacks.resource = resource;
             link.callbacks.resource_started = started;
             link.callbacks.resource_concluded = concluded;
+        }
+        LinkMsg::SetResourceCallback(cb) => {
+            link.callbacks.resource = cb;
+        }
+        LinkMsg::SetResourceStartedCallback(cb) => {
+            link.callbacks.resource_started = cb;
+        }
+        LinkMsg::SetResourceConcludedCallback(cb) => {
+            link.callbacks.resource_concluded = cb;
+        }
+        LinkMsg::AdvertisedResourceDecision { advertisement_packet, accept } => {
+            // RNS/Link.py:1108-1109
+            if accept {
+                let concluded = link.callbacks.resource_concluded.clone();
+                link.accept_advertised_resource(&advertisement_packet, concluded, None, None);
+            } else {
+                Resource::reject(&advertisement_packet);
+            }
         }
         LinkMsg::SetTrackPhyStats(track) => {
             link.track_phy_stats = track;
@@ -1154,19 +1221,7 @@ fn actor_check_request_timeouts(link: &mut Link) {
         });
     }
     for timed_out_req in timed_out {
-        if let Some(callback) = timed_out_req.failed_callback {
-            let receipt = RequestReceipt {
-                request_id: timed_out_req.request_id.clone(),
-                response: None,
-                link: Arc::new(Mutex::new(link.clone())),
-                sent_at: timed_out_req.sent_at,
-                received_at: None,
-                progress: 0.0,
-            };
-            thread::spawn(move || {
-                callback(receipt);
-            });
-        }
+        timed_out_req.fail(Arc::new(Mutex::new(link.clone())));
     }
 }
 
@@ -1511,13 +1566,20 @@ pub fn link_id_from_lr_packet(packet: &Packet) -> Vec<u8> {
     result
 }
 
+/// RNS/Link.py `callbacks.resource(advertisement) -> bool`.
+pub type ResourceAcceptCallback = Arc<dyn Fn(&crate::resource::ResourceAdvertisement) -> bool + Send + Sync>;
+
 /// Callbacks for link lifecycle events
 #[derive(Clone, Default)]
 pub struct LinkCallbacks {
     pub link_established: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     pub link_closed: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     pub packet: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
-    pub resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+    /// RNS/Link.py set_resource_callback(): under ACCEPT_APP the callback
+    /// is handed the advertisement and its return value decides whether
+    /// the resource is accepted. Until 2026-09-22 the Rust callback received
+    /// an already-accepted Resource and could only cancel it afterwards.
+    pub resource: Option<ResourceAcceptCallback>,
     pub resource_started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     pub resource_concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     pub remote_identified: Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>,
@@ -1533,19 +1595,72 @@ struct RequestPayload(f64, serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResponsePayload(serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 
+// RNS/Link.py RequestReceipt status values
+pub const REQUEST_FAILED: u8 = 0x00;
+pub const REQUEST_SENT: u8 = 0x01;
+pub const REQUEST_DELIVERED: u8 = 0x02;
+pub const REQUEST_RECEIVING: u8 = 0x03;
+pub const REQUEST_READY: u8 = 0x04;
+
+/// RNS/Link.py RequestReceipt, as handed to the response, failed and
+/// progress callbacks. A snapshot of the pending request at the moment the
+/// callback fires; the fields and accessors follow the Python object.
 #[derive(Clone)]
 pub struct RequestReceipt {
     pub request_id: Vec<u8>,
+    /// The response bytes (msgpack-encoded value) once `status` is READY.
     pub response: Option<Vec<u8>>,
+    /// Response metadata for a metadata-bearing response Resource, raw as
+    /// received. `None` otherwise.
+    pub metadata: Option<Vec<u8>>,
     pub link: Arc<Mutex<Link>>,
+    pub status: u8,
     pub sent_at: f64,
+    /// When the wait for the response began (Python `started_at`).
+    pub started_at: Option<f64>,
+    /// When the response arrived (Python `response_concluded_at`).
     pub received_at: Option<f64>,
+    /// When the request concluded by failure (Python `concluded_at`).
+    pub concluded_at: Option<f64>,
     pub progress: f64,
+    pub response_size: Option<usize>,
+    pub response_transfer_size: Option<usize>,
+    pub timeout: f64,
+    pub max_response_size: Option<usize>,
 }
 
 impl RequestReceipt {
+    pub fn get_request_id(&self) -> &[u8] {
+        &self.request_id
+    }
+
+    pub fn get_status(&self) -> u8 {
+        self.status
+    }
+
     pub fn get_progress(&self) -> f64 {
         self.progress
+    }
+
+    /// The response if it is ready, otherwise `None` (RNS/Link.py:1478).
+    pub fn get_response(&self) -> Option<&[u8]> {
+        if self.status == REQUEST_READY { self.response.as_deref() } else { None }
+    }
+
+    /// Seconds from the start of the wait to the response, once ready.
+    pub fn get_response_time(&self) -> Option<f64> {
+        if self.status == REQUEST_READY {
+            match (self.received_at, self.started_at) {
+                (Some(received), Some(started)) => Some(received - started),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn concluded(&self) -> bool {
+        self.status == REQUEST_READY || self.status == REQUEST_FAILED
     }
 }
 
@@ -1558,6 +1673,12 @@ struct PendingRequest {
     request_id: Vec<u8>,
     sent_at: f64,
     timeout: f64,
+    status: u8,
+    started_at: Option<f64>,
+    progress: f64,
+    response_size: Option<usize>,
+    response_transfer_size: Option<usize>,
+    max_response_size: Option<usize>,
     /// When the wait for a response began. `None` while the request is still
     /// uploading as a Resource: RNS/Link.py `request_resource_concluded` only
     /// starts the response timeout once the upload has concluded, because
@@ -1571,8 +1692,68 @@ struct PendingRequest {
     receiving_response: bool,
     response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
     failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
-    #[allow(dead_code)]
     progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+}
+
+impl PendingRequest {
+    fn new(
+        request_id: Vec<u8>,
+        sent_at: f64,
+        timeout: f64,
+        max_response_size: Option<usize>,
+        response_clock_started: Option<f64>,
+        response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+    ) -> Self {
+        PendingRequest {
+            request_id,
+            sent_at,
+            timeout,
+            status: REQUEST_SENT,
+            started_at: response_clock_started,
+            progress: 0.0,
+            response_size: None,
+            response_transfer_size: None,
+            max_response_size,
+            response_clock_started,
+            receiving_response: false,
+            response_callback,
+            failed_callback,
+            progress_callback,
+        }
+    }
+
+    /// The receipt handed to a callback: the request's current state plus
+    /// the outcome fields the caller supplies.
+    fn receipt(&self, link: Arc<Mutex<Link>>, response: Option<Vec<u8>>, metadata: Option<Vec<u8>>, received_at: Option<f64>, concluded_at: Option<f64>) -> RequestReceipt {
+        RequestReceipt {
+            request_id: self.request_id.clone(),
+            response,
+            metadata,
+            link,
+            status: self.status,
+            sent_at: self.sent_at,
+            started_at: self.started_at,
+            received_at,
+            concluded_at,
+            progress: self.progress,
+            response_size: self.response_size,
+            response_transfer_size: self.response_transfer_size,
+            timeout: self.timeout,
+            max_response_size: self.max_response_size,
+        }
+    }
+
+    /// RNS/Link.py RequestReceipt.request_timed_out / response_rejected:
+    /// the request is over, and the failed callback says so.
+    fn fail(mut self, link: Arc<Mutex<Link>>) {
+        self.status = REQUEST_FAILED;
+        let receipt = self.receipt(link, None, None, None, Some(now_seconds()));
+        if let Some(callback) = self.failed_callback {
+            thread::spawn(move || { callback(receipt); });
+        }
+    }
 }
 
 /// A link to a remote destination for encrypted communication
@@ -2546,17 +2727,11 @@ impl Link {
     }
     
     /// Get remote identity
-    pub fn get_remote_identity(&self) -> Option<String> {
-        // Returns a string placeholder since Identity doesn't implement Clone
-        if let Ok(id) = self.remote_identity.lock() {
-            if id.is_some() {
-                Some("remote_identity".to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    /// RNS/Link.py get_remote_identity(): the identity the peer proved with
+    /// LINKIDENTIFY, or `None`. Until 2026-09-22 this returned the literal
+    /// string "remote_identity" for any identified link.
+    pub fn get_remote_identity(&self) -> Option<Identity> {
+        self.remote_identity.lock().ok().and_then(|id| id.clone())
     }
     
     /// Set link established callback
@@ -2603,7 +2778,7 @@ impl Link {
     }
     
     /// Set resource callback
-    pub fn set_resource_callback(&mut self, callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>) {
+    pub fn set_resource_callback(&mut self, callback: Option<ResourceAcceptCallback>) {
         self.callbacks.resource = callback;
     }
     
@@ -2776,6 +2951,11 @@ impl Link {
         }
         self.state = STATE_CLOSED;
         self.status = STATE_CLOSED;
+        // RNS/Link.py teardown(): the side that closes names itself. A
+        // timeout has already set REASON_TIMEOUT before reaching here.
+        if self.teardown_reason != REASON_TIMEOUT {
+            self.teardown_reason = if self.initiator { REASON_INITIATOR_CLOSED } else { REASON_DESTINATION_CLOSED };
+        }
         unregister_runtime_link(&self.link_id);
         // Immediately remove the transport relay entry instead of waiting for
         // the periodic cull (~900s). Prevents stale link_table buildup on
@@ -2783,10 +2963,67 @@ impl Link {
         crate::transport::Transport::remove_link_entry(&self.link_id);
         self.link_closed();
     }
+
+    /// RNS/Link.py teardown_packet(): a LINKCLOSE from the peer, carrying
+    /// our link id, closes the link without answering with another
+    /// LINKCLOSE, and names the peer as the closing side.
+    fn teardown_packet(&mut self, plaintext: &[u8]) {
+        if plaintext != self.link_id.as_slice() {
+            return;
+        }
+        if self.state == STATE_CLOSED {
+            return;
+        }
+        self.state = STATE_CLOSED;
+        self.status = STATE_CLOSED;
+        self.teardown_reason = if self.initiator { REASON_DESTINATION_CLOSED } else { REASON_INITIATOR_CLOSED };
+        unregister_runtime_link(&self.link_id);
+        crate::transport::Transport::remove_link_entry(&self.link_id);
+        self.link_closed();
+    }
     
+    /// RNS/Resource.py accept(): the accepted resource is registered on the
+    /// link and, if the application asked, told that a transfer started.
+    /// Every acceptance on this link goes through here so that the
+    /// `resource_started` callback fires for requests, responses and plain
+    /// resources alike, as it does upstream.
+    fn accept_advertised_resource(
+        &mut self,
+        advertisement_packet: &Packet,
+        concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        progress: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        request_id: Option<Vec<u8>>,
+    ) -> Option<Arc<Mutex<Resource>>> {
+        let link_handle = self.self_handle.as_ref()?.clone();
+        let link_ctx = self.resource_link_context();
+        let resource = Resource::accept(advertisement_packet, link_handle, concluded, progress, request_id, Some(link_ctx))?;
+        // Register on the real link so RESOURCE data packets find it.
+        self.register_incoming_resource(resource.clone());
+        if let Some(started) = self.callbacks.resource_started.clone() {
+            let started_resource = resource.clone();
+            thread::spawn(move || started(started_resource));
+        }
+        Some(resource)
+    }
+
     /// Handle link closure cleanup
     fn link_closed(&mut self) {
-        // Cancel resources
+        // RNS/Link.py link_closed(): every in-flight resource is cancelled,
+        // which concludes it (status FAILED) through its own callback. The
+        // cancellations run off the actor thread: `Resource::cancel` asks
+        // the link whether it is active, and this is the actor.
+        let mut in_flight: Vec<Arc<Mutex<Resource>>> = Vec::new();
+        if let Ok(incoming) = self.incoming_resources.lock() { in_flight.extend(incoming.iter().cloned()); }
+        if let Ok(outgoing) = self.outgoing_resources.lock() { in_flight.extend(outgoing.iter().cloned()); }
+        if !in_flight.is_empty() {
+            thread::spawn(move || {
+                for resource in in_flight {
+                    if let Ok(mut resource) = resource.lock() {
+                        resource.cancel();
+                    }
+                }
+            });
+        }
         self.prv_bytes = None;
         self.pub_bytes = None;
         self.sig_prv_bytes = None;
@@ -2955,6 +3192,18 @@ impl Link {
                 }
             };
 
+            // RNS/Link.py:1035-1080 (1.5.2): the whole advertisement branch
+            // is one try/except, and any malformed advertisement tears the
+            // link down. Decrypt failures are not malformed advertisements
+            // (Python's decrypt returns None and the branch is skipped).
+            let advertisement = match crate::resource::ResourceAdvertisement::unpack(&plaintext) {
+                Ok(advertisement) => advertisement,
+                Err(e) => {
+                    crate::log(&format!("Invalid resource advertisement on link {}: {}", crate::hexrep(&self.link_id, false), e), crate::LOG_DEBUG, false, false);
+                    self.teardown();
+                    return Ok(());
+                }
+            };
             let mut advertisement_packet = packet.clone();
             advertisement_packet.plaintext = Some(plaintext);
 
@@ -2964,7 +3213,18 @@ impl Link {
                 is_req, is_resp), crate::LOG_NOTICE, false, false);
 
             if is_req {
-                let link_ctx = self.resource_link_context();
+                // RNS/Link.py:1037-1042: a request larger than the
+                // destination's max_request_size is rejected before it is
+                // ever assembled.
+                let max_request_size = self.destination.lock().ok().and_then(|d| d.max_request_size);
+                let request_size = crate::resource::ResourceAdvertisement::read_size(&advertisement_packet).unwrap_or(0);
+                if let Some(max) = max_request_size {
+                    if request_size > max {
+                        Resource::reject(&advertisement_packet);
+                        crate::log(&format!("Rejected request with excessive size {} B on link {}", request_size, crate::hexrep(&self.link_id, false)), crate::LOG_DEBUG, false, false);
+                        return Ok(());
+                    }
+                }
                 let adv_request_id =
                     crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet);
 
@@ -3005,17 +3265,7 @@ impl Link {
                         link_handle.handle_request_packet(request_id, data);
                     }));
 
-                if let Some(resource) = Resource::accept(
-                    &advertisement_packet,
-                    self.self_handle.as_ref().unwrap().clone(),
-                    request_concluded_cb,
-                    None,
-                    adv_request_id,
-                    Some(link_ctx),
-                ) {
-                    // Register on real link so RESOURCE data packets find it
-                    self.register_incoming_resource(resource);
-                }
+                self.accept_advertised_resource(&advertisement_packet, request_concluded_cb, None, adv_request_id);
                 return Ok(());
             }
 
@@ -3035,21 +3285,76 @@ impl Link {
                 // moves that request to RECEIVING, where the response timeout
                 // no longer applies — a large response on a slow link must not
                 // be failed by the timer while its parts are still arriving.
+                // RNS/Link.py:1043-1066: the response is accepted only for a
+                // request we are waiting on, only if it fits the request's
+                // max_response_size (else rejected, and the request fails),
+                // and accepting it records the sizes and starts the clock.
+                let response_size = crate::resource::ResourceAdvertisement::read_size(&advertisement_packet).unwrap_or(0);
+                let response_transfer_size = crate::resource::ResourceAdvertisement::read_transfer_size(&advertisement_packet).unwrap_or(0);
+                let link_arc = Arc::new(Mutex::new(self.clone()));
+                let mut rejected: Option<PendingRequest> = None;
                 let awaited = request_id_opt.as_ref().map(|request_id| {
                     self.pending_requests.lock().ok().map(|mut pending| {
-                        match pending.iter_mut().find(|p| &p.request_id == request_id) {
-                            Some(request) => { request.receiving_response = true; true }
+                        match pending.iter().position(|p| &p.request_id == request_id) {
+                            Some(index) => {
+                                let size_ok = pending[index].max_response_size.map(|max| response_size <= max).unwrap_or(true);
+                                if !size_ok {
+                                    rejected = Some(pending.remove(index));
+                                    false
+                                } else {
+                                    let request = &mut pending[index];
+                                    request.receiving_response = true;
+                                    request.status = REQUEST_RECEIVING;
+                                    if request.response_size.is_none() { request.response_size = Some(response_size); }
+                                    request.response_transfer_size = Some(request.response_transfer_size.unwrap_or(0) + response_transfer_size);
+                                    if request.started_at.is_none() { request.started_at = Some(now_seconds()); }
+                                    true
+                                }
+                            }
                             None => false,
                         }
                     }).unwrap_or(false)
                 }).unwrap_or(false);
+                if let Some(request) = rejected {
+                    Resource::reject(&advertisement_packet);
+                    crate::log(&format!("Rejected response with excessive size {} B on link {}", response_size, crate::hexrep(&self.link_id, false)), crate::LOG_DEBUG, false, false);
+                    request.fail(link_arc);
+                    return Ok(());
+                }
                 if !awaited {
                     crate::log("[RESP-RES] response resource matches no pending request — ignored (matches Python)", crate::LOG_NOTICE, false, false);
                     return Ok(());
                 }
 
                 let pending_requests = Arc::clone(&self.pending_requests);
-                let link_arc = Arc::new(Mutex::new(self.clone()));
+
+                // RNS/Link.py RequestReceipt.response_resource_progress(): the
+                // request's progress follows the response Resource, and the
+                // application's progress callback fires on every update.
+                let progress_pending = Arc::clone(&self.pending_requests);
+                let progress_link = Arc::clone(&link_arc);
+                let progress_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> =
+                    Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
+                        let (progress, resource_request_id) = match resource.lock() {
+                            Ok(mut r) => (r.get_progress(), r.request_id.clone()),
+                            Err(_) => return,
+                        };
+                        let Some(request_id) = resource_request_id else { return };
+                        let receipt = {
+                            let Ok(mut pending) = progress_pending.lock() else { return };
+                            let Some(request) = pending.iter_mut().find(|p| p.request_id == request_id) else { return };
+                            if request.status == REQUEST_FAILED { return }
+                            request.status = REQUEST_RECEIVING;
+                            request.progress = progress;
+                            match request.progress_callback.clone() {
+                                Some(callback) => Some((callback, request.receipt(Arc::clone(&progress_link), None, None, None, None))),
+                                None => None,
+                            }
+                        };
+                        if let Some((callback, receipt)) = receipt {
+                            callback(receipt);
+                        }
+                    }));
                 let concluded_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> =
                     Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
                         let (data_opt, res_request_id_opt, status) = {
@@ -3069,17 +3374,7 @@ impl Link {
                                 Some(pending.remove(index))
                             });
                             if let Some(request) = failed {
-                                if let Some(callback) = request.failed_callback {
-                                    let receipt = RequestReceipt {
-                                        request_id: request.request_id.clone(),
-                                        response: None,
-                                        link: Arc::clone(&link_arc),
-                                        sent_at: request.sent_at,
-                                        received_at: None,
-                                        progress: 0.0,
-                                    };
-                                    thread::spawn(move || { callback(receipt); });
-                                }
+                                request.fail(Arc::clone(&link_arc));
                             }
                             return;
                         }
@@ -3136,17 +3431,8 @@ impl Link {
                         if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
                             crate::log("[RESP-RES] found pending request, spawning callback thread", crate::LOG_NOTICE, false, false);
                             let request = pending.remove(index);
-                            let receipt = RequestReceipt {
-                                request_id: request_id.clone(),
-                                response: Some(response_bytes),
-                                link: Arc::clone(&link_arc),
-                                sent_at: request.sent_at,
-                                received_at: Some(current_time().unwrap_or(0) as f64),
-                                progress: 1.0,
-                            };
-                            if let Some(callback) = request.response_callback {
-                                thread::spawn(move || { callback(receipt); });
-                            }
+                            drop(pending);
+                            Link::response_received(request, Arc::clone(&link_arc), response_bytes, None);
                         } else {
                             crate::log(&format!(
                                 "[RESP-RES] NO matching pending request for id={}",
@@ -3155,15 +3441,12 @@ impl Link {
                         }
                     }));
 
-                if let Some(resource) = Resource::accept(
-                    &advertisement_packet,
-                    self.self_handle.as_ref().unwrap().clone(),
-                    concluded_callback,
-                    None,
-                    request_id_opt,
-                    Some(self.resource_link_context()),
-                ) {
-                    self.register_incoming_resource(resource);
+                // RNS/Link.py:1064: the progress callback runs once at
+                // acceptance, before any part has arrived.
+                if let Some(resource) = self.accept_advertised_resource(&advertisement_packet, concluded_callback, progress_callback.clone(), request_id_opt) {
+                    if let Some(progress_callback) = progress_callback {
+                        thread::spawn(move || progress_callback(resource));
+                    }
                 }
                 return Ok(());
             }
@@ -3185,52 +3468,31 @@ impl Link {
                 ACCEPT_NONE => {
                 }
                 ACCEPT_APP => {
-                    // Python parity (RNS/Link.py:1106-1109): ACCEPT_APP only
-                    // accepts the resource if `callbacks.resource` is set and
-                    // returns True. If no resource callback is registered,
-                    // the advertisement is silently ignored — assembling the
-                    // resource with no concluded callback would just produce
-                    // a "Resource concluded but no callback registered"
-                    // warning and drop the bytes anyway.
-                    let resource_cb = self.callbacks.resource.clone();
-                    if resource_cb.is_none() {
+                    // RNS/Link.py:1104-1109: ACCEPT_APP asks the application
+                    // with the advertisement, and accepts only on True. With
+                    // no callback registered nothing is accepted.
+                    //
+                    // The callback runs off the actor thread (it may take
+                    // locks held by a thread that is itself waiting on this
+                    // actor) and its verdict comes back as a message. Parts
+                    // cannot arrive in between: the sender waits for our
+                    // first RESOURCE_REQ, which acceptance sends.
+                    let Some(callback) = self.callbacks.resource.clone() else {
                         return Ok(());
-                    }
-                    let link_ctx = self.resource_link_context();
-                    if let Some(resource) = Resource::accept(
-                        &advertisement_packet,
-                        self.self_handle.as_ref().unwrap().clone(),
-                        self.callbacks.resource_concluded.clone(),
-                        None,
-                        None,
-                        Some(link_ctx),
-                    ) {
-                        crate::log(&format!("[RESOURCE] accepted incoming resource on link {}: parts={} size={}",
-                            crate::hexrep(&self.link_id, false),
-                            resource.lock().map(|r| r.total_parts).unwrap_or(0),
-                            resource.lock().map(|r| r.size).unwrap_or(0)), crate::LOG_DEBUG, false, false);
-                        // Register on real link so RESOURCE data packets find it
-                        self.register_incoming_resource(resource.clone());
-                        // Spawn callback off the actor thread so the user's handler
-                        // can freely call LinkHandle methods (snapshot, send_packet,
-                        // etc.) without deadlocking the actor on its own queue.
-                        let callback = resource_cb.unwrap();
-                        std::thread::spawn(move || callback(resource));
-                    } else {
-                        Resource::reject(&advertisement_packet);
-                    }
+                    };
+                    let Some(handle) = self.self_handle.clone() else {
+                        return Ok(());
+                    };
+                    let mut advertisement = advertisement;
+                    advertisement.link = Some(handle.clone());
+                    std::thread::spawn(move || {
+                        let accept = callback(&advertisement);
+                        handle.advertised_resource_decision(advertisement_packet, accept);
+                    });
                 }
                 ACCEPT_ALL => {
-                    if let Some(resource) = Resource::accept(
-                        &advertisement_packet,
-                        self.self_handle.as_ref().unwrap().clone(),
-                        self.callbacks.resource_concluded.clone(),
-                        None,
-                        None,
-                        Some(self.resource_link_context()),
-                    ) {
-                        self.register_incoming_resource(resource);
-                    }
+                    let concluded = self.callbacks.resource_concluded.clone();
+                    self.accept_advertised_resource(&advertisement_packet, concluded, None, None);
                 }
                 _ => {}
             }
@@ -3267,7 +3529,10 @@ impl Link {
         // own last_inbound; here we only need to bounce a 0xFE reply if we
         // are the responder so the initiator's stale timer also resets.
         if packet.context == crate::packet::KEEPALIVE {
-            if !self.initiator && packet.data.as_slice() == [0xFFu8] {
+            // RNS/Link.py:1131 (1.5.2): the pong is only sent when nothing
+            // else went out within the last keepalive period.
+            let pong_due = current_time().unwrap_or(0) >= self.last_outbound + self.keepalive as u64;
+            if !self.initiator && packet.data.as_slice() == [0xFFu8] && pong_due {
                 if let Some((dest, _link_id)) = self.prepare_keepalive() {
                     let mut reply = Packet::new(
                         Some(dest),
@@ -3282,6 +3547,7 @@ impl Link {
                         0,
                     );
                     let _ = reply.send();
+                    self.had_outbound(true);
                 }
             }
             return Ok(());
@@ -3311,6 +3577,15 @@ impl Link {
         };
 
         if packet.context == crate::packet::REQUEST {
+            // RNS/Link.py:998-1000 (1.5.2): a packed request larger than
+            // the destination's max_request_size is ignored.
+            let max_request_size = self.destination.lock().ok().and_then(|d| d.max_request_size);
+            if let Some(max) = max_request_size {
+                if plaintext.len() > max {
+                    crate::log(&format!("Ignored request with excessive size {} B on link {}", plaintext.len(), crate::hexrep(&self.link_id, false)), crate::LOG_DEBUG, false, false);
+                    return Ok(());
+                }
+            }
             let request_id = packet.get_truncated_hash();
             self.handle_request_packet(request_id, &plaintext)?;
             return Ok(());
@@ -3328,7 +3603,7 @@ impl Link {
 
         if packet.context == crate::packet::LINKCLOSE {
             crate::log(&format!("[LINK] LINKCLOSE received on link={}", crate::hexrep(&self.link_id, false)), crate::LOG_NOTICE, false, false);
-            self.teardown();
+            self.teardown_packet(&plaintext);
             return Ok(());
         }
 
@@ -3910,21 +4185,19 @@ impl Link {
         crate::log(&format!("[RESP] pending_requests count={}, looking for id={} pending_ids={:?}", pending.len(), crate::hexrep(&request_id, false), pending_ids), crate::LOG_NOTICE, false, false);
         if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
             crate::log(&format!("[RESP] found pending request, spawning callback thread"), crate::LOG_NOTICE, false, false);
-            let request = pending.remove(index);
-            let receipt = RequestReceipt {
-                request_id: request_id.clone(),
-                response: Some(response_bytes),
-                link: Arc::new(Mutex::new(self.clone())),
-                sent_at: request.sent_at,
-                received_at: Some(current_time().unwrap_or(0) as f64),
-                progress: 1.0,
-            };
-
-            if let Some(callback) = request.response_callback {
-                // Spawn a thread so the callback can re-lock the link
-                // (e.g. for teardown) without deadlocking the TCP reader thread
-                // that currently holds the link mutex.
-                thread::spawn(move || { callback(receipt); });
+            let mut request = pending.remove(index);
+            drop(pending);
+            // RNS/Link.py:1017: `transfer_size = len(umsgpack.packb(response_data))-2`,
+            // then handle_response(..., update_sizes=True, check_size=True).
+            let transfer_size = response_bytes.len().saturating_sub(2);
+            request.response_size = Some(transfer_size);
+            request.response_transfer_size = Some(request.response_transfer_size.unwrap_or(0) + transfer_size);
+            let size_ok = request.max_response_size.map(|max| transfer_size <= max).unwrap_or(true);
+            if !size_ok {
+                crate::log(&format!("Rejected response with excessive size {} B on link {}", transfer_size, crate::hexrep(&self.link_id, false)), crate::LOG_DEBUG, false, false);
+                request.fail(Arc::new(Mutex::new(self.clone())));
+            } else {
+                Link::response_received(request, Arc::new(Mutex::new(self.clone())), response_bytes, None);
             }
         } else {
             crate::log(&format!("[RESP] NO matching pending request found for id={} pending_ids={:?}", crate::hexrep(&request_id, false), pending_ids), crate::LOG_NOTICE, false, false);
@@ -3940,7 +4213,12 @@ impl Link {
         response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        timeout: Option<f64>,
+        max_response_size: Option<usize>,
     ) -> Result<Vec<u8>, String> {
+        // RNS/Link.py request(): `if timeout == None: timeout = self.rtt *
+        // self.traffic_timeout_factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125`
+        let timeout = timeout.unwrap_or_else(|| self.request_timeout());
         // Python RNS wire format: [timestamp_f64, path_hash_16bytes, data_bytes]
         let path_hash = identity::truncated_hash(path.as_bytes());
         let timestamp = current_time().unwrap_or(0) as f64;
@@ -3967,7 +4245,7 @@ impl Link {
         // RNS/Link.py request(): `if len(packed_request) <= self.mdu` it is a
         // single REQUEST packet, otherwise the same bytes go as a Resource.
         if payload_data.len() > self.mdu {
-            return self.request_as_resource(payload_data, response_callback, failed_callback, progress_callback);
+            return self.request_as_resource(payload_data, response_callback, failed_callback, progress_callback, timeout, max_response_size);
         }
 
         // Encrypt the payload using the link session key directly (via self.encrypt),
@@ -4024,49 +4302,30 @@ impl Link {
         let request_id = packet.get_truncated_hash();
 
         let sent_at = current_time().unwrap_or(0) as f64;
-        let receipt = RequestReceipt {
-            request_id: request_id.clone(),
-            response: None,
-            link: Arc::new(Mutex::new(self.clone())),
-            sent_at,
-            received_at: None,
-            progress: 0.0,
-        };
+        let pending_request = PendingRequest::new(
+            request_id.clone(), sent_at, timeout, max_response_size, Some(sent_at),
+            response_callback, failed_callback, progress_callback,
+        );
 
         if let Err(err) = packet.send() {
-            if let Some(callback) = failed_callback {
-                // Spawn so callback can re-acquire locks (e.g. router) that may
-                // already be held by the thread calling request().
-                thread::spawn(move || { callback(receipt); });
-            }
+            // RNS/Link.py request(): `if packet_receipt == False: return False`
+            // - no receipt, no callbacks. The Rust caller learns of it from
+            // the Err; the failed callback is kept for the transition
+            // (callers relied on it) and reports FAILED.
+            pending_request.fail(Arc::new(Mutex::new(self.clone())));
             return Err(err);
         }
 
-        if let Some(callback) = progress_callback.clone() {
-            let mut initial = receipt.clone();
-            initial.progress = 0.1;
-            // Spawn so the progress callback can re-acquire locks (e.g. router)
-            // that may already be held by the calling thread.
-            thread::spawn(move || { callback(initial); });
-        }
-
-        let timeout = self.request_timeout();
+        // RNS/Link.py: the progress callback only ever reports the response
+        // Resource's progress (response_resource_progress). Nothing fires
+        // here; a single-packet response reports 1.0 on arrival.
 
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
         
         // Request timeout checking is now handled by the actor loop
         // (actor_check_request_timeouts).
         
-        pending.push(PendingRequest {
-            request_id: request_id.clone(),
-            sent_at,
-            timeout,
-            response_clock_started: Some(sent_at),
-            receiving_response: false,
-            response_callback,
-            failed_callback,
-            progress_callback,
-        });
+        pending.push(pending_request);
 
         Ok(request_id)
     }
@@ -4092,10 +4351,11 @@ impl Link {
         response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        timeout: f64,
+        max_response_size: Option<usize>,
     ) -> Result<Vec<u8>, String> {
         let link_handle = self.self_handle.clone().ok_or("Link has no actor handle; cannot send request as resource")?;
         let request_id = identity::truncated_hash(&packed_request);
-        let timeout = self.request_timeout();
         crate::log(
             &format!(
                 "[REQ] sending request {} as resource: {} bytes > link MDU {}",
@@ -4109,16 +4369,10 @@ impl Link {
         self.pending_requests
             .lock()
             .map_err(|_| "Pending request lock poisoned")?
-            .push(PendingRequest {
-                request_id: request_id.clone(),
-                sent_at: current_time().unwrap_or(0) as f64,
-                timeout,
-                response_clock_started: None,
-                receiving_response: false,
-                response_callback,
-                failed_callback,
-                progress_callback,
-            });
+            .push(PendingRequest::new(
+                request_id.clone(), current_time().unwrap_or(0) as f64, timeout, max_response_size, None,
+                response_callback, failed_callback, progress_callback,
+            ));
 
         let concluded_handle = link_handle.clone();
         let concluded_id = request_id.clone();
@@ -4148,7 +4402,10 @@ impl Link {
             // Absent means the response already arrived and claimed the entry.
             let Some(index) = pending.iter().position(|p| p.request_id == request_id) else { return };
             if delivered {
-                pending[index].response_clock_started = Some(now_seconds());
+                let now = now_seconds();
+                pending[index].response_clock_started = Some(now);
+                pending[index].status = REQUEST_DELIVERED;
+                if pending[index].started_at.is_none() { pending[index].started_at = Some(now); }
                 None
             } else {
                 Some(pending.remove(index))
@@ -4164,18 +4421,24 @@ impl Link {
         }
     }
 
+    /// RNS/Link.py RequestReceipt.response_received(): progress 1.0, READY,
+    /// then the progress callback and the response callback, in that order.
+    fn response_received(mut request: PendingRequest, link: Arc<Mutex<Link>>, response: Vec<u8>, metadata: Option<Vec<u8>>) {
+        request.progress = 1.0;
+        request.status = REQUEST_READY;
+        let receipt = request.receipt(link, Some(response), metadata, Some(now_seconds()), None);
+        let progress_callback = request.progress_callback.clone();
+        let response_callback = request.response_callback.clone();
+        // Spawned so the callbacks can take locks (the router) that the
+        // thread delivering the response may be holding.
+        thread::spawn(move || {
+            if let Some(callback) = progress_callback { callback(receipt.clone()); }
+            if let Some(callback) = response_callback { callback(receipt); }
+        });
+    }
+
     fn fail_request(&self, request: PendingRequest) {
-        if let Some(callback) = request.failed_callback {
-            let receipt = RequestReceipt {
-                request_id: request.request_id.clone(),
-                response: None,
-                link: Arc::new(Mutex::new(self.clone())),
-                sent_at: request.sent_at,
-                received_at: None,
-                progress: 0.0,
-            };
-            thread::spawn(move || { callback(receipt); });
-        }
+        request.fail(Arc::new(Mutex::new(self.clone())));
     }
     
     /// Handle LINKIDENTIFY packets - validate identity signature and establish remote identity
@@ -4197,15 +4460,20 @@ impl Link {
             Ok(identity) => {
                 // Validate the signature
                 if identity.validate(signature, &signed_data) {
-                    // Store the remote identity
-                    if let Ok(mut remote_id) = self.remote_identity.lock() {
-                        *remote_id = Some(identity.clone());
+                    // RNS/Link.py:990 (1.5.2): a link identifies once. A
+                    // second LINKIDENTIFY neither replaces the identity nor
+                    // re-fires the callback.
+                    let already_identified = self.remote_identity.lock()
+                        .map(|id| id.is_some()).unwrap_or(false);
+                    if !already_identified {
+                        if let Ok(mut remote_id) = self.remote_identity.lock() {
+                            *remote_id = Some(identity.clone());
+                        }
+                        // Signal that remote_identified callback should fire
+                        // OUTSIDE the link lock (in dispatch_runtime_packet)
+                        // so the callback receives the original Arc, not a clone.
+                        self.pending_remote_identified = true;
                     }
-
-                    // Signal that remote_identified callback should fire
-                    // OUTSIDE the link lock (in dispatch_runtime_packet)
-                    // so the callback receives the original Arc, not a clone.
-                    self.pending_remote_identified = true;
 
                     Ok(())
                 } else {
@@ -4878,6 +5146,9 @@ mod tests {
         link.status = STATE_ACTIVE;
         // initiator=false ensures the KEEPALIVE branch SHOULD send a pong.
         assert!(!link.initiator);
+        // ...and nothing went out within the last keepalive period
+        // (RNS/Link.py:1131, 1.5.2), so the pong is due.
+        link.last_outbound = 0;
 
         // Sanity: decrypting a 1-byte buffer must fail so this test would
         // catch a regression that re-orders KEEPALIVE after the decrypt
@@ -4975,18 +5246,17 @@ mod tests {
         failed: mpsc::Sender<Vec<u8>>,
     ) -> PendingRequest {
         let failed = Mutex::new(failed);
-        PendingRequest {
-            request_id: vec![0xAB; 16],
-            sent_at: 0.0,
-            timeout: 0.0, // already expired the moment the clock is running
-            response_clock_started: clock,
-            receiving_response: receiving,
-            response_callback: None,
-            failed_callback: Some(Arc::new(move |receipt: RequestReceipt| {
+        let mut request = PendingRequest::new(
+            vec![0xAB; 16], 0.0,
+            0.0, // already expired the moment the clock is running
+            None, clock, None,
+            Some(Arc::new(move |receipt: RequestReceipt| {
                 let _ = failed.lock().unwrap().send(receipt.request_id);
             })),
-            progress_callback: None,
-        }
+            None,
+        );
+        request.receiving_response = receiving;
+        request
     }
 
     #[test]
@@ -5082,4 +5352,274 @@ mod tests {
             "initiator must NOT send another keepalive in response to a 0xFE pong"
         );
     }
+
+    // ── Contract parity with RNS 1.5.2 (PARITY-AUDIT-1.5.2.md) ──────────────
+
+    /// Give a bare test link a session key so the encrypted branches of
+    /// `handle_data_packet` can be driven without a handshake.
+    fn install_session_key(link: &mut Link) {
+        let key: Vec<u8> = (0u8..64).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+        *link.token.lock().unwrap() = Some(Token::new(&key).unwrap());
+        link.derived_key = Some(key);
+    }
+
+    fn link_packet(link: &Link, context: u8, plaintext: &[u8]) -> Packet {
+        let dest = link.destination.lock().unwrap().clone();
+        let mut packet = Packet::new(
+            Some(dest), Vec::new(), DATA, context, crate::transport::BROADCAST,
+            packet::HEADER_1, None, None, false, 0,
+        );
+        packet.data = link.encrypt(plaintext).expect("test link encrypts");
+        packet
+    }
+
+    fn wait_until(deadline_secs: u64, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(deadline_secs);
+        while std::time::Instant::now() < deadline {
+            if done() { return true; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// A2: RNS/Link.py get_remote_identity() returns the identity.
+    #[test]
+    fn get_remote_identity_returns_the_identity() {
+        let link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(61)).collect());
+        assert!(link.get_remote_identity().is_none());
+        let identity = Identity::new(true);
+        *link.remote_identity.lock().unwrap() = Some(identity.clone());
+        let seen = link.get_remote_identity().expect("identified link has a remote identity");
+        assert_eq!(seen.hash, identity.hash);
+    }
+
+    /// A14: RNS/Link.py:990 (1.5.2) - a link identifies once.
+    #[test]
+    fn a_second_linkidentify_is_ignored() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(67)).collect());
+        let identify_with = |link: &mut Link, identity: &Identity| {
+            let public_key = identity.get_public_key().expect("public key");
+            let mut signed = link.link_id.clone();
+            signed.extend_from_slice(&public_key);
+            let signature = identity.sign(&signed);
+            let mut plaintext = public_key.clone();
+            plaintext.extend_from_slice(&signature);
+            link.handle_linkidentify_packet(&plaintext).expect("valid identify");
+        };
+        let first = Identity::new(true);
+        let second = Identity::new(true);
+        identify_with(&mut link, &first);
+        assert!(link.pending_remote_identified, "first identify fires the callback");
+        link.pending_remote_identified = false;
+        identify_with(&mut link, &second);
+        assert!(!link.pending_remote_identified, "a second identify must not re-fire the callback");
+        assert_eq!(link.get_remote_identity().unwrap().hash, first.hash, "the first identity stays");
+    }
+
+    /// A13: RNS/Link.py:1131 (1.5.2) - the pong is only sent when nothing
+    /// went out within the last keepalive period.
+    #[test]
+    fn keepalive_pong_is_rate_limited_by_recent_outbound() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(71)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let dest = link.destination.lock().unwrap().clone();
+        let mut ping = Packet::new(Some(dest), vec![0xFFu8], DATA, crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST, packet::HEADER_1, None, None, false, 0);
+        ping.data = vec![0xFFu8];
+
+        link.last_outbound = current_time().unwrap(); // something just went out
+        link.last_keepalive = 0;
+        link.handle_data_packet(&ping).unwrap();
+        assert_eq!(link.last_keepalive, 0, "no pong while the link sent something within the keepalive period");
+
+        link.last_outbound = current_time().unwrap() - link.keepalive as u64 - 1;
+        link.handle_data_packet(&ping).unwrap();
+        assert!(link.last_keepalive > 0, "pong once the last outbound is older than the keepalive period");
+    }
+
+    /// A12: RNS/Link.py:749 (1.5.2) - the watchdog also wakes when the
+    /// link's own outbound side has been quiet for a keepalive period.
+    #[test]
+    fn watchdog_sends_keepalive_when_outbound_is_stale_even_if_inbound_is_fresh() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(73)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        link.initiator = true;
+        let now = current_time().unwrap();
+        link.last_inbound = now;
+        link.last_proof = now;
+        link.activated_at = Some(now);
+        link.last_outbound = now - link.keepalive as u64 - 1;
+        link.last_keepalive = 0;
+        let (tx, _rx) = mpsc::channel();
+        let handle = LinkHandle::from_parts_for_test(tx, link.link_id.clone());
+        actor_watchdog_tick(&mut link, &handle);
+        assert!(link.last_keepalive > 0,
+            "a fresh inbound side must not stop the initiator keeping its own outbound side alive");
+    }
+
+    /// A10: RNS/Link.py teardown()/teardown_packet() name the closing side,
+    /// and a LINKCLOSE from the peer is not answered with another LINKCLOSE.
+    #[test]
+    fn teardown_reasons_name_the_closing_side() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(79)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let before = link.last_outbound;
+        link.teardown_packet(&[0u8; 16]);
+        assert_ne!(link.state, STATE_CLOSED, "a LINKCLOSE that does not carry our link id is ignored");
+        link.teardown_packet(&link.link_id.clone());
+        assert_eq!(link.state, STATE_CLOSED);
+        assert_eq!(link.teardown_reason, REASON_INITIATOR_CLOSED, "we are the destination; the peer (initiator) closed");
+        assert_eq!(link.last_outbound, before, "closing on the peer's LINKCLOSE sends nothing");
+
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(83)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        link.teardown();
+        assert_eq!(link.teardown_reason, REASON_DESTINATION_CLOSED, "we closed, and we are the destination");
+    }
+
+    /// A6: RNS/Link.py RequestReceipt - status, accessors, and the order of
+    /// the progress and response callbacks on arrival.
+    #[test]
+    fn request_receipt_reports_status_and_concludes() {
+        let link = Arc::new(Mutex::new(make_incoming_link((0u8..16).map(|i| i.wrapping_mul(89)).collect())));
+        let (tx, rx) = mpsc::channel::<(&'static str, RequestReceipt)>();
+        let make = |tx: &mpsc::Sender<(&'static str, RequestReceipt)>| {
+            let (r, f, p) = (tx.clone(), tx.clone(), tx.clone());
+            PendingRequest::new(vec![1; 16], 10.0, 5.0, None, Some(10.0),
+                Some(Arc::new(move |receipt| { let _ = r.send(("response", receipt)); })),
+                Some(Arc::new(move |receipt| { let _ = f.send(("failed", receipt)); })),
+                Some(Arc::new(move |receipt| { let _ = p.send(("progress", receipt)); })))
+        };
+        let request = make(&tx);
+        assert_eq!(request.status, REQUEST_SENT);
+
+        Link::response_received(request, Arc::clone(&link), vec![0xc3], None);
+        let (first, progress) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (second, response) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((first, second), ("progress", "response"), "progress reports 1.0 before the response callback");
+        assert_eq!(progress.get_progress(), 1.0);
+        assert_eq!(response.get_status(), REQUEST_READY);
+        assert!(response.concluded());
+        assert_eq!(response.get_response(), Some(&[0xc3u8][..]));
+        assert!(response.get_response_time().is_some());
+
+        make(&tx).fail(Arc::clone(&link));
+        let (kind, failed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(kind, "failed");
+        assert_eq!(failed.get_status(), REQUEST_FAILED);
+        assert!(failed.concluded());
+        assert!(failed.get_response().is_none());
+        assert!(failed.concluded_at.is_some());
+    }
+
+    /// A7: RNS/Link.py:1017 + handle_response(check_size=True) - a single
+    /// packet response larger than the request's max_response_size fails the
+    /// request instead of being delivered.
+    #[test]
+    fn oversized_single_packet_response_is_rejected() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(97)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let (r, f) = (tx.clone(), tx.clone());
+        let request_id = vec![5u8; 16];
+        link.pending_requests.lock().unwrap().push(PendingRequest::new(
+            request_id.clone(), 0.0, 60.0, Some(4), Some(0.0),
+            Some(Arc::new(move |_| { let _ = r.send("response"); })),
+            Some(Arc::new(move |_| { let _ = f.send("failed"); })),
+            None,
+        ));
+        let mut plaintext = Vec::new();
+        rmpv_write_value(&mut plaintext, &rmpv::Value::Array(vec![
+            rmpv::Value::Binary(request_id), rmpv::Value::Binary(vec![0u8; 64]),
+        ])).unwrap();
+        link.handle_response_packet(&plaintext).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "failed");
+        assert!(link.pending_requests.lock().unwrap().is_empty(), "the request is concluded");
+    }
+
+    /// A8: RNS/Link.py:998 (1.5.2) - a request larger than the destination's
+    /// max_request_size never reaches the handler.
+    #[test]
+    fn oversized_request_packet_is_ignored() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(101)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        let handled = Arc::new(Mutex::new(0usize));
+        let handled_cb = Arc::clone(&handled);
+        {
+            let mut dest = link.destination.lock().unwrap();
+            dest.register_request_handler("/big".to_string(),
+                Some(Arc::new(move |_p: &str, _d: &[u8], _r: &[u8], _i: Option<&Identity>, _l: Option<&LinkHandle>, _t: f64| {
+                    *handled_cb.lock().unwrap() += 1;
+                    Vec::new()
+                })),
+                crate::destination::ALLOW_ALL, None, false).unwrap();
+            dest.set_max_request_size(Some(8));
+        }
+        let (tx, _rx) = mpsc::channel();
+        link.self_handle = Some(LinkHandle::from_parts_for_test(tx, link.link_id.clone()));
+        let mut plaintext = Vec::new();
+        rmpv_write_value(&mut plaintext, &rmpv::Value::Array(vec![
+            rmpv::Value::F64(0.0), rmpv::Value::Binary(identity::truncated_hash(b"/big")),
+            rmpv::Value::Binary(vec![0u8; 100]),
+        ])).unwrap();
+        let packet = link_packet(&link, crate::packet::REQUEST, &plaintext);
+        link.handle_data_packet(&packet).unwrap();
+        assert!(!wait_until(1, || *handled.lock().unwrap() > 0), "an oversized request must not reach the handler");
+
+        link.destination.lock().unwrap().set_max_request_size(None);
+        link.handle_data_packet(&packet).unwrap();
+        assert!(wait_until(5, || *handled.lock().unwrap() > 0), "without a limit the same request is handled");
+    }
+
+    /// A15: RNS/Link.py:1080 (1.5.2) - a malformed resource advertisement
+    /// tears the link down.
+    #[test]
+    fn malformed_resource_advertisement_tears_down_the_link() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(103)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        let packet = link_packet(&link, crate::packet::RESOURCE_ADV, b"not an advertisement");
+        link.handle_data_packet(&packet).unwrap();
+        assert_eq!(link.state, STATE_CLOSED);
+    }
+
+    /// A4: RNS/Link.py:1104-1109 - under ACCEPT_APP the application's
+    /// callback sees the advertisement and its verdict decides acceptance.
+    #[test]
+    fn accept_app_callback_verdict_is_returned_to_the_actor() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(107)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        link.resource_strategy = ACCEPT_APP;
+        let (tx, rx) = mpsc::channel();
+        link.self_handle = Some(LinkHandle::from_parts_for_test(tx, link.link_id.clone()));
+        let seen_size = Arc::new(Mutex::new(None::<usize>));
+        let seen_cb = Arc::clone(&seen_size);
+        link.callbacks.resource = Some(Arc::new(move |adv: &crate::resource::ResourceAdvertisement| -> bool {
+            *seen_cb.lock().unwrap() = Some(adv.get_data_size());
+            adv.get_link().is_some() && adv.get_data_size() < 1000
+        }));
+        let adv = crate::resource::ResourceAdvertisement {
+            t: 2000, d: 2000, n: 1, h: vec![1; 32], r: vec![2; 4], o: vec![3; 32], i: 1, l: 1, q: None,
+            f: 0, m: vec![0; crate::resource::Resource::MAPHASH_LEN], e: false, c: false, s: false, u: false, p: false, x: false,
+            link: None,
+        };
+        let packet = link_packet(&link, crate::packet::RESOURCE_ADV, &adv.pack(0).unwrap());
+        link.handle_data_packet(&packet).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the verdict reaches the actor") {
+            LinkMsg::AdvertisedResourceDecision { accept, .. } => assert!(!accept, "the callback refused a 2000 B transfer"),
+            _ => panic!("unexpected actor message"),
+        }
+        assert_eq!(*seen_size.lock().unwrap(), Some(2000), "the callback was handed the advertisement");
+    }
+
 }
