@@ -106,6 +106,8 @@ pub struct Resource {
     pub request_id: Option<Vec<u8>>,
     pub started_transferring: Option<f64>,
     pub is_response: bool,
+    /// RNS/Resource.py:368 — hard cap on the size of a decompressed resource.
+    pub max_decompressed_size: usize,
     pub auto_compress: bool,
     pub auto_compress_limit: usize,
     pub auto_compress_option: AutoCompressOption,
@@ -156,6 +158,8 @@ impl Resource {
     pub const PART_TIMEOUT_FACTOR: f64 = 4.0;
     pub const PART_TIMEOUT_FACTOR_AFTER_RTT: f64 = 2.0;
     pub const PROOF_TIMEOUT_FACTOR: f64 = 3.0;
+    // RNS/Resource.py:131
+    pub const HMU_WAIT_FACTOR: f64 = 3.5;
     pub const MAX_RETRIES: usize = 16;
     pub const MAX_ADV_RETRIES: usize = 4;
     pub const SENDER_GRACE_TIME: f64 = 10.0;
@@ -387,6 +391,7 @@ impl Resource {
             request_id,
             started_transferring: None,
             is_response,
+            max_decompressed_size: Resource::AUTO_COMPRESS_MAX_SIZE,
             auto_compress: matches!(auto_compress, AutoCompressOption::Enabled | AutoCompressOption::Limit(_)),
             auto_compress_limit: Resource::AUTO_COMPRESS_MAX_SIZE,
             auto_compress_option: auto_compress,
@@ -840,6 +845,51 @@ impl Resource {
         Resource::start_watchdog(self_arc);
     }
 
+    /// RNS/Resource.py:610 — how long the receiver still expects to wait for
+    /// a hashmap update before it can request more parts.
+    pub fn expected_hmu_wait_remaining(
+        waiting_for_hmu: bool,
+        outstanding_parts: usize,
+        sdu: usize,
+        eifr: f64,
+    ) -> f64 {
+        if waiting_for_hmu || outstanding_parts == 0 {
+            (sdu as f64 * 8.0 * Resource::HMU_WAIT_FACTOR) / eifr
+        } else {
+            0.0
+        }
+    }
+
+    /// RNS/Resource.py:613-616 — receiver-side watchdog sleep time while the
+    /// resource is TRANSFERRING, relative to `now`.  Kept as a pure function
+    /// so the two branches can be exercised directly.
+    pub fn transferring_sleep_time(
+        last_activity: f64,
+        part_timeout_factor: f64,
+        expected_tof_remaining: f64,
+        expected_hmu_wait_remaining: f64,
+        req_resp_rtt_rate: f64,
+        sdu: usize,
+        eifr: f64,
+        extra_wait: f64,
+        now: f64,
+    ) -> f64 {
+        if req_resp_rtt_rate != 0.0 {
+            last_activity
+                + part_timeout_factor * expected_tof_remaining
+                + expected_hmu_wait_remaining
+                + Resource::RETRY_GRACE_TIME
+                + extra_wait
+                - now
+        } else {
+            last_activity
+                + part_timeout_factor * ((3.0 * sdu as f64) / eifr)
+                + Resource::RETRY_GRACE_TIME
+                + extra_wait
+                - now
+        }
+    }
+
     pub fn watchdog_job(&mut self) {
         // Legacy: only used for sender-side resources that already have their own Arc.
         // For receiver-side resources, use start_watchdog() instead.
@@ -986,13 +1036,23 @@ impl Resource {
                                 // so update_eifr does NOT issue an mpsc snapshot
                                 // call while we hold the resource lock.
                                 r.update_eifr(eifr_ctx.as_ref());
+                                // RNS/Resource.py:610
+                                let expected_hmu_wait_remaining = Resource::expected_hmu_wait_remaining(
+                                    r.waiting_for_hmu, r.outstanding_parts, r.sdu, r.eifr.unwrap_or(1.0));
                                 let expected_tof_remaining = (r.outstanding_parts as f64 * r.sdu as f64 * 8.0) / r.eifr.unwrap_or(1.0);
 
-                                let st = if r.req_resp_rtt_rate != 0.0 {
-                                    r.last_activity + r.part_timeout_factor * expected_tof_remaining + Resource::RETRY_GRACE_TIME + extra_wait - now()
-                                } else {
-                                    r.last_activity + r.part_timeout_factor * ((3.0 * r.sdu as f64) / r.eifr.unwrap_or(1.0)) + Resource::RETRY_GRACE_TIME + extra_wait - now()
-                                };
+                                // RNS/Resource.py:613-616
+                                let st = Resource::transferring_sleep_time(
+                                    r.last_activity,
+                                    r.part_timeout_factor,
+                                    expected_tof_remaining,
+                                    expected_hmu_wait_remaining,
+                                    r.req_resp_rtt_rate,
+                                    r.sdu,
+                                    r.eifr.unwrap_or(1.0),
+                                    extra_wait,
+                                    now(),
+                                );
 
                                 if st < 0.0 {
                                     if r.retries_left > 0 {
@@ -1146,7 +1206,9 @@ impl Resource {
     /// Process HMU packet and update hashmap. Returns true if request_next
     /// should be called (caller must defer to avoid link-mutex deadlock).
     pub fn hashmap_update_packet(&mut self, plaintext: &[u8]) -> bool {
-        if self.status != ResourceStatus::Failed {
+        // RNS/Resource.py:488-495 — an HMU is only accepted while we are
+        // actually waiting for one.
+        if self.status != ResourceStatus::Failed && self.waiting_for_hmu {
             self.last_activity = now();
             self.retries_left = self.max_retries;
             if plaintext.len() > identity::HASHLENGTH / 8 {
@@ -1154,18 +1216,21 @@ impl Resource {
                 // msgpack bin format (sent by Python) into Vec<u8>.
                 // Plain Vec<u8> expects msgpack array-of-ints which fails.
                 if let Ok(update) = from_slice::<(usize, serde_bytes::ByteBuf)>(&plaintext[identity::HASHLENGTH / 8..]) {
-                    eprintln!("[RESOURCE-HMU] parsed segment={} hashmap_len={}", update.0, update.1.len());
-                    self.hashmap_update(update.0, &update.1);
-                    return true;
+                    crate::log(&format!("[RESOURCE-HMU] parsed segment={} hashmap_len={}", update.0, update.1.len()),
+                        crate::LOG_EXTREME, false, false);
+                    return self.hashmap_update(update.0, &update.1);
                 } else {
-                    eprintln!("[RESOURCE-HMU] from_slice FAILED, plaintext_len={}", plaintext.len());
+                    crate::log(&format!("[RESOURCE-HMU] from_slice FAILED, plaintext_len={}", plaintext.len()),
+                        crate::LOG_EXTREME, false, false);
                 }
             }
         }
         false
     }
 
-    pub fn hashmap_update(&mut self, segment: usize, hashmap: &[u8]) {
+    /// Returns true if `request_next` should be called (RNS/Resource.py:510
+    /// calls it inline; this port must defer it out of the link lock).
+    pub fn hashmap_update(&mut self, segment: usize, hashmap: &[u8]) -> bool {
         if self.status != ResourceStatus::Failed {
             self.status = ResourceStatus::Transferring;
             let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
@@ -1181,11 +1246,20 @@ impl Resource {
                     self.hashmap[target_index..target_index + Resource::MAPHASH_LEN].copy_from_slice(slice);
                 }
             }
-            self.waiting_for_hmu = false;
-            // NOTE: Do NOT call self.request_next() here.
-            // The caller must defer request_next to a background thread
-            // to avoid deadlocking the link mutex.
+            // RNS/Resource.py:505-511
+            if hashes < 1 {
+                crate::log("Invalid HMU received, cancelling transfer", crate::LOG_ERROR, false, false);
+                self.cancel();
+                return false;
+            } else {
+                self.waiting_for_hmu = false;
+                // NOTE: Do NOT call self.request_next() here.
+                // The caller must defer request_next to a background thread
+                // to avoid deadlocking the link mutex.
+                return true;
+            }
         }
+        false
     }
 
     /// Prepare request_next data while holding the resource lock, but return
@@ -1647,10 +1721,18 @@ impl Resource {
             }
 
             if self.compressed {
-                let mut decoder = BzDecoder::new(&data[..]);
-                let mut decompressed = Vec::new();
-                if decoder.read_to_end(&mut decompressed).is_ok() {
-                    data = decompressed;
+                // RNS/Resource.py:697-705 — decompress with a hard bound of
+                // max_decompressed_size.  Python passes max_length to
+                // BZ2Decompressor.decompress and rejects the resource when
+                // the decompressor did not reach eof within that bound.
+                match bounded_decompress(&data, self.max_decompressed_size) {
+                    Some(decompressed) => data = decompressed,
+                    None => {
+                        self.status = ResourceStatus::Corrupt;
+                        self.cancel();
+                        crate::log("Decompressed resource exceeded maximum decompressed size. The resource was rejected.", crate::LOG_ERROR, false, false);
+                        return;
+                    }
                 }
             }
 
@@ -1829,7 +1911,35 @@ impl Resource {
     }
 
     pub fn cancel(&mut self) {
-        if (self.status as u8) < (ResourceStatus::Complete as u8) {
+        // RNS/Resource.py:1093
+        if let Some(next_segment) = self.next_segment.clone() {
+            if let Ok(mut next) = next_segment.lock() {
+                next.cancel();
+            }
+        }
+
+        // RNS/Resource.py:1095-1098
+        if self.status == ResourceStatus::Corrupt {
+            self.link.cancel_incoming_resource(Arc::new(Mutex::new(self.clone())));
+            // Python calls `self.reject(self.advertisement_packet)`.  This port
+            // does not keep the advertisement packet on the Resource, so send
+            // the same RESOURCE_RCL that `Resource::reject` sends, carrying
+            // this resource's hash.
+            let mut reject_packet = Packet::new(
+                self.packet_destination(),
+                self.hash.clone(),
+                crate::packet::DATA,
+                RESOURCE_RCL,
+                BROADCAST,
+                crate::packet::HEADER_1,
+                None,
+                None,
+                false,
+                0,
+            );
+            let _ = reject_packet.send();
+            self.link.teardown();
+        } else if (self.status as u8) < (ResourceStatus::Complete as u8) {
             self.status = ResourceStatus::Failed;
             if self.initiator {
                 if self.link.is_active() {
@@ -1849,6 +1959,23 @@ impl Resource {
                 }
                 self.link.cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
             } else {
+                // RNS/Resource.py:1112-1118 — the receiving end tells the
+                // sender it is cancelling before dropping the resource.
+                if self.link.is_active() {
+                    let mut packet = Packet::new(
+                        self.packet_destination(),
+                        self.hash.clone(),
+                        crate::packet::DATA,
+                        RESOURCE_RCL,
+                        BROADCAST,
+                        crate::packet::HEADER_1,
+                        None,
+                        None,
+                        false,
+                        0,
+                    );
+                    let _ = packet.send();
+                }
                 self.link.cancel_incoming_resource(Arc::new(Mutex::new(self.clone())));
             }
 
@@ -2083,6 +2210,7 @@ impl Clone for Resource {
             request_id: self.request_id.clone(),
             started_transferring: self.started_transferring,
             is_response: self.is_response,
+            max_decompressed_size: self.max_decompressed_size,
             auto_compress: self.auto_compress,
             auto_compress_limit: self.auto_compress_limit,
             auto_compress_option: self.auto_compress_option,
@@ -2128,6 +2256,9 @@ pub struct ResourceAdvertisement {
     pub u: bool,
     pub p: bool,
     pub x: bool,
+    /// RNS/Link.py:1070 — the link sets itself on the advertisement before
+    /// handing it to the application's resource-accept callback.
+    pub link: Option<crate::link::LinkHandle>,
 }
 
 impl ResourceAdvertisement {
@@ -2154,6 +2285,7 @@ impl ResourceAdvertisement {
             u: false,
             p: false,
             x: resource.has_metadata,
+            link: None,
         };
 
         if adv.q.is_some() {
@@ -2194,21 +2326,33 @@ impl ResourceAdvertisement {
             .and_then(|adv| adv.q)
     }
 
-    pub fn read_transfer_size(advertisement_packet: &Packet) -> Option<u64> {
+    /// RNS/Resource.py:1279-1282 — the advertised transfer size (`adv.t`).
+    pub fn read_transfer_size(advertisement_packet: &Packet) -> Option<usize> {
         advertisement_packet
             .plaintext
             .as_ref()
             .and_then(|p| ResourceAdvertisement::unpack(p).ok())
-            .map(|adv| adv.t)
+            .map(|adv| adv.t as usize)
     }
 
-    pub fn read_size(advertisement_packet: &Packet) -> Option<u64> {
+    /// RNS/Resource.py:1284-1287 — the advertised total uncompressed data
+    /// size (`adv.d`).
+    pub fn read_size(advertisement_packet: &Packet) -> Option<usize> {
         advertisement_packet
             .plaintext
             .as_ref()
             .and_then(|p| ResourceAdvertisement::unpack(p).ok())
-            .map(|adv| adv.d)
+            .map(|adv| adv.d as usize)
     }
+
+    // RNS/Resource.py:1320-1327 — instance accessors.
+    pub fn get_transfer_size(&self) -> usize { self.t as usize }
+    pub fn get_data_size(&self) -> usize { self.d as usize }
+    pub fn get_parts(&self) -> usize { self.n as usize }
+    pub fn get_segments(&self) -> usize { self.l as usize }
+    pub fn get_hash(&self) -> &[u8] { &self.h }
+    pub fn get_link(&self) -> Option<&crate::link::LinkHandle> { self.link.as_ref() }
+    pub fn is_compressed(&self) -> bool { self.c }
 
     pub fn pack(&self, segment: usize) -> Result<Vec<u8>, String> {
         let hashmap_start = segment * ResourceAdvertisement::HASHMAP_MAX_LEN;
@@ -2251,6 +2395,12 @@ impl ResourceAdvertisement {
             e.to_string()
         })?;
         adv.apply_flags();
+
+        // RNS/Resource.py:1374
+        if adv.t > (Resource::MAX_EFFICIENT_SIZE as u64) * 3 {
+            return Err("Invalid transfer size".to_string());
+        }
+
         Ok(ResourceAdvertisement {
             t: adv.t,
             d: adv.d,
@@ -2269,6 +2419,7 @@ impl ResourceAdvertisement {
             u: adv.u,
             p: adv.p,
             x: adv.x,
+            link: None,
         })
     }
 }
@@ -2334,6 +2485,26 @@ impl ResourceAdvertisementData {
     }
 }
 
+/// RNS/Resource.py:699-705 — bz2 decompression bounded by `max_size`.
+///
+/// Python hands `max_length=self.max_decompressed_size` to
+/// `BZ2Decompressor.decompress` and then checks `decompressor.eof`; anything
+/// that has not ended cleanly within the bound is rejected.  Here the decoder
+/// is read through `take(max_size+1)`, so more than `max_size` bytes of output
+/// means the stream would have overrun the bound.  Returns `None` when the
+/// bound is exceeded or the compressed stream does not decode cleanly.
+fn bounded_decompress(data: &[u8], max_size: usize) -> Option<Vec<u8>> {
+    let mut limited = BzDecoder::new(data).take(max_size as u64 + 1);
+    let mut decompressed = Vec::new();
+    if limited.read_to_end(&mut decompressed).is_err() {
+        return None;
+    }
+    if decompressed.len() > max_size {
+        return None;
+    }
+    Some(decompressed)
+}
+
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2345,5 +2516,276 @@ fn ensure_resource_path() {
     let path = reticulum::resource_path();
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_bytes::ByteBuf;
+
+    /// A resource attached to a bare, never-established inbound link: the
+    /// actor answers, but the link is not ACTIVE, so no packet ever goes out.
+    fn test_resource() -> Resource {
+        let link = crate::link::LinkHandle::spawn(
+            crate::link::Link::new_inbound(crate::destination::Destination::default())
+                .expect("test link"),
+        );
+        let ctx = ResourceLinkContext {
+            mtu: 500,
+            rtt: Some(0.1),
+            traffic_timeout_factor: 4.0,
+            establishment_cost: 0,
+            last_resource_window: None,
+            last_resource_eifr: None,
+        };
+        Resource::new_internal(
+            None,
+            link,
+            None,
+            false,
+            AutoCompressOption::Disabled,
+            None,
+            None,
+            Some(0.0),
+            0,
+            None,
+            None,
+            false,
+            0,
+            Some(&ctx),
+        )
+        .expect("test resource")
+    }
+
+    fn bz2(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    // --- 1: bounded bz2 decompression (RNS/Resource.py:697-705) ---
+
+    #[test]
+    fn bounded_decompress_enforces_max_decompressed_size() {
+        let payload = vec![0x41u8; 4096];
+        let compressed = bz2(&payload);
+
+        // Within the bound the stream decodes normally.
+        assert_eq!(bounded_decompress(&compressed, 4096).as_deref(), Some(&payload[..]));
+        assert_eq!(bounded_decompress(&compressed, 64 * 1024).as_deref(), Some(&payload[..]));
+
+        // One byte short of the decompressed size is a rejection.
+        assert!(bounded_decompress(&compressed, 4095).is_none());
+        assert!(bounded_decompress(&compressed, 16).is_none());
+
+        // A stream that does not decode cleanly is rejected too.
+        assert!(bounded_decompress(&compressed[..compressed.len() / 2], 64 * 1024).is_none());
+        assert!(bounded_decompress(b"not bzip2 at all", 64 * 1024).is_none());
+    }
+
+    #[test]
+    fn assemble_rejects_oversized_decompressed_resource() {
+        let payload = vec![0x42u8; 4096];
+        let random_hash = vec![9u8; Resource::RANDOM_HASH_SIZE];
+        let mut part = random_hash.clone();
+        part.extend_from_slice(&bz2(&payload));
+
+        let mut r = test_resource();
+        r.status = ResourceStatus::Transferring;
+        r.encrypted = false;
+        r.compressed = true;
+        r.random_hash = random_hash.clone();
+        // The advertised hash is the RIGHT one: without the bound this
+        // resource assembles successfully, so only the bound can reject it.
+        r.hash = identity::full_hash(&[payload.clone(), random_hash].concat());
+        r.total_parts = 1;
+        r.total_segments = 1;
+        r.parts = vec![Some(part)];
+        r.max_decompressed_size = 64;
+
+        r.assemble();
+
+        assert_eq!(r.status, ResourceStatus::Corrupt, "oversized decompression must mark the resource corrupt");
+        assert!(r.data.is_none(), "no data may be assembled from an oversized decompression");
+    }
+
+    #[test]
+    fn assemble_accepts_decompression_within_the_bound() {
+        let payload = vec![0x42u8; 4096];
+        let random_hash = vec![9u8; Resource::RANDOM_HASH_SIZE];
+        let mut part = random_hash.clone();
+        part.extend_from_slice(&bz2(&payload));
+
+        let mut r = test_resource();
+        r.status = ResourceStatus::Transferring;
+        r.encrypted = false;
+        r.compressed = true;
+        r.random_hash = random_hash.clone();
+        r.hash = identity::full_hash(&[payload.clone(), random_hash].concat());
+        r.total_parts = 1;
+        r.total_segments = 1;
+        r.parts = vec![Some(part)];
+        r.max_decompressed_size = Resource::AUTO_COMPRESS_MAX_SIZE;
+
+        r.assemble();
+
+        assert_eq!(r.status, ResourceStatus::Complete);
+        assert_eq!(r.data.as_deref(), Some(&payload[..]));
+    }
+
+    // --- 3: HMU wait term in the receiver watchdog (RNS/Resource.py:609-618) ---
+
+    #[test]
+    fn hmu_wait_term_enters_the_receiver_sleep_time() {
+        let sdu = 431usize;
+        let eifr = 1000.0f64;
+        let expected = (sdu as f64 * 8.0 * Resource::HMU_WAIT_FACTOR) / eifr;
+
+        // Waiting for a hashmap update, or nothing outstanding to wait for.
+        assert_eq!(Resource::expected_hmu_wait_remaining(true, 4, sdu, eifr), expected);
+        assert_eq!(Resource::expected_hmu_wait_remaining(false, 0, sdu, eifr), expected);
+        // Parts are outstanding and no HMU is pending: no extra wait.
+        assert_eq!(Resource::expected_hmu_wait_remaining(false, 4, sdu, eifr), 0.0);
+
+        let tof = 0.25f64;
+        let with_hmu = Resource::transferring_sleep_time(100.0, 4.0, tof, expected, 5000.0, sdu, eifr, 0.5, 100.0);
+        let without_hmu = Resource::transferring_sleep_time(100.0, 4.0, tof, 0.0, 5000.0, sdu, eifr, 0.5, 100.0);
+
+        // The HMU term is added in the req_resp_rtt_rate != 0 branch.
+        assert!((with_hmu - without_hmu - expected).abs() < 1e-9,
+            "HMU wait term must be added to the rtt-rate sleep formula");
+        assert!((with_hmu - (4.0 * tof + expected + Resource::RETRY_GRACE_TIME + 0.5)).abs() < 1e-9);
+
+        // ...and NOT in the else branch.
+        let slow_with_hmu = Resource::transferring_sleep_time(100.0, 4.0, tof, expected, 0.0, sdu, eifr, 0.5, 100.0);
+        let slow_without_hmu = Resource::transferring_sleep_time(100.0, 4.0, tof, 0.0, 0.0, sdu, eifr, 0.5, 100.0);
+        assert_eq!(slow_with_hmu, slow_without_hmu);
+        assert!((slow_with_hmu - (4.0 * ((3.0 * sdu as f64) / eifr) + Resource::RETRY_GRACE_TIME + 0.5)).abs() < 1e-9);
+    }
+
+    // --- 4: HMU only while waiting, empty HMU cancels (RNS/Resource.py:488-511) ---
+
+    fn hmu_plaintext(segment: usize, hashmap: Vec<u8>) -> Vec<u8> {
+        let mut plaintext = vec![0u8; identity::HASHLENGTH / 8];
+        plaintext.extend_from_slice(
+            &rmp_serde::encode::to_vec(&(segment, ByteBuf::from(hashmap))).unwrap(),
+        );
+        plaintext
+    }
+
+    fn hmu_test_resource() -> Resource {
+        let mut r = test_resource();
+        r.status = ResourceStatus::Transferring;
+        r.total_parts = 4;
+        r.parts = vec![None; 4];
+        r.hashmap = vec![0u8; 4 * Resource::MAPHASH_LEN];
+        r.hashmap_height = 0;
+        r
+    }
+
+    #[test]
+    fn hashmap_update_packet_is_ignored_unless_waiting_for_hmu() {
+        let plaintext = hmu_plaintext(0, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let mut r = hmu_test_resource();
+        r.waiting_for_hmu = false;
+        assert!(!r.hashmap_update_packet(&plaintext), "an unsolicited HMU must not be processed");
+        assert_eq!(r.hashmap_height, 0, "an unsolicited HMU must not touch the hashmap");
+        assert_eq!(r.hashmap, vec![0u8; 4 * Resource::MAPHASH_LEN]);
+
+        let mut r = hmu_test_resource();
+        r.waiting_for_hmu = true;
+        assert!(r.hashmap_update_packet(&plaintext), "a solicited HMU must be processed");
+        assert_eq!(r.hashmap_height, 2);
+        assert_eq!(&r.hashmap[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!r.waiting_for_hmu, "a valid HMU clears waiting_for_hmu");
+    }
+
+    #[test]
+    fn empty_hashmap_update_cancels_the_transfer() {
+        let mut r = hmu_test_resource();
+        r.waiting_for_hmu = true;
+
+        assert!(!r.hashmap_update(0, &[]), "an empty HMU must not trigger a part request");
+        assert_eq!(r.status, ResourceStatus::Failed, "an empty HMU must cancel the transfer");
+
+        // An empty HMU arriving as a packet is cancelled the same way.
+        let mut r = hmu_test_resource();
+        r.waiting_for_hmu = true;
+        assert!(!r.hashmap_update_packet(&hmu_plaintext(0, Vec::new())));
+        assert_eq!(r.status, ResourceStatus::Failed);
+    }
+
+    // --- 5: advertisement transfer-size check (RNS/Resource.py:1374) ---
+
+    fn packed_adv(t: u64, d: u64) -> Vec<u8> {
+        let wire = ResourceAdvertisementData {
+            t,
+            d,
+            n: 1,
+            h: vec![1u8; identity::HASHLENGTH / 8],
+            r: vec![2u8; Resource::RANDOM_HASH_SIZE],
+            o: vec![3u8; identity::HASHLENGTH / 8],
+            i: 1,
+            l: 1,
+            q: None,
+            f: 0,
+            m: vec![4u8; Resource::MAPHASH_LEN],
+            e: false,
+            c: false,
+            s: false,
+            u: false,
+            p: false,
+            x: false,
+        };
+        to_vec_named(&wire).unwrap()
+    }
+
+    #[test]
+    fn unpack_rejects_oversized_transfer_size() {
+        let limit = (Resource::MAX_EFFICIENT_SIZE as u64) * 3;
+
+        let adv = ResourceAdvertisement::unpack(&packed_adv(limit, 1024)).expect("at the limit");
+        assert_eq!(adv.t, limit);
+
+        match ResourceAdvertisement::unpack(&packed_adv(limit + 1, 1024)) {
+            Ok(_) => panic!("one byte over the limit must be rejected"),
+            Err(e) => assert_eq!(e, "Invalid transfer size"),
+        }
+
+        assert!(ResourceAdvertisement::unpack(&packed_adv(u64::MAX, 1024)).is_err());
+    }
+
+    // --- ResourceAdvertisement accessors (RNS/Resource.py:1279-1287, 1320-1327) ---
+
+    #[test]
+    fn read_size_and_read_transfer_size_read_the_advertisement() {
+        let mut packet = Packet::new(
+            None,
+            Vec::new(),
+            crate::packet::DATA,
+            RESOURCE_ADV,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        packet.plaintext = Some(packed_adv(1234, 5678));
+
+        // read_transfer_size is adv.t, read_size is adv.d.
+        assert_eq!(ResourceAdvertisement::read_transfer_size(&packet), Some(1234));
+        assert_eq!(ResourceAdvertisement::read_size(&packet), Some(5678));
+
+        let adv = ResourceAdvertisement::unpack(packet.plaintext.as_ref().unwrap()).unwrap();
+        assert_eq!(adv.get_transfer_size(), 1234);
+        assert_eq!(adv.get_data_size(), 5678);
+        assert_eq!(adv.get_parts(), 1);
+        assert_eq!(adv.get_segments(), 1);
+        assert_eq!(adv.get_hash(), &[1u8; identity::HASHLENGTH / 8][..]);
+        assert!(!adv.is_compressed());
+        assert!(adv.get_link().is_none());
     }
 }
