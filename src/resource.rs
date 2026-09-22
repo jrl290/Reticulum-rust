@@ -1619,8 +1619,8 @@ impl Resource {
     }
 
     pub fn assemble(&mut self) {
-        crate::log(&format!("Resource assembly starting, {} parts",
-            self.total_parts), crate::LOG_DEBUG, false, false);
+        crate::log(&format!("Resource assembly starting, {} parts, encrypted={} compressed={}",
+            self.total_parts, self.encrypted, self.compressed), crate::LOG_DEBUG, false, false);
         if self.status != ResourceStatus::Failed {
             self.status = ResourceStatus::Assembling;
             let mut stream = Vec::new();
@@ -1633,7 +1633,10 @@ impl Resource {
             let mut data = if self.encrypted {
                 match self.link.decrypt(&stream) {
                     Ok(d) => d,
-                    Err(_e) => stream
+                    Err(e) => {
+                        crate::log(&format!("[RESOURCE] assembly: link decrypt of {} bytes FAILED: {:?}", stream.len(), e), crate::LOG_ERROR, false, false);
+                        stream
+                    }
                 }
             } else {
                 stream
@@ -1652,6 +1655,12 @@ impl Resource {
             }
 
             let calculated_hash = identity::full_hash(&[data.clone(), self.random_hash.clone()].concat());
+            if calculated_hash != self.hash {
+                // RNS/Resource.py logs this at LOG_DEBUG only; here it is the
+                // one way an otherwise-complete transfer produces nothing.
+                crate::log(&format!("[RESOURCE] assembled data does not match advertised hash {} ({} bytes) — resource corrupt",
+                    crate::hexrep(&self.hash, false), data.len()), crate::LOG_ERROR, false, false);
+            }
             if calculated_hash == self.hash {
                 // self.data is ALWAYS the full decompressed payload (including
                 // metadata prefix if any), matching Python's behavior.

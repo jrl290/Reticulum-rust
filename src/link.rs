@@ -629,292 +629,9 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
         }
 
         if let Some(msg) = msg {
-            match msg {
-                // --- Read operations ---
-                LinkMsg::Snapshot(reply) => {
-                    let _ = reply.send(Ok(LinkSnapshot {
-                        link_id: link.link_id.clone(),
-                        state: link.state,
-                        status: link.status,
-                        initiator: link.initiator,
-                        rtt: link.rtt,
-                        activated_at: link.activated_at,
-                        established_at: link.established_at,
-                        attached_interface: link.attached_interface.clone(),
-                        mtu: Some(link.mtu),
-                        traffic_timeout_factor: link.traffic_timeout_factor,
-                        rssi: link.rssi,
-                        snr: link.snr,
-                        q: link.q,
-                        track_phy_stats: link.track_phy_stats,
-                        request_time: link.request_time,
-                        establishment_cost: link.establishment_cost,
-                        last_inbound: link.last_inbound,
-                    }));
-                }
-                LinkMsg::Status(reply) => { let _ = reply.send(link.status); }
-                LinkMsg::IsActive(reply) => { let _ = reply.send(link.state == STATE_ACTIVE); }
-                LinkMsg::IsAlive(reply) => { let _ = reply.send(link.state != STATE_CLOSED); }
-                LinkMsg::NoDataFor(reply) => { let _ = reply.send(Ok(link.no_data_for())); }
-                LinkMsg::RemoteIdentity(reply) => {
-                    let ri = link.remote_identity.lock().ok().and_then(|r| r.clone());
-                    let _ = reply.send(Ok(ri));
-                }
-                LinkMsg::DestinationHash(reply) => {
-                    let result = link.destination.lock()
-                        .map(|d| d.hash.clone())
-                        .map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-                LinkMsg::CloneDestination(reply) => {
-                    let result = link.destination.lock()
-                        .map(|d| d.clone())
-                        .map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-                LinkMsg::BuildLinkDestination(reply) => {
-                    let result = link.destination.lock().map(|d| {
-                        let mut dest = d.clone();
-                        dest.dest_type = crate::destination::DestinationType::Link;
-                        dest.hash = link.link_id.clone();
-                        dest.hexhash = crate::hexrep(&dest.hash, false);
-                        dest.link = Some(crate::destination::LinkInfo {
-                            rtt: link.rtt,
-                            traffic_timeout_factor: link.traffic_timeout_factor,
-                            status_closed: false,
-                            mtu: Some(link.mtu),
-                            attached_interface: link.attached_interface.clone(),
-                        });
-                        dest
-                    }).map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-                LinkMsg::GetLinkOutboundInfo(reply) => {
-                    let _ = reply.send((link.attached_interface.clone(), link.state == STATE_CLOSED));
-                }
-
-                // --- Crypto operations ---
-                LinkMsg::Encrypt(plaintext, reply) => {
-                    let result = if link.state != STATE_ACTIVE && link.state != STATE_STALE {
-                        Err(LinkGone)
-                    } else {
-                        link.encrypt(&plaintext).map_err(|_| LinkGone)
-                    };
-                    let _ = reply.send(result);
-                }
-                LinkMsg::Decrypt(ciphertext, reply) => {
-                    let result = link.decrypt(&ciphertext).map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-
-                // --- Mutating with response ---
-                // Process the request inline on the actor: encrypt the
-                // payload, pack the packet, and enqueue it on the per-
-                // interface writer (Step 1 of the transport refactor).
-                // All of these are bounded-latency, so replying
-                // synchronously to the caller is safe — the FFI / UI
-                // thread is never blocked on socket RTT.
-                LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, reply } => {
-                    let result = link
-                        .request(path, data, response_cb, failed_cb, progress_cb)
-                        .map_err(|e| {
-                            crate::log(
-                                &format!("[LINK] request submission failed: {}", e),
-                                crate::LOG_NOTICE,
-                                false,
-                                false,
-                            );
-                            LinkGone
-                        });
-                    let _ = reply.send(result);
-                }
-                LinkMsg::SendPacket(data, reply) => {
-                    let result = link.send_packet(&data).map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-                LinkMsg::Identify(identity, reply) => {
-                    let result = link.identify(&identity).map_err(|_| LinkGone);
-                    let _ = reply.send(result);
-                }
-                LinkMsg::Initiate(reply) => {
-                    // Three-step initiation so a LINKPROOF arriving on the
-                    // wire (which can happen the instant `packet.send()`
-                    // returns, or even slightly before for loopback paths)
-                    // can always be routed to this handle:
-                    //   1. `initiate_prepare` builds the LR packet and
-                    //      derives the real `link.link_id`.
-                    //   2. We update the shared cached id on the handle
-                    //      AND insert this handle into the runtime
-                    //      registry under the real id — both before the
-                    //      packet hits the wire.
-                    //   3. `initiate_send` performs the (potentially
-                    //      blocking) `packet.send()`.
-                    match link.initiate_prepare() {
-                        Ok(packet) => {
-                            let new_id = link.link_id.clone();
-                            if let Ok(mut id) = self_handle.id.lock() {
-                                *id = new_id;
-                            }
-                            register_runtime_link_handle(self_handle.clone());
-                            match link.initiate_send(packet) {
-                                Ok(()) => { let _ = reply.send(Ok(())); }
-                                Err(_) => { let _ = reply.send(Err(LinkGone)); }
-                            }
-                        }
-                        Err(_) => { let _ = reply.send(Err(LinkGone)); }
-                    }
-                }
-
-                // --- Resource operations ---
-                LinkMsg::ReadyForNewResource(reply) => {
-                    let _ = reply.send(link.ready_for_new_resource());
-                }
-                LinkMsg::RegisterOutgoingResource(resource) => {
-                    link.register_outgoing_resource(resource);
-                }
-                LinkMsg::RegisterIncomingResource(resource) => {
-                    link.register_incoming_resource(resource);
-                }
-                LinkMsg::ResourceConcluded(resource, reply) => {
-                    let cb = link.resource_concluded(resource);
-                    let _ = reply.send(cb);
-                }
-                LinkMsg::CancelOutgoingResource(resource) => {
-                    link.cancel_outgoing_resource(resource);
-                }
-                LinkMsg::CancelIncomingResource(resource) => {
-                    link.cancel_incoming_resource(resource);
-                }
-                LinkMsg::SetExpectedRate(rate) => {
-                    link.set_expected_rate(rate);
-                }
-                LinkMsg::GetLastResourceWindow(reply) => {
-                    let _ = reply.send(link.get_last_resource_window());
-                }
-                LinkMsg::GetLastResourceEifr(reply) => {
-                    let _ = reply.send(link.get_last_resource_eifr());
-                }
-
-                // --- Fire-and-forget ---
-                LinkMsg::Teardown(caller) => {
-                    crate::log(&format!("LINK teardown-caller link={} state={} from={}", crate::hexrep(&link.link_id, false), link.state, caller), crate::LOG_NOTICE, false, false);
-                    link.teardown();
-                    self_handle.status_atomic.store(link.status, Ordering::Relaxed);
-                    // Actor exits.  link_closed callback is spawned on a new thread
-                    // inside teardown() — same as link_established/remote_identified/packet —
-                    // so the callback can safely acquire external mutexes without
-                    // deadlocking the actor on its own queue.
-                    break;
-                }
-                LinkMsg::SetLinkEstablishedCallback(cb) => {
-                    link.callbacks.link_established = cb;
-                }
-                LinkMsg::SetLinkClosedCallback(cb) => {
-                    link.callbacks.link_closed = cb;
-                }
-                LinkMsg::SetPacketCallback(cb) => {
-                    link.set_packet_callback(cb);
-                }
-                LinkMsg::SetRemoteIdentifiedCallback(cb) => {
-                    link.callbacks.remote_identified = cb;
-                }
-                LinkMsg::SetResourceStrategy(strategy) => {
-                    link.resource_strategy = strategy;
-                }
-                LinkMsg::SetResourceCallbacks { resource, started, concluded } => {
-                    link.callbacks.resource = resource;
-                    link.callbacks.resource_started = started;
-                    link.callbacks.resource_concluded = concluded;
-                }
-                LinkMsg::SetTrackPhyStats(track) => {
-                    link.track_phy_stats = track;
-                }
-
-                // --- Internal: packet dispatch ---
-                LinkMsg::Receive(packet, reply) => {
-                    // The §1 assertion and link_established callback belong to
-                    // the PENDING/HANDSHAKE → ACTIVE transition (actual link
-                    // establishment). STALE → ACTIVE is a keepalive recovery,
-                    // NOT an establishment: the watchdog demotes an idle link
-                    // to STALE and the next inbound packet revives it (see
-                    // receive()'s "Mark active if stale"). Counting the stale
-                    // revival as a late link-establishment success re-fired
-                    // the callback and tripped §1 with the ORIGINAL
-                    // request_time, so the reported latency escalated by one
-                    // keepalive period per cycle (66s, 132s, 199s, ...).
-                    let was_establishing =
-                        link.state == STATE_PENDING || link.state == STATE_HANDSHAKE;
-                    let handled = link.receive(&packet).is_ok();
-                    let now_active = link.state == STATE_ACTIVE;
-
-                    // Sync the atomic before firing any callback — callbacks may call
-                    // status()/is_active()/is_alive() on self_handle and must see the
-                    // updated value without going through the channel (which would deadlock).
-                    self_handle.status_atomic.store(link.status, Ordering::Relaxed);
-
-                    // Fire link_established callback on a dedicated thread — same pattern
-                    // as remote_identified. The callback may call back into LinkHandle
-                    // methods (snapshot, identify, request, etc.) which would deadlock
-                    // if called on the actor thread itself (the actor can't process its
-                    // own reply while it's blocked inside the callback).
-                    if was_establishing && now_active {
-                        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                        crate::send_assertion::assert_send_completed_in_time(
-                            "link.establish",
-                            link.request_time.unwrap_or(0.0),
-                        );
-                        if let Some(cb) = link.callbacks.link_established.take() {
-                            let h = self_handle.clone();
-                            thread::spawn(move || cb(h));
-                        }
-                    }
-
-                    // Fire remote_identified callback on a dedicated thread.
-                    if link.pending_remote_identified {
-                        link.pending_remote_identified = false;
-                        if let Some(cb) = link.callbacks.remote_identified.clone() {
-                            let identity = link.remote_identity.lock().ok().and_then(|r| r.clone());
-                            if let Some(identity) = identity {
-                                let h = self_handle.clone();
-                                thread::spawn(move || cb(h, identity));
-                            }
-                        }
-                    }
-
-                    let _ = reply.send(ReceiveResult { handled });
-                }
-                LinkMsg::ValidateProof { proof, mut receipt, reply } => {
-                    let valid = receipt.validate_link_proof(&proof, &link);
-                    let _ = reply.send((valid, receipt));
-                }
-
-                // Fire-and-forget: send a request response assembled by the
-                // background thread that ran the request handler callback.
-                LinkMsg::SendResponse { request_id, response } => {
-                    // Match Python RNS: a handler that returns no bytes is
-                    // treated as "no response" — we emit no packet at all and
-                    // let the requester time out cleanly. Sending an empty
-                    // payload through send_request_response would either
-                    // produce a malformed wire packet (original bug) or a
-                    // non-Python `[id, nil]` packet (earlier band-aid);
-                    // neither is protocol-conformant.
-                    if response.is_empty() {
-                        crate::log("[REQ] handler returned 0 bytes — no response packet sent (matches Python None)", crate::LOG_NOTICE, false, false);
-                    } else {
-                        let _ = link.send_request_response(&request_id, &response);
-                    }
-                }
-
-                // Dispatch an assembled REQUEST resource — sent by the
-                // request_resource_concluded callback after a multi-segment
-                // inbound request has finished assembling.
-                LinkMsg::RequestResourceConcluded { request_id, delivered } => {
-                    link.request_resource_concluded(&request_id, delivered);
-                }
-                LinkMsg::HandleRequestPacket { request_id, plaintext } => {
-                    let _ = link.handle_request_packet(request_id, &plaintext);
-                }
-            }
+            let was_teardown = matches!(msg, LinkMsg::Teardown(_));
+            actor_handle_message(&mut link, &rx, &self_handle, msg);
+            if was_teardown { break; }
         }
 
         // --- Watchdog: runs on every timeout AND after every message ---
@@ -1062,6 +779,346 @@ fn send_request_resource(
             }
         }
     });
+}
+
+
+/// One actor message. Shared by the actor loop and by
+/// `service_mailbox_until_finished`, which runs the mailbox while a callback
+/// that must complete before the next packet is still executing.
+fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_handle: &LinkHandle, msg: LinkMsg) {
+    match msg {
+        // --- Read operations ---
+        LinkMsg::Snapshot(reply) => {
+            let _ = reply.send(Ok(LinkSnapshot {
+                link_id: link.link_id.clone(),
+                state: link.state,
+                status: link.status,
+                initiator: link.initiator,
+                rtt: link.rtt,
+                activated_at: link.activated_at,
+                established_at: link.established_at,
+                attached_interface: link.attached_interface.clone(),
+                mtu: Some(link.mtu),
+                traffic_timeout_factor: link.traffic_timeout_factor,
+                rssi: link.rssi,
+                snr: link.snr,
+                q: link.q,
+                track_phy_stats: link.track_phy_stats,
+                request_time: link.request_time,
+                establishment_cost: link.establishment_cost,
+                last_inbound: link.last_inbound,
+            }));
+        }
+        LinkMsg::Status(reply) => { let _ = reply.send(link.status); }
+        LinkMsg::IsActive(reply) => { let _ = reply.send(link.state == STATE_ACTIVE); }
+        LinkMsg::IsAlive(reply) => { let _ = reply.send(link.state != STATE_CLOSED); }
+        LinkMsg::NoDataFor(reply) => { let _ = reply.send(Ok(link.no_data_for())); }
+        LinkMsg::RemoteIdentity(reply) => {
+            let ri = link.remote_identity.lock().ok().and_then(|r| r.clone());
+            let _ = reply.send(Ok(ri));
+        }
+        LinkMsg::DestinationHash(reply) => {
+            let result = link.destination.lock()
+                .map(|d| d.hash.clone())
+                .map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+        LinkMsg::CloneDestination(reply) => {
+            let result = link.destination.lock()
+                .map(|d| d.clone())
+                .map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+        LinkMsg::BuildLinkDestination(reply) => {
+            let result = link.destination.lock().map(|d| {
+                let mut dest = d.clone();
+                dest.dest_type = crate::destination::DestinationType::Link;
+                dest.hash = link.link_id.clone();
+                dest.hexhash = crate::hexrep(&dest.hash, false);
+                dest.link = Some(crate::destination::LinkInfo {
+                    rtt: link.rtt,
+                    traffic_timeout_factor: link.traffic_timeout_factor,
+                    status_closed: false,
+                    mtu: Some(link.mtu),
+                    attached_interface: link.attached_interface.clone(),
+                });
+                dest
+            }).map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+        LinkMsg::GetLinkOutboundInfo(reply) => {
+            let _ = reply.send((link.attached_interface.clone(), link.state == STATE_CLOSED));
+        }
+
+        // --- Crypto operations ---
+        LinkMsg::Encrypt(plaintext, reply) => {
+            let result = if link.state != STATE_ACTIVE && link.state != STATE_STALE {
+                Err(LinkGone)
+            } else {
+                link.encrypt(&plaintext).map_err(|_| LinkGone)
+            };
+            let _ = reply.send(result);
+        }
+        LinkMsg::Decrypt(ciphertext, reply) => {
+            let result = link.decrypt(&ciphertext).map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+
+        // --- Mutating with response ---
+        // Process the request inline on the actor: encrypt the
+        // payload, pack the packet, and enqueue it on the per-
+        // interface writer (Step 1 of the transport refactor).
+        // All of these are bounded-latency, so replying
+        // synchronously to the caller is safe — the FFI / UI
+        // thread is never blocked on socket RTT.
+        LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, reply } => {
+            let result = link
+                .request(path, data, response_cb, failed_cb, progress_cb)
+                .map_err(|e| {
+                    crate::log(
+                        &format!("[LINK] request submission failed: {}", e),
+                        crate::LOG_NOTICE,
+                        false,
+                        false,
+                    );
+                    LinkGone
+                });
+            let _ = reply.send(result);
+        }
+        LinkMsg::SendPacket(data, reply) => {
+            let result = link.send_packet(&data).map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+        LinkMsg::Identify(identity, reply) => {
+            let result = link.identify(&identity).map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
+        LinkMsg::Initiate(reply) => {
+            // Three-step initiation so a LINKPROOF arriving on the
+            // wire (which can happen the instant `packet.send()`
+            // returns, or even slightly before for loopback paths)
+            // can always be routed to this handle:
+            //   1. `initiate_prepare` builds the LR packet and
+            //      derives the real `link.link_id`.
+            //   2. We update the shared cached id on the handle
+            //      AND insert this handle into the runtime
+            //      registry under the real id — both before the
+            //      packet hits the wire.
+            //   3. `initiate_send` performs the (potentially
+            //      blocking) `packet.send()`.
+            match link.initiate_prepare() {
+                Ok(packet) => {
+                    let new_id = link.link_id.clone();
+                    if let Ok(mut id) = self_handle.id.lock() {
+                        *id = new_id;
+                    }
+                    register_runtime_link_handle(self_handle.clone());
+                    match link.initiate_send(packet) {
+                        Ok(()) => { let _ = reply.send(Ok(())); }
+                        Err(_) => { let _ = reply.send(Err(LinkGone)); }
+                    }
+                }
+                Err(_) => { let _ = reply.send(Err(LinkGone)); }
+            }
+        }
+
+        // --- Resource operations ---
+        LinkMsg::ReadyForNewResource(reply) => {
+            let _ = reply.send(link.ready_for_new_resource());
+        }
+        LinkMsg::RegisterOutgoingResource(resource) => {
+            link.register_outgoing_resource(resource);
+        }
+        LinkMsg::RegisterIncomingResource(resource) => {
+            link.register_incoming_resource(resource);
+        }
+        LinkMsg::ResourceConcluded(resource, reply) => {
+            let cb = link.resource_concluded(resource);
+            let _ = reply.send(cb);
+        }
+        LinkMsg::CancelOutgoingResource(resource) => {
+            link.cancel_outgoing_resource(resource);
+        }
+        LinkMsg::CancelIncomingResource(resource) => {
+            link.cancel_incoming_resource(resource);
+        }
+        LinkMsg::SetExpectedRate(rate) => {
+            link.set_expected_rate(rate);
+        }
+        LinkMsg::GetLastResourceWindow(reply) => {
+            let _ = reply.send(link.get_last_resource_window());
+        }
+        LinkMsg::GetLastResourceEifr(reply) => {
+            let _ = reply.send(link.get_last_resource_eifr());
+        }
+
+        // --- Fire-and-forget ---
+        LinkMsg::Teardown(caller) => {
+            crate::log(&format!("LINK teardown-caller link={} state={} from={}", crate::hexrep(&link.link_id, false), link.state, caller), crate::LOG_NOTICE, false, false);
+            link.teardown();
+            self_handle.status_atomic.store(link.status, Ordering::Relaxed);
+            // Actor exits.  link_closed callback is spawned on a new thread
+            // inside teardown() — same as link_established/remote_identified/packet —
+            // so the callback can safely acquire external mutexes without
+            // deadlocking the actor on its own queue. The loop sees
+            // STATE_CLOSED and exits.
+        }
+        LinkMsg::SetLinkEstablishedCallback(cb) => {
+            link.callbacks.link_established = cb;
+        }
+        LinkMsg::SetLinkClosedCallback(cb) => {
+            link.callbacks.link_closed = cb;
+        }
+        LinkMsg::SetPacketCallback(cb) => {
+            link.set_packet_callback(cb);
+        }
+        LinkMsg::SetRemoteIdentifiedCallback(cb) => {
+            link.callbacks.remote_identified = cb;
+        }
+        LinkMsg::SetResourceStrategy(strategy) => {
+            link.resource_strategy = strategy;
+        }
+        LinkMsg::SetResourceCallbacks { resource, started, concluded } => {
+            link.callbacks.resource = resource;
+            link.callbacks.resource_started = started;
+            link.callbacks.resource_concluded = concluded;
+        }
+        LinkMsg::SetTrackPhyStats(track) => {
+            link.track_phy_stats = track;
+        }
+
+        // --- Internal: packet dispatch ---
+        LinkMsg::Receive(packet, reply) => {
+            // The §1 assertion and link_established callback belong to
+            // the PENDING/HANDSHAKE → ACTIVE transition (actual link
+            // establishment). STALE → ACTIVE is a keepalive recovery,
+            // NOT an establishment: the watchdog demotes an idle link
+            // to STALE and the next inbound packet revives it (see
+            // receive()'s "Mark active if stale"). Counting the stale
+            // revival as a late link-establishment success re-fired
+            // the callback and tripped §1 with the ORIGINAL
+            // request_time, so the reported latency escalated by one
+            // keepalive period per cycle (66s, 132s, 199s, ...).
+            let was_establishing =
+                link.state == STATE_PENDING || link.state == STATE_HANDSHAKE;
+            let handled = link.receive(&packet).is_ok();
+            let now_active = link.state == STATE_ACTIVE;
+
+            // Sync the atomic before firing any callback — callbacks may call
+            // status()/is_active()/is_alive() on self_handle and must see the
+            // updated value without going through the channel (which would deadlock).
+            self_handle.status_atomic.store(link.status, Ordering::Relaxed);
+
+            // Fire link_established callback on a dedicated thread — same pattern
+            // as remote_identified. The callback may call back into LinkHandle
+            // methods (snapshot, identify, request, etc.) which would deadlock
+            // if called on the actor thread itself (the actor can't process its
+            // own reply while it's blocked inside the callback).
+            if was_establishing && now_active {
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                crate::send_assertion::assert_send_completed_in_time(
+                    "link.establish",
+                    link.request_time.unwrap_or(0.0),
+                );
+                if let Some(cb) = link.callbacks.link_established.take() {
+                    // RNS/Link.py rtt_packet() calls link_established
+                    // SYNCHRONOUSLY, before the next packet on the link is
+                    // looked at, so whatever the application configures in
+                    // it — resource strategy and callbacks, packet callback,
+                    // identify — is in place for the very first data packet.
+                    //
+                    // This used to be a bare thread::spawn and the actor
+                    // moved straight on. A bulk sender (a syncing LXMF peer)
+                    // sends its RESOURCE_ADV in the same instant as its
+                    // LRRTT; the actor handled that advertisement with the
+                    // link still on ACCEPT_NONE and dropped it silently,
+                    // then received every part for a resource it never
+                    // registered and proved it anyway. rfed ingested none
+                    // of a 6000-message flood on the staging network while
+                    // the sender saw every batch accepted. The spawn exists
+                    // because the callback may call LinkHandle methods that
+                    // round-trip through this mailbox; so the actor waits for
+                    // it here while still servicing its own mailbox.
+                    let h = self_handle.clone();
+                    let done = thread::spawn(move || cb(h));
+                    service_mailbox_until_finished(link, rx, self_handle, done);
+                }
+            }
+
+            // Fire remote_identified callback on a dedicated thread.
+            if link.pending_remote_identified {
+                link.pending_remote_identified = false;
+                if let Some(cb) = link.callbacks.remote_identified.clone() {
+                    let identity = link.remote_identity.lock().ok().and_then(|r| r.clone());
+                    if let Some(identity) = identity {
+                        let h = self_handle.clone();
+                        thread::spawn(move || cb(h, identity));
+                    }
+                }
+            }
+
+            let _ = reply.send(ReceiveResult { handled });
+        }
+        LinkMsg::ValidateProof { proof, mut receipt, reply } => {
+            let valid = receipt.validate_link_proof(&proof, &link);
+            let _ = reply.send((valid, receipt));
+        }
+
+        // Fire-and-forget: send a request response assembled by the
+        // background thread that ran the request handler callback.
+        LinkMsg::SendResponse { request_id, response } => {
+            // Match Python RNS: a handler that returns no bytes is
+            // treated as "no response" — we emit no packet at all and
+            // let the requester time out cleanly. Sending an empty
+            // payload through send_request_response would either
+            // produce a malformed wire packet (original bug) or a
+            // non-Python `[id, nil]` packet (earlier band-aid);
+            // neither is protocol-conformant.
+            if response.is_empty() {
+                crate::log("[REQ] handler returned 0 bytes — no response packet sent (matches Python None)", crate::LOG_NOTICE, false, false);
+            } else {
+                let _ = link.send_request_response(&request_id, &response);
+            }
+        }
+
+        // Dispatch an assembled REQUEST resource — sent by the
+        // request_resource_concluded callback after a multi-segment
+        // inbound request has finished assembling.
+        LinkMsg::RequestResourceConcluded { request_id, delivered } => {
+            link.request_resource_concluded(&request_id, delivered);
+        }
+        LinkMsg::HandleRequestPacket { request_id, plaintext } => {
+            let _ = link.handle_request_packet(request_id, &plaintext);
+        }
+    }
+}
+
+/// Run the actor's mailbox until `worker` has finished. Used to give a
+/// callback that must complete before the next inbound packet is processed
+/// (see the link_established site) the same synchronous ordering the reference
+/// has, without deadlocking the LinkHandle calls the callback makes back into
+/// this actor. Only non-`Receive` messages are serviced: an inbound packet that
+/// arrives meanwhile is deferred until the callback is done, which is the point.
+fn service_mailbox_until_finished(
+    link: &mut Link,
+    rx: &mpsc::Receiver<LinkMsg>,
+    self_handle: &LinkHandle,
+    worker: thread::JoinHandle<()>,
+) {
+    let mut deferred: Vec<LinkMsg> = Vec::new();
+    while !worker.is_finished() {
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(msg @ LinkMsg::Receive(..)) => deferred.push(msg),
+            Ok(msg) => actor_handle_message(link, rx, self_handle, msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = worker.join();
+    // Deferred packets go back to the front of the line, in order.
+    for msg in deferred {
+        let _ = self_handle.tx.send(msg);
+    }
 }
 
 fn actor_check_request_timeouts(link: &mut Link) {
@@ -3096,6 +3153,19 @@ impl Link {
                 return Ok(());
             }
 
+            // RNS/Link.py logs nothing here either, but a silently ignored
+            // advertisement cost hours on the staging network: log the
+            // decision once per advertisement.
+            crate::log(
+                &format!(
+                    "[RESP-RES] advertisement on link {}: strategy={} app_callback={} concluded_callback={}",
+                    crate::hexrep(&self.link_id, false),
+                    match self.resource_strategy { ACCEPT_NONE => "ACCEPT_NONE", ACCEPT_APP => "ACCEPT_APP", ACCEPT_ALL => "ACCEPT_ALL", _ => "?" },
+                    self.callbacks.resource.is_some(),
+                    self.callbacks.resource_concluded.is_some(),
+                ),
+                crate::LOG_DEBUG, false, false,
+            );
             match self.resource_strategy {
                 ACCEPT_NONE => {
                 }
@@ -3120,6 +3190,10 @@ impl Link {
                         None,
                         Some(link_ctx),
                     ) {
+                        crate::log(&format!("[RESOURCE] accepted incoming resource on link {}: parts={} size={}",
+                            crate::hexrep(&self.link_id, false),
+                            resource.lock().map(|r| r.total_parts).unwrap_or(0),
+                            resource.lock().map(|r| r.size).unwrap_or(0)), crate::LOG_DEBUG, false, false);
                         // Register on real link so RESOURCE data packets find it
                         self.register_incoming_resource(resource.clone());
                         // Spawn callback off the actor thread so the user's handler
