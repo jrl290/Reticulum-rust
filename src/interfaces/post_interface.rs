@@ -29,7 +29,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(serde::Serialize)]
 struct RegisterRequest<'a> {
@@ -119,6 +119,14 @@ pub struct PostInterface {
     ack_batch_ids: Vec<String>,
     pub is_wake_mode: bool,
     pub rns_mode: u8,
+    /// Poll mode only: how often to exchange when there is nothing to send.
+    /// `poll_interval_seconds` from the config, else what the node told us
+    /// at registration (`idle_exchange_interval_ms`), else 1 s. Never below
+    /// [`Self::MIN_POLL_INTERVAL`].
+    pub poll_interval: Duration,
+    /// `poll_interval_seconds` from the config, if set — wins over the node's
+    /// `idle_exchange_interval_ms`.
+    configured_poll_interval: Option<Duration>,
     pub running: Arc<AtomicBool>,
     client: reqwest::blocking::Client,
     pub wake_listen_host: Option<String>,
@@ -195,6 +203,12 @@ impl PostInterface {
             .unwrap_or(1); // MODE_FULL default like Python
 
         let is_wake_mode = wake_url.is_some();
+        let configured_poll_interval = config
+            .get("poll_interval_seconds")
+            .or_else(|| config.get("poll_interval"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .map(Duration::from_secs_f64);
         let wake_listen_host = config.get("wake_listen_host").map(|s| s.to_string());
         let wake_listen_port = config.get("wake_listen_port").and_then(|p| p.parse::<u16>().ok());
 
@@ -237,6 +251,8 @@ impl PostInterface {
             ack_batch_ids: Vec::new(),
             is_wake_mode,
             rns_mode: mode,
+            poll_interval: configured_poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL).max(Self::MIN_POLL_INTERVAL),
+            configured_poll_interval,
             running: Arc::new(AtomicBool::new(false)),
             client,
             wake_listen_host,
@@ -244,6 +260,11 @@ impl PostInterface {
             exchange_signal: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
+
+    /// Poll-mode floor, as in the Python PostInterface (`_min_interval`).
+    pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    /// Before the node has told us its `idle_exchange_interval_ms`.
+    pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
     pub fn register_with_remote(&mut self) -> Result<(), String> {
         let register_url = format!("{}/v1/interfaces/register", self.node_url);
@@ -343,6 +364,11 @@ impl PostInterface {
         self.session_token = Some(register_response.session_token.clone());
         self.max_batch_packets = register_response.max_batch_packets.unwrap_or(Self::DEFAULT_MAX_BATCH_PACKETS);
         self.max_packet_bytes = register_response.max_packet_bytes.unwrap_or(Self::DEFAULT_MAX_PACKET_BYTES);
+        if let Some(ms) = register_response.idle_exchange_interval_ms.filter(|ms| *ms > 0) {
+            if self.configured_poll_interval.is_none() {
+                self.poll_interval = Duration::from_millis(ms).max(Self::MIN_POLL_INTERVAL);
+            }
+        }
 
         self.base.online = true;
         if let Some(ref name) = self.base.name {
@@ -683,20 +709,40 @@ impl PostInterface {
             }
 
             let mut consecutive_errors: u32 = 0;
+            let mut last_exchange = Instant::now();
 
             while running.load(Ordering::SeqCst) {
-                // Wait for a signal (outgoing packet or wake)
+                // Wait for a signal (outgoing packet or wake) — or, in poll
+                // mode, for the poll interval to elapse.
+                //
+                // RNS/Interfaces/PostInterface.py `_poll_loop`: with no
+                // wake_url the interface exchanges on a timer whether or not
+                // it has anything to send, because an exchange is also how it
+                // COLLECTS what the node has queued for it, and because the
+                // node marks an interface offline after
+                // `interface_stale_after_seconds` (15 s by default) of silence.
+                // Until 2026-09-21 this worker exchanged only when signalled,
+                // so a gateway on a quiet backbone went silent for 15–50 s at
+                // a stretch, the PHP node marked it offline, and every path
+                // request and LINKREQUEST that arrived in one of those gaps was
+                // dropped as "no usable path". Found on the private staging
+                // network on its first run; masked in production by public
+                // backbones that never stay quiet that long.
                 {
+                    let (is_wake, interval) = {
+                        let guard = iface.lock().unwrap();
+                        (guard.is_wake_mode, guard.poll_interval)
+                    };
                     let (lock, cvar) = &*exchange_signal;
                     let mut triggered = lock.lock().unwrap();
                     while !*triggered && running.load(Ordering::SeqCst) {
-                        let result = cvar.wait_timeout(triggered, Duration::from_secs(1));
-                        let (guard, timeout) = result.unwrap();
-                        triggered = guard;
-                        if timeout.timed_out() {
-                            // Periodic wake-up to check running flag
-                            continue;
+                        let due = if is_wake { None } else { Some(interval.saturating_sub(last_exchange.elapsed())) };
+                        if due == Some(Duration::ZERO) {
+                            break; // poll interval elapsed: exchange now
                         }
+                        let slice = due.unwrap_or(Duration::from_secs(1)).min(Duration::from_secs(1));
+                        let (guard, _timeout) = cvar.wait_timeout(triggered, slice).unwrap();
+                        triggered = guard;
                     }
                     *triggered = false;
                 }
@@ -724,6 +770,7 @@ impl PostInterface {
                     }
 
                     // Do exchange
+                    last_exchange = Instant::now();
                     let result = {
                         let mut guard = iface.lock().unwrap();
                         if guard.interface_id.is_some() {
@@ -921,4 +968,53 @@ pub struct ExchangeResult {
     pub recv_count: usize,
     pub has_more: bool,
     pub batch_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("name".to_string(), "t".to_string());
+        m.insert("node_url".to_string(), "http://127.0.0.1:1".to_string());
+        for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
+        m
+    }
+
+    // ── Poll mode exchanges on a timer, not only when signalled ──────────
+    //
+    // The worker loop itself needs a node to talk to; these pin the interval
+    // it will use, which is the part that was missing: the node's
+    // idle_exchange_interval_ms was stored and never read.
+
+    #[test]
+    fn poll_interval_defaults_and_honours_the_floor() {
+        let p = PostInterface::new(&cfg(&[])).unwrap();
+        assert!(!p.is_wake_mode);
+        assert_eq!(p.poll_interval, PostInterface::DEFAULT_POLL_INTERVAL);
+        let p = PostInterface::new(&cfg(&[("poll_interval_seconds", "0.2")])).unwrap();
+        assert_eq!(p.poll_interval, PostInterface::MIN_POLL_INTERVAL, "never below the Python floor");
+        let p = PostInterface::new(&cfg(&[("poll_interval_seconds", "7.5")])).unwrap();
+        assert_eq!(p.poll_interval, Duration::from_secs_f64(7.5));
+    }
+
+    #[test]
+    fn nodes_idle_interval_applies_unless_configured_locally() {
+        // Simulate what register_with_remote does with the node's answer.
+        let mut p = PostInterface::new(&cfg(&[])).unwrap();
+        let from_node = Duration::from_millis(1000).max(PostInterface::MIN_POLL_INTERVAL);
+        if p.configured_poll_interval.is_none() { p.poll_interval = from_node; }
+        assert_eq!(p.poll_interval, PostInterface::MIN_POLL_INTERVAL, "1000 ms from the node is floored to 3 s");
+
+        let mut p = PostInterface::new(&cfg(&[("poll_interval_seconds", "10")])).unwrap();
+        if p.configured_poll_interval.is_none() { p.poll_interval = from_node; }
+        assert_eq!(p.poll_interval, Duration::from_secs(10), "a configured interval wins over the node's");
+    }
+
+    #[test]
+    fn wake_mode_does_not_poll() {
+        let p = PostInterface::new(&cfg(&[("wake_url", "http://127.0.0.1:1/v1/wake")])).unwrap();
+        assert!(p.is_wake_mode, "wake mode is event-driven only, as in the Python PostInterface");
+    }
 }
