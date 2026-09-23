@@ -679,13 +679,13 @@ pub type AnnounceCallback = Arc<dyn Fn(&[u8], &Identity, &[u8], Option<Vec<u8>>,
 ///
 /// A *published* destination is a locally-registered IN/SINGLE destination
 /// that the application has opted in to having Transport announce
-/// automatically:
-///
-///   * once on every false→true `online` transition of any interface
-///     (so re-announces fire automatically when an interface comes back
-///     up after a reconnect / handshake), and
-///   * periodically at `refresh_interval`, replacing the per-app
-///     "announce timer" pattern.
+/// automatically: on the refresh sweep every `refresh_interval` on every
+/// online (non-access-point) interface, and once when an interface comes
+/// online (an edge reported through `set_interface_online` after the
+/// interface's stub is registered). Both are held per destination AND per
+/// interface to the period since the last announce of that destination on
+/// that interface, whoever sent it; a path response does not count. The
+/// application's own announces are never held.
 ///
 /// See `Transport::publish_destination` for usage.
 #[derive(Clone, Debug)]
@@ -695,9 +695,9 @@ pub struct PublishedDestination {
     /// the destination is still announced once when an interface comes
     /// online, no more than once per `AUTO_ANNOUNCE_HOLDOFF_SECS` there.
     pub refresh_interval: Option<f64>,
-    /// Wall-clock (seconds since UNIX epoch) of the last announce dispatch.
-    /// `0.0` means "never announced yet" — the next jobs() tick will
-    /// announce immediately.
+    /// Wall-clock (seconds since UNIX epoch) of the last sweep announce.
+    /// `0.0` means "never announced yet": with a refresh interval the next
+    /// sweep announces on every online interface at once.
     pub last_announced_at: f64,
     /// Optional app_data attached to each announce. When `None`, the
     /// destination's currently-configured app_data is used.
@@ -1646,6 +1646,16 @@ impl Transport {
         state.client_announce_pacing.remove(name);
         state.client_announce_last_sent.remove(name);
         state.pending_local_announces.retain(|(_, n, _)| n != name);
+        state.announce_sent_at.retain(|(_, n), _| n != name);
+        state.up_edge_pending_interfaces.remove(name);
+    }
+
+    /// Forget every automatic-announce record (used on shutdown so a stack
+    /// restarted in the same process starts with no announce history).
+    pub fn reset_announce_history() {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.announce_sent_at.clear();
+        state.up_edge_pending_interfaces.clear();
     }
 
     pub fn register_local_server_interface(name: &str) {
@@ -2778,8 +2788,12 @@ impl Transport {
             // Every (destination, interface) pair whose period has elapsed on
             // that interface. Local client interfaces are not announced to
             // here; they get announces through inbound() dispatch.
+            // Access-point interfaces never carry our automatic announces
+            // (RNS/Transport.py outbound(): an untargeted announce is not
+            // sent on MODE_ACCESS_POINT), and a targeted announce would
+            // bypass that rule, so they are left out here.
             let online: Vec<String> = state.interfaces.iter()
-                .filter(|i| i.online)
+                .filter(|i| i.online && i.mode != InterfaceStub::MODE_ACCESS_POINT)
                 .map(|i| i.name.clone())
                 .collect();
             let mut due: Vec<(Vec<u8>, Option<Vec<u8>>, String)> = Vec::new();
@@ -2839,9 +2853,19 @@ impl Transport {
                         LOG_DEBUG, false, false,
                     );
                 }
+                // The announce is built on a COPY of the registered destination
+                // (the lock is released). announce() may rotate a ratchet and
+                // persist the copy's list, so the copy's ratchet state must be
+                // written back to the registered destination afterwards:
+                // otherwise every sweep rotated again from the stale copy and
+                // overwrote on disk the ratchet it had just advertised, and
+                // peers that encrypted to that ratchet could no longer be
+                // decrypted (Python announces from the one live object).
+                let mut ratchet_state: Option<(Vec<u8>, Option<Vec<Vec<u8>>>, u64)> = None;
                 if let Some((hash, app_data, iface, mut d)) = selected {
                     match d.announce(app_data.as_deref(), false, Some(iface.clone()), None, false) {
                         Ok(Some(packet)) => {
+                            ratchet_state = Some((hash.clone(), d.ratchets.clone(), d.latest_ratchet_time));
                             published_announce_packet = Some((hash, iface, packet));
                         }
                         Ok(None) => {}
@@ -2859,6 +2883,12 @@ impl Transport {
                 // completes. Send failures are rare and self-correct on the
                 // next period.
                 state = TRANSPORT.lock().unwrap();
+                if let Some((hash, ratchets, latest)) = ratchet_state {
+                    if let Some(slot) = state.destinations.iter_mut().find(|x| x.hash == hash) {
+                        slot.ratchets = ratchets;
+                        slot.latest_ratchet_time = latest;
+                    }
+                }
                 if let Some((hash, iface, _)) = &published_announce_packet {
                     state.announce_sent_at.insert((hash.clone(), iface.clone()), now_ts);
                     if let Some(entry) = state.published_destinations.get_mut(hash) {
@@ -3744,7 +3774,12 @@ impl Transport {
             // announce, the refresh sweep or an up-edge. Automatic announces
             // of the same destination on the same interface are held for the
             // destination's period after this.
-            if packet.packet_type == ANNOUNCE && packet.hops == 0 {
+            // A PATH_RESPONSE is an answer to a peer's request, not a
+            // refresh: it is not rebroadcast and remote rate limiters ignore
+            // it (Transport.py:2303), so it must not restart the period.
+            if packet.packet_type == ANNOUNCE && packet.hops == 0
+                && packet.context != crate::packet::PATH_RESPONSE
+            {
                 if let Some(dest) = packet.destination_hash.clone() {
                     for (iface_name, _) in &transmissions {
                         state.announce_sent_at.insert((dest.clone(), iface_name.clone()), outbound_time);
@@ -8241,13 +8276,90 @@ mod tests {
         sweep();
         assert_eq!(count(&captured_a), 3, "after the period an up-edge announces once more");
 
+        // 6. Records are pruned with their destination and their interface.
+        Transport::deregister_interface_stub(iface_b);
+        {
+            let state = TRANSPORT.lock().unwrap();
+            assert!(state.announce_sent_at.keys().all(|(_, i)| i != iface_b), "deregistering an interface prunes its records");
+            assert!(state.announce_sent_at.keys().any(|(h, _)| *h == dest_hash), "the other interface's record survives");
+        }
         Transport::unpublish_destination(&dest_hash);
         {
-            let mut state = TRANSPORT.lock().unwrap();
-            state.up_edge_pending_interfaces.clear();
+            let state = TRANSPORT.lock().unwrap();
+            assert!(state.announce_sent_at.keys().all(|(h, _)| *h != dest_hash), "unpublishing prunes the destination's records");
         }
+        Transport::reset_announce_history();
         uninstall_sync_outbound_handler(iface_a);
         uninstall_sync_outbound_handler(iface_b);
+    }
+
+    /// The sweep announces a COPY of the registered destination (the lock is
+    /// released around announce()). announce() rotates a ratchet on the
+    /// copy and persists the copy's list; until 2026-09-23 nothing wrote
+    /// that back, so every sweep rotated again from the stale registered
+    /// copy and overwrote on disk the ratchet it had just advertised. Peers
+    /// encrypting to an advertised ratchet then hit "decrypt failed" on the
+    /// next message (the phone was seen trying 51 ratchets before its main
+    /// key). Python announces from the one live Destination object.
+    #[test]
+    fn refresh_sweep_writes_ratchet_state_back() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-ratchet-writeback";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.last_mgmt_announce = now() + 60.0;
+        }
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "ratchet_writeback".to_string(),
+            vec!["parity".to_string()],
+        )
+        .expect("inbound destination");
+        let ratchet_path = std::env::temp_dir()
+            .join(format!("rns_test_ratchets_wb_{}.bin", crate::hexrep(&destination.hash, false)))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&ratchet_path);
+        destination.enable_ratchets(ratchet_path.clone()).expect("enable_ratchets");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        Transport::publish_destination(dest_hash.clone(), Some(Duration::from_secs(3600)), None);
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface_name.to_string();
+        stub_config.online = Some(true);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+            state.published_last_announced_at = 0.0;
+        }
+        Transport::jobs();
+        assert_eq!(captured.lock().unwrap().len(), 1, "one refresh announce went out");
+
+        let (ratchets, latest) = {
+            let state = TRANSPORT.lock().unwrap();
+            let d = state.destinations.iter().find(|d| d.hash == dest_hash).expect("registered destination");
+            (d.ratchets.clone(), d.latest_ratchet_time)
+        };
+        assert!(latest > 0, "the registered destination carries the rotation time of the ratchet it advertised");
+        assert_eq!(ratchets.as_ref().map(|r| r.len()).unwrap_or(0), 1, "the advertised ratchet is in the registered destination's list");
+
+        Transport::unpublish_destination(&dest_hash);
+        Transport::reset_announce_history();
+        uninstall_sync_outbound_handler(iface_name);
+        let _ = std::fs::remove_file(&ratchet_path);
     }
 
     #[test]

@@ -1296,9 +1296,10 @@ impl RNodeInterface {
 			inner.online = true;
 		}
 		println!("RNodeInterface[{}] is configured and powered up", self.name);
-		// Notify Transport so the false→true online transition triggers an
-		// automatic re-announce of all locally registered destinations on
-		// this interface (covers post-handshake and post-reconnect).
+		// Notify Transport of the false→true online transition: it announces
+		// each published destination once on this interface, held per
+		// destination and per interface to its refresh period (covers
+		// post-handshake and post-reconnect).
 		crate::transport::Transport::set_interface_online(&self.name, true);
 		Ok(())
 	}
@@ -1398,9 +1399,10 @@ impl RNodeInterface {
 			iface.name.clone()
 		};
 
-		// Notify Transport so the false→true online transition triggers an
-		// automatic re-announce of all locally registered destinations on
-		// this interface (covers post-handshake and post-reconnect).
+		// Notify Transport of the false→true online transition: it announces
+		// each published destination once on this interface, held per
+		// destination and per interface to its refresh period (covers
+		// post-handshake and post-reconnect).
 		crate::transport::Transport::set_interface_online(&iface_name, true);
 
 		Ok(())

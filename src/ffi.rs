@@ -121,6 +121,7 @@ pub fn init(config_dir: &str, loglevel: i32) -> Result<(), String> {
 /// Shut down Reticulum (best-effort).
 pub fn shutdown() -> Result<(), String> {
     crate::reticulum::exit_handler();
+    Transport::reset_announce_history();
     Ok(())
 }
 

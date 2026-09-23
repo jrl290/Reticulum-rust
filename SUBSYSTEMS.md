@@ -127,16 +127,28 @@ the refresh sweep inside `Transport::jobs()`)
 
 ### What the system owns
 
-- **Announce on opt-in.** First periodic refresh sweep after
-  `publish_destination` fires immediately, so the app gets an
+- **Announce on opt-in.** With a `refresh_interval`, the first
+  refresh sweep after `publish_destination` announces on each online
+  interface not announced on within the period, so the app gets an
   announce as soon as it expresses intent.
-- **Announce on interface up-edge.** Every time any interface
-  transitions `online: false → true`, all published destinations are
-  re-announced on that interface. This covers: cold start, TCP
-  reconnect, Wi-Fi join, cellular handover, app foreground.
+- **Announce on interface up-edge.** When an interface transitions
+  `online: false → true`, each published destination is announced once
+  on that interface — unless it was already announced there within its
+  period (see hold-off below). This covers: TCP reconnect, Wi-Fi join,
+  cellular handover, app foreground. A cold start is not an up-edge for
+  an interface registered already online.
 - **Periodic refresh.** Every `refresh_interval` (per published dest)
-  the destination is re-announced on every online interface. Default
-  guidance: 30 minutes for IN/SINGLE peer destinations.
+  the destination is re-announced on every online non-access-point
+  interface, targeted per interface, with the `app_data` given to
+  `publish_destination` (or the destination's default app_data).
+  Default guidance: 30 minutes for IN/SINGLE peer destinations.
+- **Hold-off.** Both automatic announces are held per destination AND
+  per interface to one per period, counted from the last announce of
+  that destination there, whoever sent it: `refresh_interval`, or
+  `AUTO_ANNOUNCE_HOLDOFF_SECS` (30 min) when published without one (in
+  which case only up-edges announce it). The application's own
+  announces always go out and start a period. Nothing announces on
+  down-edges, link close or decrypt failure.
 - **Re-entrancy safety.** The refresh sweep snapshots state, drops
   the `TRANSPORT` lock, builds announce packets outside the lock, then
   re-acquires to update bookkeeping. Two known re-entrancy traps
@@ -182,7 +194,7 @@ Transport::unpublish_destination(&self_dest_hash);
   `false → true` (initial connect, reconnect after drop, manual
   enable), it must call `Transport::set_interface_online(name, true)`.
   This is what fires both the AppLinks re-trigger AND the published-
-  destination re-announce.
+  destination up-edge announce (held to its period, see §2).
 - **Down-edge notification.** Whenever an interface drops from
   `true → false`, it must call `Transport::set_interface_online(name,
   false)` so dependent subsystems can stop trying.
@@ -196,9 +208,9 @@ Transport::unpublish_destination(&self_dest_hash);
 - AppLinks will not initiate establishment over an offline interface.
 - Published destinations will not be announced to an offline
   interface.
-- The first packet you successfully hand to an interface after an
-  up-edge is preceded by re-announces (and, if AppLinks is in use,
-  by re-establishment of any wanted links).
+- After an up-edge, published destinations not announced on that
+  interface within their period are re-announced there (and, if
+  AppLinks is in use, wanted links are re-established).
 
 ---
 

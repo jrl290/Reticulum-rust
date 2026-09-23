@@ -773,6 +773,9 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
             let grace_secs = link.stale_grace as u64;
             if now >= stale_at + grace_secs.max(1) {
                 crate::log(&format!("Link timeout, tearing down {}", crate::hexrep(&link.link_id, false)), crate::LOG_DEBUG, false, false);
+                // RNS/Link.py:765: a stale link that times out reports
+                // TEARDOWN_REASON_TIMEOUT, not the closing side.
+                link.teardown_reason = REASON_TIMEOUT;
                 link.teardown();
             }
         }
