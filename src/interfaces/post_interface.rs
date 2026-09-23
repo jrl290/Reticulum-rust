@@ -887,21 +887,10 @@ impl PostInterface {
                             let _ = stream.write_all(response.as_bytes());
                         } else if request.starts_with("POST /v1/wake") || request.contains("POST /v1/wake") {
                             // Extract body (after \r\n\r\n)
-                            let mut waker_url = String::new();
-                            if let Some(body_start) = request.find("\r\n\r\n") {
-                                let body = &request[body_start + 4..];
-                                // Simple JSON parse for waker_url
-                                if let Some(start) = body.find("\"waker_url\"") {
-                                    if let Some(colon) = body[start..].find(':') {
-                                        let val_start = start + colon + 1;
-                                        if let Some(q1) = body[val_start..].find('"') {
-                                            if let Some(q2) = body[val_start + q1 + 1..].find('"') {
-                                                waker_url = body[val_start + q1 + 1..val_start + q1 + 1 + q2].to_string();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            let waker_url = request
+                                .find("\r\n\r\n")
+                                .map(|body_start| wake_body_waker_url(&request[body_start + 4..]))
+                                .unwrap_or_default();
 
                             // Validate waker_url matches our configured node_url
                             let expected = node_url.trim_end_matches('/');
@@ -1016,5 +1005,44 @@ mod tests {
     fn wake_mode_does_not_poll() {
         let p = PostInterface::new(&cfg(&[("wake_url", "http://127.0.0.1:1/v1/wake")])).unwrap();
         assert!(p.is_wake_mode, "wake mode is event-driven only, as in the Python PostInterface");
+    }
+}
+
+/// The `waker_url` from a `/v1/wake` body.
+///
+/// The body is JSON, so it is parsed as JSON. PHP's `json_encode` escapes
+/// slashes by default (`"https:\/\/retichat.com\/reticulum"`), and the
+/// substring scan this replaced compared the *escaped* text against the
+/// configured node_url, rejecting every wake from a PHP peer with
+/// "waker_url '…\/\/…' does not match node_url". Anything that is not a JSON
+/// object with a string `waker_url` yields an empty string, which the caller
+/// rejects.
+pub(crate) fn wake_body_waker_url(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("waker_url").and_then(|u| u.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod wake_body_tests {
+    use super::wake_body_waker_url;
+
+    #[test]
+    fn php_escaped_slashes_decode_to_the_configured_url() {
+        // Exactly what PHP json_encode() sends without JSON_UNESCAPED_SLASHES.
+        let body = r#"{"waker_url":"https:\/\/retichat.com\/reticulum"}"#;
+        assert_eq!(wake_body_waker_url(body), "https://retichat.com/reticulum");
+    }
+
+    #[test]
+    fn plain_and_malformed_bodies() {
+        assert_eq!(
+            wake_body_waker_url(r#"{"waker_url":"https://selectivesubconscious.com/reticulum/"}"#),
+            "https://selectivesubconscious.com/reticulum/"
+        );
+        assert_eq!(wake_body_waker_url(r#"{"waker_url": 7}"#), "");
+        assert_eq!(wake_body_waker_url("not json"), "");
+        assert_eq!(wake_body_waker_url(""), "");
     }
 }
