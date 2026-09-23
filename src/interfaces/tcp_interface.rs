@@ -1298,16 +1298,23 @@ impl TcpClientInterface {
                     }
 
                     crate::log(&format!("TCP reconnect attempt {}...", attempts), crate::LOG_NOTICE, false, false);
-                    let ok = {
+                    let result = {
                         let mut iface = interface.lock().unwrap();
-                        iface.connect(false).is_ok()
+                        iface.connect(false)
                     };
 
-                    if ok {
-                        crate::log("TCP reconnected successfully, restarting read loop", crate::LOG_NOTICE, false, false);
-                        break 'reconnect true;
-                    } else {
-                        crate::log(&format!("TCP reconnect attempt {} failed", attempts), crate::LOG_WARNING, false, false);
+                    match result {
+                        Ok(()) => {
+                            crate::log("TCP reconnected successfully, restarting read loop", crate::LOG_NOTICE, false, false);
+                            break 'reconnect true;
+                        }
+                        Err(e) => {
+                            // Say why. On Android the same address can be
+                            // reachable from a shell while this process is
+                            // background-restricted, and "failed" alone
+                            // cannot tell that apart from a dead peer.
+                            crate::log(&format!("TCP reconnect attempt {} failed: {}", attempts, e), crate::LOG_WARNING, false, false);
+                        }
                     }
                 }; // 'reconnect
 
