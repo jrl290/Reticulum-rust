@@ -3087,9 +3087,19 @@ impl Link {
             self.rx += 1;
             self.rxbytes += packet.data.len() as u64;
             
-            // Mark active if stale
+            // Mark active if stale (RNS/Link.py receive(): a stale link that
+            // hears from its peer is active again). `status` is what
+            // `LinkHandle::status()` publishes through `status_atomic` and
+            // what app-links reads; until 2026-09-23 only `state` was
+            // restored, so a link that went stale once and recovered was
+            // reported STALE for the rest of its life. AppLinks::status()
+            // then returned ESTABLISHING, open_with_mode() declined to
+            // re-open, and the phone's propagation sync waited forever on a
+            // link that was exchanging keepalives the whole time.
             if self.state == STATE_STALE {
                 self.state = STATE_ACTIVE;
+                self.status = STATE_ACTIVE;
+                self.stale_since = None;
             }
             
             // Route based on packet context
@@ -5248,6 +5258,41 @@ mod tests {
              and silently dropped the ping — the exact regression we are guarding \
              against"
         );
+    }
+
+    /// RNS/Link.py receive(): a link the watchdog marked STALE is ACTIVE again
+    /// as soon as its peer is heard from. `status` (what `LinkHandle::status()`
+    /// publishes and app-links reads) must recover together with `state`.
+    /// Until 2026-09-23 only `state` did, and a link that had gone stale once
+    /// stayed reported STALE while it kept exchanging keepalives: the phone's
+    /// persistent propagation link was "establishing" forever.
+    #[test]
+    fn stale_link_recovers_status_as_well_as_state_on_inbound() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(97)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let now = current_time().unwrap();
+        link.activated_at = Some(now - link.stale_time as u64 - 10);
+        link.last_inbound = now - link.stale_time as u64 - 10;
+        link.last_proof = link.last_inbound;
+        link.last_outbound = now;
+        let (tx, _rx) = mpsc::channel();
+        let handle = LinkHandle::from_parts_for_test(tx, link.link_id.clone());
+        actor_watchdog_tick(&mut link, &handle);
+        assert_eq!(link.state, STATE_STALE, "the watchdog demotes a silent link to STALE");
+        assert_eq!(link.status, STATE_STALE);
+
+        let dest = link.destination.lock().unwrap().clone();
+        let mut ping = Packet::new(
+            Some(dest), vec![0xFFu8], DATA, crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST, packet::HEADER_1, None, None, false, 0,
+        );
+        ping.data = vec![0xFFu8];
+        link.receive(&ping).expect("an unencrypted KEEPALIVE is accepted");
+
+        assert_eq!(link.state, STATE_ACTIVE, "hearing from the peer revives the link");
+        assert_eq!(link.status, STATE_ACTIVE, "the published status must revive with it");
+        assert!(link.stale_since.is_none());
     }
 
     /// RNS/Link.py handle_request(): the response generator receives the
