@@ -4417,11 +4417,16 @@ impl Transport {
             // it; our multi-entry table keeps stale forks, so we must gate on
             // interface online status here.  Without this a fresh path on a
             // dead interface (e.g. RMap) out-scores a live one (MichMesh).
+            // An interface that is not registered at all is not "online by
+            // default": it is gone. A persisted route can outlive a config
+            // change (the gateway kept routing rfed via a MichMesh entry for
+            // hours after MichMesh left its config, 2026-09-23, dropping every
+            // link request on the floor), and the reference never faces this
+            // because it drops such entries when it loads the table.
             if let Some(name) = entry.receiving_interface.as_ref() {
-                if let Some(iface) = interfaces.iter().find(|i| &i.name == name) {
-                    if !iface.online {
-                        continue;
-                    }
+                match interfaces.iter().find(|i| &i.name == name) {
+                    Some(iface) if iface.online => {}
+                    _ => continue,
                 }
             }
             let bitrate = entry.receiving_interface.as_ref()
@@ -4467,11 +4472,12 @@ impl Transport {
             // interface.OUT gate: drop paths whose interface is offline
             // (see select_path).
             .filter(|(_, e)| match e.receiving_interface.as_ref() {
+                // Unknown interface = unusable route (see select_path_excluding).
                 Some(name) => interfaces
                     .iter()
                     .find(|i| &i.name == name)
                     .map(|i| i.online)
-                    .unwrap_or(true),
+                    .unwrap_or(false),
                 None => true,
             })
             .map(|(idx, e)| {
@@ -8188,6 +8194,35 @@ mod tests {
     /// 2026-09-22 every up-edge re-announced everything: 138 announces from
     /// the fcm bridge in a 35 min reconnect loop, blocked by the public
     /// node's per-destination limiter (PARITY-AUDIT-1.5.2.md B22).
+    /// A persisted route whose interface is no longer configured must never be
+    /// selected. On 2026-09-23 the gateway kept forwarding rfed's link requests
+    /// down a MichMesh entry for hours after MichMesh left its config; the
+    /// fresh, shorter sofia route lost to it and every packet was dropped.
+    #[test]
+    fn a_route_on_an_unknown_interface_is_never_selected() {
+        let dest = vec![0xAAu8; 16];
+        let now_ts = now();
+        let route = |iface: &str, hops: u8| PathEntry {
+            timestamp: now_ts,
+            next_hop: vec![hops; 16],
+            hops,
+            expires: now_ts + 3600.0,
+            receiving_interface: Some(iface.to_string()),
+            packet_hash: vec![hops; 32],
+        };
+        let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        table.insert(dest.clone(), VecDeque::from(vec![route("MichMesh", 1), route("rns.sofia", 2)]));
+        let interfaces = vec![InterfaceStub { name: "rns.sofia".to_string(), online: true, ..InterfaceStub::default() }];
+
+        let chosen = Transport::select_path(&table, &interfaces, &dest, now_ts).expect("the live route is selectable");
+        assert_eq!(chosen.1.receiving_interface.as_deref(), Some("rns.sofia"), "the fewer-hop route on a vanished interface must lose");
+        let all = Transport::select_all_paths(&table, &interfaces, &dest, now_ts);
+        assert!(all.iter().all(|(_, _, e)| e.receiving_interface.as_deref() == Some("rns.sofia")), "hedging must not fall back to the vanished interface either");
+
+        table.insert(dest.clone(), VecDeque::from(vec![route("MichMesh", 1)]));
+        assert!(Transport::select_path(&table, &interfaces, &dest, now_ts).is_none(), "only a vanished route: no path, so a path request goes out instead of a drop");
+    }
+
     #[test]
     fn automatic_announces_are_held_per_destination_per_interface() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
