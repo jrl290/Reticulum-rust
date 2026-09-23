@@ -87,7 +87,17 @@ pub const LOCAL_CLIENT_ANNOUNCE_PACE: f64 = 0.60;
 /// interface when the destination was published without a refresh interval
 /// (with one, that interval is the period). Announces the application sends
 /// itself are never held; they start the period. See `set_interface_online`.
-pub const AUTO_ANNOUNCE_HOLDOFF_SECS: f64 = 30.0 * 60.0;
+///
+/// Six hours: the reference ecosystem's only automatic announce (lxmd's
+/// propagation node, `announce_interval = 360` minutes) uses it, and public
+/// transport nodes commonly run `announce_rate_target = 3600` (the manual's
+/// own example) — a destination that re-announces inside that target is a
+/// rate violation each time and, past the grace count, is silently not
+/// rebroadcast for target + penalty. Until 2026-09-23 this was 30 minutes,
+/// rfed's services refreshed every 15 and the push bridges every 10; the
+/// backbones stopped relaying our re-announces within the hour while a
+/// path's lifetime (`PATHFINDER_E`) is a week. PARITY-AUDIT-1.5.2.md B28.
+pub const AUTO_ANNOUNCE_HOLDOFF_SECS: f64 = 6.0 * 60.0 * 60.0;
 
 /// Minimum spacing between announces of OUR OWN destinations on one
 /// interface. A node with twenty destinations used to announce all of them
@@ -10589,4 +10599,17 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod reannounce_cadence_tests {
+    /// The manual's example public interface sets `announce_rate_target =
+    /// 3600`; anything that re-announces faster is a rate violation there
+    /// and eventually stops being rebroadcast (PARITY-AUDIT-1.5.2.md B28).
+    #[test]
+    fn automatic_reannounce_period_clears_the_common_rate_target() {
+        assert!(super::AUTO_ANNOUNCE_HOLDOFF_SECS >= 3600.0);
+        // And it is the reference's own cadence: lxmd announce_interval = 360 min.
+        assert_eq!(super::AUTO_ANNOUNCE_HOLDOFF_SECS, 6.0 * 60.0 * 60.0);
+    }
 }
