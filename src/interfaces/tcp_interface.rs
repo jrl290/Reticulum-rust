@@ -1674,7 +1674,7 @@ impl TcpServerInterface {
         base.supports_discovery = true;
 
         let bind_addr = format!("{}:{}", bind_ip, bind_port);
-        let listener = TcpListener::bind(&bind_addr)
+        let listener = Self::bind_with_retry(&bind_addr, Self::BIND_RETRY_BUDGET)
             .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
 
         let listener_arc = Arc::new(listener);
@@ -2619,5 +2619,71 @@ mod tests {
                 "HDLC round-trip failed for payload {:?}", payload,
             );
         }
+    }
+}
+
+impl TcpServerInterface {
+    /// How long a server interface keeps trying to bind a port that is still
+    /// held. `service rnsd restart` starts the new instance while the old one
+    /// is still shutting down (persisting its tables after SIGTERM); on
+    /// 2026-09-23 the gateway's LAN listener lost that race ("Address already
+    /// in use"), rnsd carried on without it, and every LAN peer sat in
+    /// reconnect backoff until the next restart.
+    pub const BIND_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Bind `addr`, retrying every half second for `budget` while the port is
+    /// still in use. Any other error is returned at once.
+    pub fn bind_with_retry(addr: &str, budget: std::time::Duration) -> std::io::Result<std::net::TcpListener> {
+        let started = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            match std::net::TcpListener::bind(addr) {
+                Ok(listener) => return Ok(listener),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && started.elapsed() < budget => {
+                    if !warned {
+                        crate::log(
+                            &format!("TCP server: {} is still in use (previous instance shutting down?) — retrying for up to {}s", addr, budget.as_secs()),
+                            crate::LOG_WARNING, false, false,
+                        );
+                        warned = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bind_retry_tests {
+    use super::TcpServerInterface;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bind_waits_for_a_port_the_previous_instance_still_holds() {
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap().to_string();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            drop(holder);
+        });
+        let t0 = Instant::now();
+        let bound = TcpServerInterface::bind_with_retry(&addr, Duration::from_secs(10))
+            .expect("binds once the holder releases the port");
+        assert!(t0.elapsed() >= Duration::from_millis(1000), "must have waited for the release");
+        assert_eq!(bound.local_addr().unwrap().to_string(), addr);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn bind_gives_up_after_the_budget() {
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap().to_string();
+        let err = TcpServerInterface::bind_with_retry(&addr, Duration::from_millis(700))
+            .expect_err("port never freed");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(holder);
     }
 }
