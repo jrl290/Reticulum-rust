@@ -1816,6 +1816,9 @@ impl RNodeInterface {
 					eprintln!("RNode read error: {}", e);
 					let iface = interface.lock().unwrap();
 					iface.inner.lock().unwrap().online = false;
+					// Tell Transport, so outbound() stops using the interface
+					// and the next up-edge is a real transition.
+					crate::transport::Transport::set_interface_online(&iface.name, false);
 					break;
 				}
 			}
@@ -2497,10 +2500,13 @@ impl RNodeInterface {
 	/// commands. Used by FFI deregister paths where the underlying link
 	/// (BLE/USB) may already be torn down.
 	pub fn shutdown(&self) {
-		let mut inner = self.inner.lock().unwrap();
-		inner.detached = true;
-		inner.online = false;
-		inner.connection.close();
+		{
+			let mut inner = self.inner.lock().unwrap();
+			inner.detached = true;
+			inner.online = false;
+			inner.connection.close();
+		}
+		crate::transport::Transport::set_interface_online(&self.name, false);
 	}
 
 	/// Return the configured ID-callsign bytes (if any).

@@ -360,11 +360,20 @@ impl KissInterface {
     }
 
     fn handle_error_and_reconnect(iface: Arc<Mutex<KissInterface>>) {
-        {
+        let offline_name = {
             let mut iface_guard = iface.lock().unwrap();
             iface_guard.online = false;
             iface_guard.base.online = false;
             iface_guard.serial = None;
+            iface_guard.base.name.clone()
+        };
+        // Report the down-edge so Transport stops routing to the port and
+        // the reconnect's set_interface_online(true) is a real transition.
+        if let Some(name) = &offline_name {
+            RnsTransport::set_interface_online(name, false);
+        }
+        {
+            let mut iface_guard = iface.lock().unwrap();
             log(
                 "A serial port error occurred, the interface is now offline.",
                 crate::LOG_ERROR,

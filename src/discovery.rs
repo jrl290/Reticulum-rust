@@ -318,9 +318,12 @@ impl InterfaceAnnouncer {
         
         // Create discovery destination using transport identity or network identity
         let identity = Transport::discovery_identity_clone();
+        // RNS/Discovery.py:67: a SINGLE destination on the discovery
+        // identity. (It was PLAIN here, which announce() rejects, so no
+        // discovery announce was ever sent.)
         let mut discovery_dest = Destination::new_inbound(
             identity,
-            DestinationType::Plain,
+            DestinationType::Single,
             APP_NAME.to_string(),
             vec!["discovery".to_string(), "interface".to_string()],
         ).map_err(|e| format!("Failed to create discovery destination: {}", e))?;

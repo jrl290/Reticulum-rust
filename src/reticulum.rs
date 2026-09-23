@@ -1898,6 +1898,13 @@ impl Reticulum {
                                 }),
                             );
 
+                            // configure_device_shared reported its online
+                            // transition before the stub existed (nothing
+                            // recorded it), so register the stub with the
+                            // radio's real state; an online registration is
+                            // the up-edge.
+                            stub_config.online = Some(interface.lock().map(|i| i.is_online()).unwrap_or(false));
+
                             self.system_interfaces.push(SystemInterface::RNode(interface));
                         }
                         Err(err) => {

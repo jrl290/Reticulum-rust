@@ -1611,6 +1611,15 @@ impl Transport {
         iface.ifac_signature = config.ifac_signature;
         iface.repr = config.repr.unwrap_or_default();
 
+        // An interface registered already online (spawned TCP/Backbone
+        // clients, and initial connects that completed before the stub
+        // existed) never reports a transition, so treat the registration
+        // itself as its up-edge: the sweep announces each published
+        // destination on it once, held per interface to its period.
+        if iface.online {
+            state.up_edge_pending_interfaces.insert(iface.name.clone());
+            state.published_last_checked = 0.0;
+        }
         state.interfaces.push(iface);
     }
 
@@ -8291,6 +8300,63 @@ mod tests {
         Transport::reset_announce_history();
         uninstall_sync_outbound_handler(iface_a);
         uninstall_sync_outbound_handler(iface_b);
+    }
+
+    /// A spawned TCP/Backbone client, and a client whose initial connect
+    /// finished before its stub existed, are registered already online and
+    /// never call set_interface_online(true). Registering an online stub is
+    /// therefore its up-edge (audit of 92f51f5, B22).
+    #[test]
+    fn registering_an_online_interface_is_an_up_edge() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let iface_name = "test-spawned-online";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.up_edge_pending_interfaces.clear();
+            state.last_mgmt_announce = now() + 60.0;
+        }
+        let destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "spawned_test".to_string(),
+            vec!["parity".to_string()],
+        )
+        .expect("inbound destination");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        Transport::publish_destination(dest_hash.clone(), None, None); // up-edges only
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface_name.to_string();
+        stub_config.online = Some(true); // registered already online, no transition ever reported
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_announced_at = 0.0;
+        }
+        Transport::jobs();
+        assert_eq!(captured.lock().unwrap().len(), 1, "registering an online interface announces the published destination on it once");
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+            state.published_last_announced_at = 0.0;
+        }
+        Transport::jobs();
+        assert_eq!(captured.lock().unwrap().len(), 1, "and only once inside the period");
+
+        Transport::unpublish_destination(&dest_hash);
+        Transport::reset_announce_history();
+        uninstall_sync_outbound_handler(iface_name);
     }
 
     /// The sweep announces a COPY of the registered destination (the lock is
