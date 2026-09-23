@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Global reconnect nudge ──────────────────────────────────────────────
 // A Condvar shared by all TCP client reconnect loops.  When the platform
@@ -129,6 +129,31 @@ impl TcpClientInterface {
     pub const DEFAULT_IFAC_SIZE: usize = 16;
     pub const RECONNECT_WAIT_BASE: u64 = 5;  // seconds — first retry delay
     pub const RECONNECT_WAIT_MAX: u64  = 300; // seconds — cap (5 min)
+    /// A connection the peer closes sooner than this is a reject, not a
+    /// working link: it counts as a failed attempt so the backoff keeps
+    /// climbing instead of restarting at 5 s. On 2026-09-23 rns.michmesh.net
+    /// accepted and reset our connection within the same second, ~11 times a
+    /// minute for hours, from two nodes — the reconnect loop saw every accept
+    /// as a success and dialled again 5 s later.
+    pub const SHORT_LIVED_CONNECTION_SECS: f64 = 10.0;
+
+    /// Seconds to wait before reconnect attempt number `attempts` (0-based):
+    /// 5, 10, 20, 40, 80, 160, then 300 for good.
+    pub fn reconnect_wait_secs(attempts: u32) -> u64 {
+        let shift = attempts.min(6) as u64;
+        (Self::RECONNECT_WAIT_BASE << shift).min(Self::RECONNECT_WAIT_MAX)
+    }
+
+    /// How many consecutive short-lived connections to carry into the next
+    /// reconnect episode: one more if this connection was short-lived, zero
+    /// if it lasted.
+    pub fn next_short_lived_streak(previous: u32, lifetime_secs: f64) -> u32 {
+        if lifetime_secs < Self::SHORT_LIVED_CONNECTION_SECS {
+            previous.saturating_add(1)
+        } else {
+            0
+        }
+    }
     pub const INITIAL_CONNECT_TIMEOUT: u64 = 5; // seconds
     
     // TCP socket timeouts (Linux)
@@ -938,6 +963,9 @@ impl TcpClientInterface {
             // We never spawn a second thread.  After a successful reconnect we
             // simply `continue 'running` to re-clone the new socket and start
             // reading again in the same thread.
+            // Consecutive connections the peer closed within
+            // SHORT_LIVED_CONNECTION_SECS; seeds the next backoff.
+            let mut short_lived_streak: u32 = 0;
             'running: loop {
                 // ── Clone current socket and read static config ───────────────
                 let socket_result: Option<(TcpStream, Option<String>, bool, usize, usize, bool, Arc<AtomicBool>)> = {
@@ -991,6 +1019,7 @@ impl TcpClientInterface {
                 let mut ebadf = false;
 
                 crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
+                let connected_at = Instant::now();
 
                 // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §2
                 // Python parity: Transport.start() calls synthesize_tunnel for every
@@ -1242,6 +1271,19 @@ impl TcpClientInterface {
 
                 crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
                 {
+                    let lifetime = connected_at.elapsed().as_secs_f64();
+                    short_lived_streak = Self::next_short_lived_streak(short_lived_streak, lifetime);
+                    if short_lived_streak > 0 {
+                        crate::log(
+                            &format!(
+                                "TCP: connection lived only {:.1}s before the peer closed it ({} in a row) — treating it as a reject, next wait {}s",
+                                lifetime, short_lived_streak, Self::reconnect_wait_secs(short_lived_streak)
+                            ),
+                            crate::LOG_WARNING, false, false,
+                        );
+                    }
+                }
+                {
                     let mut iface = interface.lock().unwrap();
                     iface.base.online = false;
                     if let Some(name) = &iface.base.name {
@@ -1268,13 +1310,13 @@ impl TcpClientInterface {
 
                 // ── Reconnect (initiator only) ────────────────────────────────
                 crate::log("TCP read loop: initiator, attempting reconnect...", crate::LOG_NOTICE, false, false);
-                let mut attempts = 0u32;
+                // Start where the last episode left off when the peer keeps
+                // closing us at once; a connection that lasted resets to 0.
+                let mut attempts = short_lived_streak;
                 let reconnected = 'reconnect: loop {
                     // Exponential backoff: base * 2^attempts, capped at RECONNECT_WAIT_MAX.
                     // attempts==0 on the first iteration → 5 s; 10 s; 20 s; 40 s … 300 s.
-                    let shift = attempts.min(6) as u64;
-                    let wait_secs = (Self::RECONNECT_WAIT_BASE << shift)
-                        .min(Self::RECONNECT_WAIT_MAX);
+                    let wait_secs = Self::reconnect_wait_secs(attempts);
                     // Wait up to `wait_secs`, but wake immediately
                     // if the platform signals that network connectivity is back.
                     wait_or_nudge(wait_secs);
@@ -1813,6 +1855,24 @@ impl std::fmt::Display for TcpServerInterface {
 
 #[cfg(test)]
 mod tests {
+    /// A peer that accepts and immediately resets us must not be dialled
+    /// every 5 s forever: each short-lived connection advances the backoff.
+    #[test]
+    fn short_lived_connections_keep_the_reconnect_backoff_climbing() {
+        use super::TcpClientInterface as T;
+        assert_eq!(T::reconnect_wait_secs(0), 5);
+        assert_eq!(T::reconnect_wait_secs(3), 40);
+        assert_eq!(T::reconnect_wait_secs(6), 300);
+        assert_eq!(T::reconnect_wait_secs(40), 300, "capped");
+        let mut streak = 0;
+        for _ in 0..7 {
+            streak = T::next_short_lived_streak(streak, 0.2);
+        }
+        assert_eq!(streak, 7);
+        assert_eq!(T::reconnect_wait_secs(streak), 300, "seven immediate resets → five-minute wait");
+        assert_eq!(T::next_short_lived_streak(streak, 3600.0), 0, "a connection that lasted resets the streak");
+    }
+
     use super::*;
 
     // RNS/Interfaces/TCPInterface.py:337-340 `check_frame_len`.
