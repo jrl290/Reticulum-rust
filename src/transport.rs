@@ -83,6 +83,11 @@ pub const REVERSE_TIMEOUT: f64 = 8.0 * 60.0;
 /// need `2/T < 3.5`, i.e. `T > 0.571 s`.  We use 600 ms to give a
 /// comfortable margin, achieving a maximum effective rate of ~1.67/s.
 pub const LOCAL_CLIENT_ANNOUNCE_PACE: f64 = 0.60;
+/// Minimum period between AUTOMATIC announces of one destination on one
+/// interface when the destination was published without a refresh interval
+/// (with one, that interval is the period). Announces the application sends
+/// itself are never held; they start the period. See `set_interface_online`.
+pub const AUTO_ANNOUNCE_HOLDOFF_SECS: f64 = 30.0 * 60.0;
 pub const DESTINATION_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 pub const MAX_RECEIPTS: usize = 1024;
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
@@ -506,6 +511,16 @@ pub struct TransportState {
     /// with many published destinations never emits a burst that trips the
     /// upstream peer's announce ingress control.
     pub published_last_announced_at: f64,
+    /// Wall-clock of the last announce of each LOCAL destination that left
+    /// on each interface, whoever triggered it (the application, the refresh
+    /// sweep or an interface up-edge). Automatic announces of that
+    /// destination on that interface are held for the destination's period
+    /// after it. Keyed (destination hash, interface name).
+    pub announce_sent_at: HashMap<(Vec<u8>, String), f64>,
+    /// Interfaces that came online since the refresh sweep last looked at
+    /// them: published destinations get one announce on each, subject to
+    /// the per-interface period, even without a refresh interval.
+    pub up_edge_pending_interfaces: HashSet<String>,
     /// True when `path_table` has been mutated since the last on-disk
     /// persist. Drives the opportunistic save in `jobs()` so that warm
     /// starts find every learned path on disk — not just whatever
@@ -675,8 +690,10 @@ pub type AnnounceCallback = Arc<dyn Fn(&[u8], &Identity, &[u8], Option<Vec<u8>>,
 /// See `Transport::publish_destination` for usage.
 #[derive(Clone, Debug)]
 pub struct PublishedDestination {
-    /// Refresh interval in seconds. `None` = no periodic announce; the
-    /// destination is announced only when the application announces it.
+    /// Refresh interval in seconds, also the minimum period between
+    /// automatic announces per interface. `None` = no periodic refresh;
+    /// the destination is still announced once when an interface comes
+    /// online, no more than once per `AUTO_ANNOUNCE_HOLDOFF_SECS` there.
     pub refresh_interval: Option<f64>,
     /// Wall-clock (seconds since UNIX epoch) of the last announce dispatch.
     /// `0.0` means "never announced yet" — the next jobs() tick will
@@ -1298,10 +1315,19 @@ impl Transport {
     /// Opt a locally-registered IN/SINGLE destination into Transport's
     /// announce daemon.
     ///
-    /// Once published, the destination is announced every
-    /// `refresh_interval` if `Some(...)` is supplied (the first sweep
-    /// announces it immediately). Nothing else announces on its own: as in
-    /// the reference, interface state changes never trigger announces.
+    /// Once published, the destination is announced automatically
+    ///   * on every interface that comes online (one announce per up-edge
+    ///     per interface), and
+    ///   * every `refresh_interval` on every online interface, if
+    ///     `Some(...)` is supplied.
+    /// Both are held to a minimum period per destination AND per interface
+    /// since the last announce of that destination on that interface,
+    /// whoever sent it: `refresh_interval`, or `AUTO_ANNOUNCE_HOLDOFF_SECS`
+    /// without one. A flapping interface therefore costs no more than the
+    /// refresh does, while an interface seen for the first time (roaming)
+    /// is announced on at once. Announces the application sends itself are
+    /// never held; they start the period. (The reference has no automatic
+    /// announces at all; PARITY-AUDIT-1.5.2.md B22.)
     ///
     /// Calling `publish_destination` with the same hash a second time
     /// updates the existing entry (e.g. to change the refresh interval
@@ -1333,6 +1359,18 @@ impl Transport {
     pub fn unpublish_destination(destination_hash: &[u8]) {
         let mut state = TRANSPORT.lock().unwrap();
         state.published_destinations.remove(destination_hash);
+        state.announce_sent_at.retain(|(h, _), _| h.as_slice() != destination_hash);
+    }
+
+    /// Is an automatic announce of `destination_hash` allowed on `iface`
+    /// now? True when nothing announced it there within `period` seconds.
+    fn auto_announce_due_locked(state: &TransportState, destination_hash: &[u8], iface: &str, period: f64, now_ts: f64) -> bool {
+        let last = state
+            .announce_sent_at
+            .get(&(destination_hash.to_vec(), iface.to_string()))
+            .copied()
+            .unwrap_or(0.0);
+        now_ts - last >= period
     }
 
     /// Return a snapshot of currently-published destinations.
@@ -1653,18 +1691,21 @@ impl Transport {
                 iface.online = online;
             }
         }
-        // As in RNS/Transport.py, an interface state change announces
-        // nothing. Destinations are announced only when the application
-        // asks (or on the refresh interval it chose via
-        // `publish_destination`). Until 2026-09-22 this re-announced every
-        // IN/SINGLE destination on each up-transition and, on each
-        // down-transition, via every other interface; public transport
-        // nodes rate-limit announces per destination and blocked the
-        // Android app (24 announces in 40 min over three flapping
-        // backbones) and the fcm bridge (138 in 35 min in a reconnect
-        // loop), so their direct paths vanished. PARITY-AUDIT-1.5.2.md B22.
+        // RNS/Transport.py announces nothing on a state change. Here an
+        // up-edge asks the refresh sweep to run now; the sweep announces each
+        // published destination on this interface at most once per period
+        // (per destination AND per interface, counted from the last announce
+        // of it there, whoever sent it). Until 2026-09-22 every up-edge
+        // re-announced everything unconditionally and every down-edge did so
+        // via all other interfaces: 138 announces from the fcm bridge in a
+        // 35 min reconnect loop, 24 from the Android app in 40 min, both
+        // blocked by the public node's per-destination limiter, so their
+        // direct paths vanished. PARITY-AUDIT-1.5.2.md B22.
         if transitioned_up {
             log(&format!("Interface {} transitioned online", name), LOG_NOTICE, false, false);
+            let mut state = TRANSPORT.lock().unwrap();
+            state.up_edge_pending_interfaces.insert(name.to_string());
+            state.published_last_checked = 0.0;
         }
         if transitioned_down {
             log(&format!("Interface {} transitioned offline", name), LOG_NOTICE, false, false);
@@ -2729,35 +2770,48 @@ impl Transport {
         // While a backlog exists `published_last_checked` is deliberately
         // NOT advanced, so the sweep re-runs on the next 250 ms tick and the
         // whole set drains at ~1 announce per 600 ms instead of 30 s apart.
-        let mut published_announce_packet: Option<(Vec<u8>, Packet)> = None;
+        let mut published_announce_packet: Option<(Vec<u8>, String, Packet)> = None;
         if !state.published_destinations.is_empty()
             && now() > state.published_last_checked + state.published_check_interval
         {
             let now_ts = now();
-            let due: Vec<(Vec<u8>, Option<Vec<u8>>)> = state.published_destinations.iter()
-                .filter_map(|(h, p)| {
-                    let ri = p.refresh_interval?;
-                    if now_ts - p.last_announced_at >= ri {
-                        Some((h.clone(), p.app_data.clone()))
-                    } else { None }
-                })
+            // Every (destination, interface) pair whose period has elapsed on
+            // that interface. Local client interfaces are not announced to
+            // here; they get announces through inbound() dispatch.
+            let online: Vec<String> = state.interfaces.iter()
+                .filter(|i| i.online)
+                .map(|i| i.name.clone())
                 .collect();
+            let mut due: Vec<(Vec<u8>, Option<Vec<u8>>, String)> = Vec::new();
+            for (h, p) in state.published_destinations.iter() {
+                let period = p.refresh_interval.unwrap_or(AUTO_ANNOUNCE_HOLDOFF_SECS);
+                for iface in &online {
+                    let wanted = p.refresh_interval.is_some()
+                        || state.up_edge_pending_interfaces.contains(iface);
+                    if wanted && Self::auto_announce_due_locked(&state, h, iface, period, now_ts) {
+                        due.push((h.clone(), p.app_data.clone(), iface.clone()));
+                    }
+                }
+            }
+            // An up-edge stays pending only while pairs for it remain.
+            state.up_edge_pending_interfaces.retain(|i| due.iter().any(|(_, _, d)| d == i));
             if due.is_empty() {
                 state.published_last_checked = now_ts;
             } else if now_ts - state.published_last_announced_at >= LOCAL_CLIENT_ANNOUNCE_PACE {
                 // Snapshot the matching destinations so we can release the
                 // lock before invoking announce() (see deadlock note above).
-                // Sorted by hash so the drain order is deterministic.
-                let mut candidates: Vec<(Vec<u8>, Option<Vec<u8>>, Destination)> = due.iter()
-                    .filter_map(|(hash, app_data)| {
+                // Sorted by hash then interface so the drain order is
+                // deterministic.
+                let mut candidates: Vec<(Vec<u8>, Option<Vec<u8>>, String, Destination)> = due.iter()
+                    .filter_map(|(hash, app_data, iface)| {
                         state.destinations.iter().find(|d|
                             d.hash == *hash
                             && d.direction == crate::destination::Direction::IN
                             && d.dest_type == crate::destination::DestinationType::Single
-                        ).map(|orig| (hash.clone(), app_data.clone(), orig.clone()))
+                        ).map(|orig| (hash.clone(), app_data.clone(), iface.clone(), orig.clone()))
                     })
                     .collect();
-                candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
                 let selected = if candidates.is_empty() { None } else { Some(candidates.remove(0)) };
                 let missing: Vec<Vec<u8>> = if selected.is_some() {
                     // Real work to do — keep draining. Unregistered hashes are
@@ -2768,7 +2822,10 @@ impl Transport {
                     // Nothing left but unregistered hashes; they must not pin
                     // the sweep to the 250 ms tick forever.
                     state.published_last_checked = now_ts;
-                    due.iter().map(|(hash, _)| hash.clone()).collect()
+                    state.up_edge_pending_interfaces.clear();
+                    let mut m: Vec<Vec<u8>> = due.iter().map(|(hash, _, _)| hash.clone()).collect();
+                    m.dedup();
+                    m
                 };
 
                 // Drop the TRANSPORT lock before calling announce(), which
@@ -2782,10 +2839,10 @@ impl Transport {
                         LOG_DEBUG, false, false,
                     );
                 }
-                if let Some((hash, app_data, mut d)) = selected {
-                    match d.announce(app_data.as_deref(), false, None, None, false) {
+                if let Some((hash, app_data, iface, mut d)) = selected {
+                    match d.announce(app_data.as_deref(), false, Some(iface.clone()), None, false) {
                         Ok(Some(packet)) => {
-                            published_announce_packet = Some((hash, packet));
+                            published_announce_packet = Some((hash, iface, packet));
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -2797,12 +2854,13 @@ impl Transport {
                     }
                 }
 
-                // Re-acquire the lock and optimistically mark
-                // `last_announced_at` so the next sweep doesn't re-emit
-                // before send() completes. Send failures are rare and
-                // self-correct on the next interval.
+                // Re-acquire the lock and optimistically mark the pair as
+                // announced so the next sweep doesn't re-emit before send()
+                // completes. Send failures are rare and self-correct on the
+                // next period.
                 state = TRANSPORT.lock().unwrap();
-                if let Some((hash, _)) = &published_announce_packet {
+                if let Some((hash, iface, _)) = &published_announce_packet {
+                    state.announce_sent_at.insert((hash.clone(), iface.clone()), now_ts);
                     if let Some(entry) = state.published_destinations.get_mut(hash) {
                         entry.last_announced_at = now_ts;
                     }
@@ -3229,14 +3287,14 @@ impl Transport {
         // Send the published-destination refresh announce (also deferred —
         // see the published-destination refresh sweep above for the full
         // re-entrant deadlock rationale). At most one per tick, by design.
-        if let Some((hash, mut packet)) = published_announce_packet {
+        if let Some((hash, iface, mut packet)) = published_announce_packet {
             match packet.send() {
                 Ok(_) => log(
-                    &format!("Published-destination refresh: announced {}", crate::hexrep(&hash, true)),
+                    &format!("Published-destination refresh: announced {} on {}", crate::hexrep(&hash, true), iface),
                     LOG_NOTICE, false, false,
                 ),
                 Err(e) => log(
-                    &format!("Published-destination refresh: announce send failed for {}: {}", crate::hexrep(&hash, true), e),
+                    &format!("Published-destination refresh: announce send failed for {} on {}: {}", crate::hexrep(&hash, true), iface, e),
                     LOG_WARNING, false, false,
                 ),
             }
@@ -3680,6 +3738,18 @@ impl Transport {
             }
             for hash in packet_hashes {
                 state.packet_hashlist.insert(hash);
+            }
+            // Remember when each of OUR destinations was last announced on
+            // each interface, whoever asked for it: the application's own
+            // announce, the refresh sweep or an up-edge. Automatic announces
+            // of the same destination on the same interface are held for the
+            // destination's period after this.
+            if packet.packet_type == ANNOUNCE && packet.hops == 0 {
+                if let Some(dest) = packet.destination_hash.clone() {
+                    for (iface_name, _) in &transmissions {
+                        state.announce_sent_at.insert((dest.clone(), iface_name.clone()), outbound_time);
+                    }
+                }
             }
         }
 
@@ -7813,6 +7883,21 @@ mod tests {
         }
 
         // Publish several destinations that are all immediately due.
+        // Refresh announces are per interface: give the sweep one online
+        // interface to announce on (frames are captured and discarded).
+        let _ifaces_restore = InterfacesRestore::new();
+        let pace_iface = "test-pace-iface";
+        let pace_captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(pace_iface, pace_captured.clone());
+        {
+            let mut stub_config = InterfaceStubConfig::default();
+            stub_config.name = pace_iface.to_string();
+            stub_config.online = Some(true);
+            stub_config.out = true;
+            stub_config.mode = InterfaceStub::MODE_FULL;
+            Transport::register_interface_stub_config(stub_config);
+        }
+
         let mut hashes: Vec<Vec<u8>> = Vec::new();
         for i in 0..4 {
             let destination = Destination::new_inbound(
@@ -7868,6 +7953,7 @@ mod tests {
             let mut state = TRANSPORT.lock().unwrap();
             state.path_table.remove(hash);
         }
+        uninstall_sync_outbound_handler(pace_iface);
 
         assert_eq!(
             after_first, 1,
@@ -8051,68 +8137,117 @@ mod tests {
         OUTBOUND_HANDLERS.lock().unwrap().remove(iface_name);
     }
 
-    /// RNS/Transport.py has no announce of its own: a destination is
-    /// announced only when the application asks. Until 2026-09-22
-    /// `set_interface_online` re-announced every IN/SINGLE destination on
-    /// each up-transition and, on each down-transition, via every other
-    /// interface. Public transport nodes rate-limit announces per
-    /// destination (Transport.py:1782) and block a chatty one: the Android
-    /// app announced 24 times in 40 min over three flapping backbones and
-    /// the fcm bridge, in a TCP reconnect loop, 138 times in 35 min; both
-    /// were blocked at rns.michmesh.net and their direct paths vanished
-    /// (PARITY-AUDIT-1.5.2.md B22).
+    /// The application's announces always go out and start the period;
+    /// automatic ones (up-edge, refresh) are held per destination AND per
+    /// interface for that period, so a flapping link costs nothing extra
+    /// and a new interface (roaming) is announced on at once. Until
+    /// 2026-09-22 every up-edge re-announced everything: 138 announces from
+    /// the fcm bridge in a 35 min reconnect loop, blocked by the public
+    /// node's per-destination limiter (PARITY-AUDIT-1.5.2.md B22).
     #[test]
-    fn interface_transitions_do_not_announce() {
+    fn automatic_announces_are_held_per_destination_per_interface() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
         let _ifaces_restore = InterfacesRestore::new();
 
-        let iface_name = "test-no-announce-on-transition";
+        let iface_a = "test-holdoff-a";
+        let iface_b = "test-holdoff-b";
         {
             let mut state = TRANSPORT.lock().unwrap();
             state.identity = Some(Identity::new(true));
             state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.up_edge_pending_interfaces.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
         }
         let destination = Destination::new_inbound(
             Some(Identity::new(true)),
             DestinationType::Single,
-            "transition_test".to_string(),
+            "holdoff_test".to_string(),
             vec!["parity".to_string()],
         )
         .expect("inbound destination");
         let mut app_copy = destination.clone();
         let dest_hash = destination.hash.clone();
         Transport::register_destination(destination);
-        // Published without a refresh interval: the daemon has nothing to do.
+        // Published without a refresh interval: only up-edges announce it.
         Transport::publish_destination(dest_hash.clone(), None, None);
 
-        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        install_sync_outbound_handler(iface_name, captured.clone());
-        let mut stub_config = InterfaceStubConfig::default();
-        stub_config.name = iface_name.to_string();
-        stub_config.online = Some(false);
-        stub_config.out = true;
-        stub_config.mode = InterfaceStub::MODE_FULL;
-        Transport::register_interface_stub_config(stub_config);
+        let captured_a: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_b: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_a, captured_a.clone());
+        install_sync_outbound_handler(iface_b, captured_b.clone());
+        for name in [iface_a, iface_b] {
+            let mut stub_config = InterfaceStubConfig::default();
+            stub_config.name = name.to_string();
+            stub_config.online = Some(false);
+            stub_config.out = true;
+            stub_config.mode = InterfaceStub::MODE_FULL;
+            Transport::register_interface_stub_config(stub_config);
+        }
+        let sweep = || {
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                state.published_last_announced_at = 0.0; // pacing is not under test
+            }
+            Transport::jobs();
+        };
+        let count = |c: &Arc<Mutex<Vec<Vec<u8>>>>| c.lock().unwrap().len();
 
-        Transport::set_interface_online(iface_name, true);
-        Transport::set_interface_online(iface_name, false);
-        Transport::set_interface_online(iface_name, true);
-        assert!(
-            captured.lock().unwrap().is_empty(),
-            "an interface state change must not announce anything; got {} frame(s)",
-            captured.lock().unwrap().len()
-        );
+        // 1. A comes online: one announce on A, none on B (still offline).
+        Transport::set_interface_online(iface_a, true);
+        sweep();
+        assert_eq!(count(&captured_a), 1, "first up-edge on A announces once");
+        assert_eq!(count(&captured_b), 0, "B is offline");
 
-        // The application's own announce still reaches the (online) interface,
-        // so the empty capture above is not an artefact of the harness.
+        // 2. A flaps: nothing more inside the period.
+        Transport::set_interface_online(iface_a, false);
+        Transport::set_interface_online(iface_a, true);
+        sweep();
+        Transport::set_interface_online(iface_a, false);
+        Transport::set_interface_online(iface_a, true);
+        sweep();
+        assert_eq!(count(&captured_a), 1, "a flapping interface must not re-announce inside the period");
+
+        // 3. B comes online (roaming onto a new interface): announced at once,
+        //    A untouched.
+        Transport::set_interface_online(iface_b, true);
+        sweep();
+        assert_eq!(count(&captured_b), 1, "a new interface is announced on immediately");
+        assert_eq!(count(&captured_a), 1);
+
+        // 4. The application's own announce is never held, and it restarts
+        //    the period: an up-edge right after it stays quiet.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announce_sent_at.insert((dest_hash.clone(), iface_a.to_string()), 0.0);
+        }
         app_copy
-            .announce(None, false, Some(iface_name.to_string()), None, true)
+            .announce(None, false, Some(iface_a.to_string()), None, true)
             .expect("application announce");
-        assert_eq!(captured.lock().unwrap().len(), 1, "the application's announce goes out");
+        assert_eq!(count(&captured_a), 2, "the application's announce goes out");
+        Transport::set_interface_online(iface_a, false);
+        Transport::set_interface_online(iface_a, true);
+        sweep();
+        assert_eq!(count(&captured_a), 2, "an up-edge inside the period after the application's announce is held");
+
+        // 5. Once the period has passed, the next up-edge announces again.
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announce_sent_at.insert((dest_hash.clone(), iface_a.to_string()), 0.0);
+        }
+        Transport::set_interface_online(iface_a, false);
+        Transport::set_interface_online(iface_a, true);
+        sweep();
+        assert_eq!(count(&captured_a), 3, "after the period an up-edge announces once more");
 
         Transport::unpublish_destination(&dest_hash);
-        uninstall_sync_outbound_handler(iface_name);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.up_edge_pending_interfaces.clear();
+        }
+        uninstall_sync_outbound_handler(iface_a);
+        uninstall_sync_outbound_handler(iface_b);
     }
 
     #[test]

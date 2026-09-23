@@ -220,7 +220,8 @@ impl KissInterface {
             }
 
             // Notify Transport of the online transition (initial open and
-            // any later re-open after a reconnect).
+            // any later re-open after a reconnect); published destinations
+            // are announced on it, once per period per interface.
             if let Some(name) = iface_name {
                 RnsTransport::set_interface_online(&name, true);
             }

@@ -312,9 +312,12 @@ pub fn interface_online(name: &str) -> i32 {
 /// announce daemon.
 ///
 /// * `destination_hash`  16-byte truncated RNS hash of the destination.
-/// * `refresh_secs`      Periodic refresh interval in seconds. `0.0` means
-///                       no periodic announce; the destination is then
-///                       announced only when the application announces it.
+/// * `refresh_secs`      Periodic refresh interval in seconds, also the
+///                       minimum period between automatic announces per
+///                       interface. `0.0` means no periodic refresh; the
+///                       destination is still announced once when an
+///                       interface comes online (at most once per 30 min
+///                       there). The application's own announces are never held.
 /// * `app_data`          Optional app_data attached to each announce.
 ///                       Pass `None` to use the destination's configured
 ///                       app_data.

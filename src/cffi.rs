@@ -289,11 +289,13 @@ pub extern "C" fn rns_interface_online(name: *const c_char) -> i32 {
 /// Opt a destination into Transport's auto-announce daemon.
 ///
 /// `dest_hash` / `hash_len` — destination hash (16 bytes typical).
-/// `refresh_secs`           — periodic refresh interval in seconds. Pass
-///                            `0.0` for no periodic refresh; the
-///                            destination is then announced only when the
-///                            application announces it (interface state
-///                            changes never announce, as in the reference).
+/// `refresh_secs`           — periodic refresh interval in seconds, also
+///                            the minimum period between automatic
+///                            announces per interface. Pass `0.0` for no
+///                            periodic refresh: the destination is then
+///                            announced once when an interface comes
+///                            online, at most once per 30 min there. The
+///                            application's own announces are never held.
 /// `app_data` / `app_data_len` — optional app_data; pass `null`/0 to use
 ///                               the destination's configured app_data.
 ///
