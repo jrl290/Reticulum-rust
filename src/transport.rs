@@ -88,6 +88,17 @@ pub const LOCAL_CLIENT_ANNOUNCE_PACE: f64 = 0.60;
 /// (with one, that interval is the period). Announces the application sends
 /// itself are never held; they start the period. See `set_interface_online`.
 pub const AUTO_ANNOUNCE_HOLDOFF_SECS: f64 = 30.0 * 60.0;
+
+/// Minimum spacing between announces of OUR OWN destinations on one
+/// interface. A node with twenty destinations used to announce all of them
+/// in the same second at start and at every refresh; the reference's
+/// ingress control (Interface.py IC_BURST_FREQ_NEW = 3 Hz for a peer
+/// connected under two hours, IC_BURST_HOLD 15 min) then held everything
+/// after the first few, so rfed.link was never learned by the gateway
+/// (2026-09-23). At one announce per 10 s an interface carries 6 a minute:
+/// twenty destinations are out in under four minutes, in the order they
+/// were asked, and nothing is ever dropped.
+pub const OWN_ANNOUNCE_SPACING_SECS: f64 = 10.0;
 pub const DESTINATION_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 pub const MAX_RECEIPTS: usize = 1024;
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
@@ -187,6 +198,11 @@ pub struct InterfaceStub {
     pub announce_cap: f64,
     pub announce_allowed_at: f64,
     pub announce_queue: Vec<AnnounceQueueEntry>,
+    /// Pacing of our own announces on this interface (OWN_ANNOUNCE_SPACING_SECS).
+    pub own_announce_allowed_at: f64,
+    /// Our own announces waiting for the spacing window: (destination, raw),
+    /// in the order they were asked; one entry per destination (newest wins).
+    pub own_announce_queue: VecDeque<(Vec<u8>, Vec<u8>)>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<f64>,
     pub announce_rate_penalty: Option<f64>,
@@ -252,6 +268,43 @@ pub struct AnnounceQueueEntry {
     pub hops: u8,
     pub emitted: u64,
     pub raw: Vec<u8>,
+}
+
+/// What `admit_own_announce` did with an announce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnAnnounce {
+    /// Transmit now.
+    Sent,
+    /// Waiting in the interface's queue; the jobs loop releases it.
+    Queued,
+}
+
+impl InterfaceStub {
+    /// Space our own announces on this interface. The first in a window goes
+    /// out at once; the rest wait, in order, one per OWN_ANNOUNCE_SPACING_SECS.
+    /// A newer announce for a destination already waiting replaces it.
+    pub fn admit_own_announce(&mut self, destination: &[u8], raw: &[u8], now: f64) -> OwnAnnounce {
+        if self.own_announce_queue.is_empty() && now >= self.own_announce_allowed_at {
+            self.own_announce_allowed_at = now + OWN_ANNOUNCE_SPACING_SECS;
+            return OwnAnnounce::Sent;
+        }
+        if let Some(entry) = self.own_announce_queue.iter_mut().find(|(d, _)| d.as_slice() == destination) {
+            entry.1 = raw.to_vec();
+        } else {
+            self.own_announce_queue.push_back((destination.to_vec(), raw.to_vec()));
+        }
+        OwnAnnounce::Queued
+    }
+
+    /// The next of our own announces whose spacing window has opened.
+    pub fn next_own_announce(&mut self, now: f64) -> Option<(Vec<u8>, Vec<u8>)> {
+        if now < self.own_announce_allowed_at {
+            return None;
+        }
+        let next = self.own_announce_queue.pop_front()?;
+        self.own_announce_allowed_at = now + OWN_ANNOUNCE_SPACING_SECS;
+        Some(next)
+    }
 }
 
 impl InterfaceStub {
@@ -1360,6 +1413,41 @@ impl Transport {
         let mut state = TRANSPORT.lock().unwrap();
         state.published_destinations.remove(destination_hash);
         state.announce_sent_at.retain(|(h, _), _| h.as_slice() != destination_hash);
+    }
+
+    /// Release and dispatch our own paced announces whose window has opened
+    /// (what the jobs loop does each pass); `now_ts` lets a test open windows.
+    pub fn release_own_announces_now(now_ts: f64) {
+        let released = {
+            let mut state = TRANSPORT.lock().unwrap();
+            Self::release_own_announces_locked(&mut state, now_ts)
+        };
+        for (name, raw) in released {
+            Transport::dispatch_outbound(&name, &raw);
+        }
+    }
+
+    /// Pop every own announce whose spacing window has opened and return
+    /// (interface, raw) to dispatch; records the send for the B22 period.
+    fn release_own_announces_locked(state: &mut TransportState, now_ts: f64) -> Vec<(String, Vec<u8>)> {
+        let mut released: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut sent: Vec<(Vec<u8>, String)> = Vec::new();
+        for iface in state.interfaces.iter_mut() {
+            if !iface.online {
+                continue;
+            }
+            if let Some((dest, raw)) = iface.next_own_announce(now_ts) {
+                crate::log(&format!("[ANNOUNCE-PACE] released own announce dest={} iface={} left={}",
+                    crate::hexrep(&dest, false), iface.name, iface.own_announce_queue.len()),
+                    crate::LOG_DEBUG, false, false);
+                sent.push((dest, iface.name.clone()));
+                released.push((iface.name.clone(), raw));
+            }
+        }
+        for (dest, name) in sent {
+            state.announce_sent_at.insert((dest, name), now_ts);
+        }
+        released
     }
 
     /// Is an automatic announce of `destination_hash` allowed on `iface`
@@ -2738,6 +2826,20 @@ impl Transport {
             }
         }
 
+        // Release our own paced announces whose window has opened, one per
+        // interface per pass (the window reopens OWN_ANNOUNCE_SPACING_SECS later).
+        {
+            let now_ts = now();
+            let released = Self::release_own_announces_locked(&mut state, now_ts);
+            if !released.is_empty() {
+                drop(state);
+                for (name, raw) in released {
+                    Transport::dispatch_outbound(&name, &raw);
+                }
+                state = TRANSPORT.lock().unwrap();
+            }
+        }
+
         // Published-destination refresh sweep.
         //
         // For every destination opted in via `publish_destination` with a
@@ -3404,6 +3506,9 @@ impl Transport {
         let mut state = TRANSPORT.lock().unwrap();
         let mut sent = false;
         let mut transmissions: Vec<(String, Vec<u8>)> = Vec::new();
+        // Interfaces on which this (own) announce was queued rather than sent;
+        // the period starts now either way, so the sweep does not ask again.
+        let mut queued_own_announces: Vec<String> = Vec::new();
         let outbound_time = now();
 
         let destination_hash = packet.destination_hash.clone().or_else(|| packet.destination.as_ref().map(|d| d.hash.clone()));
@@ -3755,6 +3860,26 @@ impl Transport {
                         }
                     }
 
+                    // Our own announces (hops == 0) are never dropped, but they
+                    // are spaced per interface so a node with many destinations
+                    // does not burst and trip the peers' ingress control. A
+                    // PATH_RESPONSE answers a request and is not spaced.
+                    if should_transmit
+                        && packet.packet_type == ANNOUNCE
+                        && packet.hops == 0
+                        && packet.context != crate::packet::PATH_RESPONSE
+                    {
+                        if let Some(ref dest) = packet.destination_hash {
+                            if interface.admit_own_announce(dest, &packet.raw, outbound_time) == OwnAnnounce::Queued {
+                                queued_own_announces.push(interface.name.clone());
+                                crate::log(&format!("[ANNOUNCE-PACE] queued own announce dest={} iface={} ahead={}",
+                                    crate::hexrep(dest, false), interface.name, interface.own_announce_queue.len() - 1),
+                                    crate::LOG_DEBUG, false, false);
+                                should_transmit = false;
+                            }
+                        }
+                    }
+
                     if should_transmit {
                         crate::log(&format!("[OUTBOUND-BCAST] ptype={} iface={} raw_len={}",
                             packet.packet_type, interface.name, packet.raw.len()),
@@ -3791,6 +3916,9 @@ impl Transport {
             {
                 if let Some(dest) = packet.destination_hash.clone() {
                     for (iface_name, _) in &transmissions {
+                        state.announce_sent_at.insert((dest.clone(), iface_name.clone()), outbound_time);
+                    }
+                    for iface_name in &queued_own_announces {
                         state.announce_sent_at.insert((dest.clone(), iface_name.clone()), outbound_time);
                     }
                 }
@@ -8223,6 +8351,71 @@ mod tests {
         assert!(Transport::select_path(&table, &interfaces, &dest, now_ts).is_none(), "only a vanished route: no path, so a path request goes out instead of a drop");
     }
 
+    /// Our own announces on one interface are spaced OWN_ANNOUNCE_SPACING_SECS
+    /// apart, kept in order, deduplicated per destination, never dropped.
+    #[test]
+    fn own_announces_are_paced_per_interface_and_never_dropped() {
+        let mut iface = InterfaceStub { name: "pace".to_string(), online: true, ..InterfaceStub::default() };
+        let t0 = 1_000_000.0;
+        assert_eq!(iface.admit_own_announce(&[1; 16], b"a1", t0), OwnAnnounce::Sent, "first goes out at once");
+        assert_eq!(iface.admit_own_announce(&[2; 16], b"b1", t0 + 0.1), OwnAnnounce::Queued, "second within the window waits");
+        assert_eq!(iface.admit_own_announce(&[3; 16], b"c1", t0 + 0.2), OwnAnnounce::Queued);
+        assert_eq!(iface.admit_own_announce(&[2; 16], b"b2", t0 + 0.3), OwnAnnounce::Queued, "a newer copy replaces the waiting one");
+        assert_eq!(iface.own_announce_queue.len(), 2, "one entry per destination");
+        assert!(iface.next_own_announce(t0 + OWN_ANNOUNCE_SPACING_SECS - 1.0).is_none(), "window still closed");
+        let (d, raw) = iface.next_own_announce(t0 + OWN_ANNOUNCE_SPACING_SECS).expect("window open");
+        assert_eq!((d, raw), (vec![2u8; 16], b"b2".to_vec()), "in order, newest bytes");
+        assert!(iface.next_own_announce(t0 + OWN_ANNOUNCE_SPACING_SECS + 1.0).is_none(), "one per window");
+        let (d, _) = iface.next_own_announce(t0 + 2.0 * OWN_ANNOUNCE_SPACING_SECS).expect("next window");
+        assert_eq!(d, vec![3u8; 16]);
+        assert!(iface.own_announce_queue.is_empty());
+    }
+
+    /// Through the transport: two own announces in the same second leave one
+    /// interface one at a time, the second when the jobs release runs after
+    /// the spacing, and both are recorded for the B22 period.
+    #[test]
+    fn transport_paces_own_announces_and_records_both() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let iface = "test-pace";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announce_sent_at.clear();
+        }
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let c = Arc::clone(&captured);
+            Transport::register_outbound_handler(iface, Arc::new(move |raw: &[u8]| { c.lock().unwrap().push(raw.to_vec()); true }));
+            let mut stub_config = InterfaceStubConfig::default();
+            stub_config.name = iface.to_string();
+            stub_config.online = Some(true);
+            stub_config.out = true;
+            stub_config.mode = InterfaceStub::MODE_FULL;
+            Transport::register_interface_stub_config(stub_config);
+        }
+        let mut d1 = Destination::new_inbound(Some(Identity::new(true)), DestinationType::Single, "pace".to_string(), vec!["one".to_string()]).expect("dest");
+        let mut d2 = Destination::new_inbound(Some(Identity::new(true)), DestinationType::Single, "pace".to_string(), vec!["two".to_string()]).expect("dest");
+        Transport::register_destination(d1.clone());
+        Transport::register_destination(d2.clone());
+        d1.announce(None, false, Some(iface.to_string()), None, true).expect("announce one");
+        d2.announce(None, false, Some(iface.to_string()), None, true).expect("announce two");
+        assert_eq!(captured.lock().unwrap().len(), 1, "the second announce waits for the window");
+        {
+            let state = TRANSPORT.lock().unwrap();
+            assert!(state.announce_sent_at.contains_key(&(d1.hash.clone(), iface.to_string())));
+            assert!(state.announce_sent_at.contains_key(&(d2.hash.clone(), iface.to_string())), "a queued announce starts its period too");
+        }
+        Transport::release_own_announces_now(now() + OWN_ANNOUNCE_SPACING_SECS + 1.0);
+        // Dispatch goes through the interface's writer thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while captured.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(captured.lock().unwrap().len(), 2, "the release sends it");
+    }
+
     #[test]
     fn automatic_announces_are_held_per_destination_per_interface() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -8301,6 +8494,12 @@ mod tests {
             let mut state = TRANSPORT.lock().unwrap();
             state.announce_sent_at.insert((dest_hash.clone(), iface_a.to_string()), 0.0);
         }
+        {
+            // The pacer would space this behind the sweep's announce; open the
+            // window so the period semantics under test stay observable.
+            let mut state = TRANSPORT.lock().unwrap();
+            if let Some(i) = state.interfaces.iter_mut().find(|i| i.name == iface_a) { i.own_announce_allowed_at = 0.0; }
+        }
         app_copy
             .announce(None, false, Some(iface_a.to_string()), None, true)
             .expect("application announce");
@@ -8314,6 +8513,8 @@ mod tests {
         {
             let mut state = TRANSPORT.lock().unwrap();
             state.announce_sent_at.insert((dest_hash.clone(), iface_a.to_string()), 0.0);
+            // Open the pacing window again: the period, not the spacing, is under test.
+            if let Some(i) = state.interfaces.iter_mut().find(|i| i.name == iface_a) { i.own_announce_allowed_at = 0.0; }
         }
         Transport::set_interface_online(iface_a, false);
         Transport::set_interface_online(iface_a, true);
