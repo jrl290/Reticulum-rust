@@ -729,10 +729,14 @@ pub fn receipt_get_hash(receipt_handle: u64) -> Option<Vec<u8>> {
     Some(receipt.hash.clone())
 }
 
-/// Set delivery and timeout callbacks on a receipt.
+/// Set delivery and timeout callbacks on the tracked receipt with this hash.
 ///
-/// The callbacks receive (rtt_seconds,) and () respectively.
-/// They are called from the Transport job thread.
+/// The delivery callback runs on the thread that received the proof, the
+/// timeout callback on a thread of its own. A receipt that already concluded
+/// is no longer tracked (RNS/Transport.py drops concluded receipts), so a
+/// callback registered here after its proof or timeout does not run; a
+/// caller that holds the receipt should set callbacks on it instead
+/// (`PacketReceipt::set_delivery_callback` runs a late registration once).
 pub fn receipt_set_callbacks(
     receipt_hash: &[u8],
     delivery_cb: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>,

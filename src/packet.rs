@@ -582,6 +582,11 @@ struct PacketReceiptInner {
     timeout: f64,
     delivery_callback: Option<ReceiptCallback>,
     timeout_callback: Option<ReceiptCallback>,
+    /// A callback has been run for this receipt's conclusion. A callback
+    /// registered after the receipt concluded runs once, at registration —
+    /// see `set_delivery_callback`.
+    delivery_notified: bool,
+    timeout_notified: bool,
 }
 
 #[derive(Clone)]
@@ -620,22 +625,28 @@ impl PacketReceipt {
     pub const EXPL_LENGTH: usize = HASHLENGTH / 8 + SIGLENGTH / 8;
     pub const IMPL_LENGTH: usize = SIGLENGTH / 8;
 
+    /// The receipt timeout of a packet sent over a link.
+    ///
+    /// RNS/Packet.py:428 (1.5.2): `max(rtt * traffic_timeout_factor,
+    /// RNS.Link.TRAFFIC_TIMEOUT_MIN_MS/1000)`. Both copies of this formula
+    /// (here and `Transport::outbound`) had the `max` on the factor instead
+    /// of the product — `rtt * max(factor, 0.005)` — so a link with no RTT
+    /// yet, or a sub-millisecond one, gave its packets a receipt that timed
+    /// out on the next jobs pass, before any proof could arrive.
+    pub fn link_timeout(link: Option<&crate::destination::LinkInfo>) -> f64 {
+        let rtt = link.and_then(|l| l.rtt).unwrap_or(0.0);
+        let factor = link
+            .map(|l| l.traffic_timeout_factor)
+            .unwrap_or(crate::link::TRAFFIC_TIMEOUT_FACTOR);
+        (rtt * factor).max(crate::link::TRAFFIC_TIMEOUT_MIN_MS / 1000.0)
+    }
+
     pub fn new(packet: &Packet) -> Self {
         let _hash = packet.get_hash();
         let _truncated = packet.get_truncated_hash();
         let destination = packet.destination.clone().unwrap_or_default();
         let timeout = if destination.dest_type == DestinationType::Link {
-            destination
-                .link
-                .as_ref()
-                .and_then(|l| l.rtt)
-                .unwrap_or(0.0)
-                * destination
-                    .link
-                    .as_ref()
-                    .map(|l| l.traffic_timeout_factor)
-                    .unwrap_or(1.0)
-                .max(0.005)
+            Self::link_timeout(destination.link.as_ref())
         } else {
             reticulum::DEFAULT_PER_HOP_TIMEOUT
                 + TIMEOUT_PER_HOP * Transport::hops_to(packet.destination_hash.as_ref().unwrap_or(&vec![])) as f64
@@ -672,6 +683,8 @@ impl PacketReceipt {
                 timeout,
                 delivery_callback: None,
                 timeout_callback: None,
+                delivery_notified: false,
+                timeout_notified: false,
             })),
         }
     }
@@ -702,20 +715,33 @@ impl PacketReceipt {
     pub fn set_status(&self, status: u8) { self.lock().status = status; }
     pub fn set_concluded_at(&self, concluded_at: Option<f64>) { self.lock().concluded_at = concluded_at; }
 
-    /// Mark the receipt delivered and run the delivery callback.
+    /// Mark the receipt delivered and run the delivery callback. Returns
+    /// whether this call delivered it.
+    ///
+    /// Only a SENT receipt can become DELIVERED. RNS/Transport.py:2758
+    /// (1.5.2) skips every receipt whose status is not SENT, and a concluded
+    /// receipt has left `Transport.receipts` by the next jobs pass. The check
+    /// sits here, under the lock `check_timeout` concludes under, so a proof
+    /// that arrives after the timeout fired (or races it on another thread)
+    /// can never also deliver the receipt: one outcome, one callback.
     ///
     /// The inner lock is released before the callback runs: the callback is
     /// handed `&PacketReceipt` and will typically call `get_status()` on it,
     /// which would deadlock against a still-held guard.
-    fn mark_delivered(&self) {
+    fn mark_delivered(&self) -> bool {
         let callback = {
             let mut inner = self.lock();
+            if inner.status != PacketReceipt::SENT {
+                return false;
+            }
             inner.status = PacketReceipt::DELIVERED;
             inner.proved = true;
             inner.concluded_at = Some(now_seconds());
+            inner.delivery_notified = inner.delivery_callback.is_some();
             inner.delivery_callback.clone()
         };
         self.fire_delivery_callback(callback);
+        true
     }
 
     pub fn validate_proof(&mut self, proof: &[u8]) -> bool {
@@ -727,8 +753,7 @@ impl PacketReceipt {
                 if let Some(identity) = &self.destination.identity {
                     let valid = Self::validate_with_identity_variants(identity, signature, &self.hash);
                     if valid {
-                        self.mark_delivered();
-                        return true;
+                        return self.mark_delivered();
                     }
                 }
             }
@@ -737,8 +762,7 @@ impl PacketReceipt {
             if let Some(identity) = &self.destination.identity {
                 let valid = Self::validate_with_identity_variants(identity, proof, &self.hash);
                 if valid {
-                    self.mark_delivered();
-                    return true;
+                    return self.mark_delivered();
                 }
             }
             false
@@ -779,19 +803,30 @@ impl PacketReceipt {
 
     /// Validate a proof over a link (Python: validate_link_proof)
     pub fn validate_link_proof(&mut self, proof: &[u8], link: &crate::link::Link) -> bool {
+        self.validate_link_proof_with(proof, |signature, hash| {
+            link.validate(signature, hash).unwrap_or(false)
+        })
+    }
+
+    /// RNS/Packet.py validate_link_proof, with `link.validate(signature,
+    /// self.hash)` supplied by the caller. Transport validates a link PROOF
+    /// from its inbound thread, where the link's peer key is only reachable
+    /// as a round trip to the link's actor; everything else — the hash
+    /// match, concluding the receipt, the delivery callback — happens on the
+    /// caller's thread, as it does in the reference (Transport.inbound runs
+    /// the callback). `validate` is only called once the hash matches.
+    pub fn validate_link_proof_with<F>(&mut self, proof: &[u8], validate: F) -> bool
+    where
+        F: FnOnce(&[u8], &[u8]) -> bool,
+    {
         // Hardcoded as explicit proofs for now (matches Python TODO comment)
         if proof.len() == Self::EXPL_LENGTH {
             let hash_len = HASHLENGTH / 8;
             let proof_hash = &proof[..hash_len];
             let signature = &proof[hash_len..hash_len + SIGLENGTH / 8];
-            if proof_hash == self.hash.as_slice() {
-                // In full implementation: link.validate(signature, &self.hash)
-                // For now, use basic validation
-                if link.validate(signature, &self.hash).unwrap_or(false) {
-                    // link.last_proof = self.concluded_at
-                    self.mark_delivered();
-                    return true;
-                }
+            if proof_hash == self.hash.as_slice() && validate(signature, &self.hash) {
+                // link.last_proof = self.concluded_at
+                return self.mark_delivered();
             }
             false
         } else if proof.len() == Self::IMPL_LENGTH {
@@ -825,6 +860,7 @@ impl PacketReceipt {
                 inner.status = PacketReceipt::FAILED;
             }
             inner.concluded_at = Some(now_seconds());
+            inner.timeout_notified = inner.timeout_callback.is_some();
             inner.timeout_callback.clone()
         };
 
@@ -852,8 +888,32 @@ impl PacketReceipt {
     /// Takes `&self`: the receipt a caller got back from `Packet::send` is
     /// the tracked receipt, so setting the callback on it is what makes it
     /// fire. Callers holding a `mut` binding are unaffected.
+    ///
+    /// A receipt that was already delivered, with no callback there to see
+    /// it, runs this one once, now. Transport forgets a receipt the moment a
+    /// proof concludes it (RNS/Transport.py:2761), and that can happen
+    /// between `send()` returning and this call. The reference has the same
+    /// window and loses the callback; the `Transport::set_receipt_*_callback`
+    /// shim used to catch it by finding the concluded receipt still listed,
+    /// which it no longer is. The late run is on its own thread: callers
+    /// register while holding their own locks (LXMF holds the message lock),
+    /// and the callback takes them.
     pub fn set_delivery_callback(&self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
-        self.lock().delivery_callback = Some(callback);
+        let late = {
+            let mut inner = self.lock();
+            inner.delivery_callback = Some(callback.clone());
+            let late = inner.status == PacketReceipt::DELIVERED && !inner.delivery_notified;
+            if late {
+                inner.delivery_notified = true;
+            }
+            late
+        };
+        if late {
+            // Not through fire_delivery_callback: the §1 assertion already
+            // ran when the proof concluded the receipt.
+            let receipt = self.clone();
+            std::thread::spawn(move || callback(&receipt));
+        }
     }
 
     /// Single, asserting entry-point for delivery-callback invocation.
@@ -872,9 +932,25 @@ impl PacketReceipt {
         }
     }
 
-    /// Set a function that gets called if delivery times out
+    /// Set a function that gets called if delivery times out.
+    ///
+    /// Like `set_delivery_callback`: a receipt that already timed out or was
+    /// culled, with no callback there to see it, runs this one once, now.
     pub fn set_timeout_callback(&self, callback: Arc<dyn Fn(&PacketReceipt) + Send + Sync>) {
-        self.lock().timeout_callback = Some(callback);
+        let late = {
+            let mut inner = self.lock();
+            inner.timeout_callback = Some(callback.clone());
+            let concluded = inner.status == PacketReceipt::FAILED || inner.status == PacketReceipt::CULLED;
+            let late = concluded && !inner.timeout_notified;
+            if late {
+                inner.timeout_notified = true;
+            }
+            late
+        };
+        if late {
+            let receipt = self.clone();
+            std::thread::spawn(move || callback(&receipt));
+        }
     }
 
     /// Set the timeout in seconds
@@ -1033,5 +1109,125 @@ mod tests {
         assert!(!receipt.validate_proof(&invalid_proof));
         assert_eq!(receipt.status(), PacketReceipt::SENT);
         assert!(!receipt.proved());
+    }
+
+    fn explicit_proof(identity: &Identity, receipt: &PacketReceipt) -> Vec<u8> {
+        let mut proof = receipt.hash.clone();
+        proof.extend_from_slice(&identity.sign(&receipt.hash));
+        proof
+    }
+
+    fn reporting_callback() -> (ReceiptCallback, std::sync::mpsc::Receiver<u8>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        (Arc::new(move |receipt: &PacketReceipt| { let _ = tx.lock().unwrap().send(receipt.status()); }), rx)
+    }
+
+    // Only a SENT receipt can become DELIVERED (RNS/Transport.py:2758). A
+    // proof that arrives after the timeout fired used to deliver the FAILED
+    // receipt as well, running both callbacks for one packet.
+    #[test]
+    fn a_proof_after_the_timeout_does_not_deliver_the_receipt() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone()); // sent at 0, timeout 1 s: long expired
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_clone = delivered.clone();
+        receipt.set_delivery_callback(Arc::new(move |_| { delivered_clone.fetch_add(1, Ordering::SeqCst); }));
+        let (timeout_cb, timed_out) = reporting_callback();
+        receipt.set_timeout_callback(timeout_cb);
+
+        receipt.check_timeout();
+        assert_eq!(timed_out.recv_timeout(Duration::from_secs(5)).expect("timeout callback"), PacketReceipt::FAILED);
+
+        assert!(!receipt.validate_proof(&explicit_proof(&identity, &receipt)), "a late proof validates nothing");
+        assert_eq!(receipt.status(), PacketReceipt::FAILED);
+        assert!(!receipt.proved());
+        assert_eq!(delivered.load(Ordering::SeqCst), 0, "the delivery callback never runs for a timed-out receipt");
+    }
+
+    // A second copy of the proof (it can arrive over two interfaces) does
+    // not deliver the receipt twice.
+    #[test]
+    fn a_second_proof_does_not_deliver_the_receipt_again() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_clone = delivered.clone();
+        receipt.set_delivery_callback(Arc::new(move |_| { delivered_clone.fetch_add(1, Ordering::SeqCst); }));
+        let proof = explicit_proof(&identity, &receipt);
+
+        assert!(receipt.validate_proof(&proof));
+        assert!(!receipt.validate_proof(&proof), "the second copy concludes nothing");
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    }
+
+    // Transport forgets a receipt the moment a proof concludes it, which can
+    // be before the sender registers its callback on the receipt `send()`
+    // returned. That callback still runs, once.
+    #[test]
+    fn a_delivery_callback_registered_after_the_proof_runs_once() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        assert!(receipt.validate_proof(&explicit_proof(&identity, &receipt)));
+
+        let (callback, delivered) = reporting_callback();
+        receipt.set_delivery_callback(callback.clone());
+        assert_eq!(delivered.recv_timeout(Duration::from_secs(5)).expect("late delivery callback"), PacketReceipt::DELIVERED);
+
+        receipt.set_delivery_callback(callback);
+        assert!(delivered.recv_timeout(Duration::from_millis(200)).is_err(), "a delivery is reported once");
+    }
+
+    #[test]
+    fn a_delivery_callback_registered_again_after_it_ran_does_not_run_twice() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        let (callback, delivered) = reporting_callback();
+        receipt.set_delivery_callback(callback.clone());
+        assert!(receipt.validate_proof(&explicit_proof(&identity, &receipt)));
+        assert_eq!(delivered.recv_timeout(Duration::from_secs(5)).expect("delivery callback"), PacketReceipt::DELIVERED);
+
+        // The Transport shim registers the same callback a second time.
+        receipt.set_delivery_callback(callback);
+        assert!(delivered.recv_timeout(Duration::from_millis(200)).is_err(), "a delivery is reported once");
+    }
+
+    #[test]
+    fn a_timeout_callback_registered_after_the_timeout_runs_once() {
+        let mut receipt = make_receipt(Identity::new(true));
+        receipt.check_timeout();
+        assert_eq!(receipt.status(), PacketReceipt::FAILED);
+
+        let (callback, timed_out) = reporting_callback();
+        receipt.set_timeout_callback(callback.clone());
+        assert_eq!(timed_out.recv_timeout(Duration::from_secs(5)).expect("late timeout callback"), PacketReceipt::FAILED);
+
+        receipt.set_timeout_callback(callback);
+        assert!(timed_out.recv_timeout(Duration::from_millis(200)).is_err(), "a timeout is reported once");
+    }
+
+    // RNS/Packet.py:428: max(rtt * traffic_timeout_factor,
+    // Link.TRAFFIC_TIMEOUT_MIN_MS/1000). The Rust formula applied the floor
+    // to the factor, so a link with no RTT yet had a zero timeout.
+    #[test]
+    fn link_receipt_timeout_is_rtt_times_factor_with_the_reference_floor() {
+        let timeout_for = |rtt: Option<f64>| {
+            let destination = Destination {
+                hash: vec![0xE8; DST_LEN],
+                dest_type: DestinationType::Link,
+                link: Some(crate::destination::LinkInfo {
+                    rtt,
+                    traffic_timeout_factor: crate::link::TRAFFIC_TIMEOUT_FACTOR,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let packet = Packet::new(Some(destination), vec![1], DATA, NONE, 0, HEADER_1, None, None, true, 0);
+            PacketReceipt::new(&packet).timeout()
+        };
+        let floor = crate::link::TRAFFIC_TIMEOUT_MIN_MS / 1000.0;
+        assert_eq!(timeout_for(None), floor, "no RTT yet: the floor, not zero");
+        assert_eq!(timeout_for(Some(0.0001)), floor, "0.6 ms is under the 5 ms floor");
+        assert!((timeout_for(Some(0.1)) - 0.1 * crate::link::TRAFFIC_TIMEOUT_FACTOR).abs() < 1e-12, "above the floor: rtt x factor");
     }
 }

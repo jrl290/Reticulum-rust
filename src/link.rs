@@ -169,6 +169,7 @@ enum LinkMsg {
         reply: Reply<Result<Vec<u8>, LinkGone>>,
     },
     SendPacket(Vec<u8>, Reply<Result<(), LinkGone>>),
+    SendPacketWithReceipt(Vec<u8>, Reply<Result<Option<crate::packet::PacketReceipt>, LinkGone>>),
     Identify(Identity, Reply<Result<(), LinkGone>>),
     Initiate(Reply<Result<(), LinkGone>>),
 
@@ -205,10 +206,14 @@ enum LinkMsg {
 
     // --- Internal (used by dispatch_runtime_packet) ---
     Receive(Packet, Reply<ReceiveResult>),
-    ValidateProof {
-        proof: Vec<u8>,
-        receipt: crate::packet::PacketReceipt,
-        reply: Reply<(bool, crate::packet::PacketReceipt)>,
+    /// RNS/Link.py validate(): a signature check against the peer's signing
+    /// key, which only the actor holds. Transport uses it to validate a link
+    /// PROOF for a receipt; the receipt is concluded, and its delivery
+    /// callback run, on Transport's thread, not here.
+    ValidateSignature {
+        signature: Vec<u8>,
+        data: Vec<u8>,
+        reply: Reply<bool>,
     },
     /// Fire-and-forget: send a request response (msgpack-encoded `response`
     /// bytes paired with `request_id`) back to the remote peer.
@@ -432,6 +437,15 @@ impl LinkHandle {
         rx.recv().map_err(|_| LinkGone)?
     }
 
+    /// Send a raw DATA packet on this link with a PacketReceipt
+    /// ([`Link::send_packet_with_receipt`]). `Err(LinkGone)`: the link is
+    /// gone or not ACTIVE. `Ok(None)`: no interface transmitted it.
+    pub fn send_packet_with_receipt(&self, data: &[u8]) -> Result<Option<crate::packet::PacketReceipt>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::SendPacketWithReceipt(data.to_vec(), tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
     /// Tear down this link.
     #[track_caller]
     pub fn teardown(&self) {
@@ -642,13 +656,11 @@ impl LinkHandle {
         rx.recv().ok()
     }
 
-    fn validate_proof(
-        &self,
-        proof: Vec<u8>,
-        receipt: crate::packet::PacketReceipt,
-    ) -> Option<(bool, crate::packet::PacketReceipt)> {
+    fn validate_signature(&self, signature: &[u8], data: &[u8]) -> Option<bool> {
         let (tx, rx) = oneshot();
-        self.tx.send(LinkMsg::ValidateProof { proof, receipt, reply: tx }).ok()?;
+        self.tx
+            .send(LinkMsg::ValidateSignature { signature: signature.to_vec(), data: data.to_vec(), reply: tx })
+            .ok()?;
         rx.recv().ok()
     }
 }
@@ -956,6 +968,10 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
             let result = link.send_packet(&data).map_err(|_| LinkGone);
             let _ = reply.send(result);
         }
+        LinkMsg::SendPacketWithReceipt(data, reply) => {
+            let result = link.send_packet_with_receipt(&data).map_err(|_| LinkGone);
+            let _ = reply.send(result);
+        }
         LinkMsg::Identify(identity, reply) => {
             let result = link.identify(&identity).map_err(|_| LinkGone);
             let _ = reply.send(result);
@@ -1144,9 +1160,8 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
 
             let _ = reply.send(ReceiveResult { handled });
         }
-        LinkMsg::ValidateProof { proof, mut receipt, reply } => {
-            let valid = receipt.validate_link_proof(&proof, &link);
-            let _ = reply.send((valid, receipt));
+        LinkMsg::ValidateSignature { signature, data, reply } => {
+            let _ = reply.send(link.validate(&signature, &data).unwrap_or(false));
         }
 
         // Fire-and-forget: send a request response assembled by the
@@ -1436,20 +1451,22 @@ pub fn validate_runtime_proof_for_receipt(
         }
     };
 
-    // Clone receipt, send to actor for validation, write back the mutated copy
-    let receipt_clone = receipt.clone();
-    match handle.validate_proof(proof.to_vec(), receipt_clone) {
-        Some((valid, updated_receipt)) => {
-            if valid {
-                *receipt = updated_receipt;
+    // Only the signature check goes to the actor, and only once the proof's
+    // hash matches this receipt. The whole validation used to run there, so
+    // the application's delivery callback ran on the actor thread while
+    // Transport held its lock waiting for the reply: a callback that used
+    // this link, or took the TRANSPORT lock, deadlocked both. The receipt
+    // shares its state with Transport's copy, so concluding it here is
+    // concluding the tracked one.
+    receipt.validate_link_proof_with(proof, |signature, hash| {
+        match handle.validate_signature(signature, hash) {
+            Some(valid) => valid,
+            None => {
+                crate::log("validate_runtime_proof: actor dead", crate::LOG_ERROR, false, false);
+                false
             }
-            valid
         }
-        None => {
-            crate::log("validate_runtime_proof: actor dead", crate::LOG_ERROR, false, false);
-            false
-        }
-    }
+    })
 }
 
 pub fn runtime_decrypt_for_destination(destination_hash: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
@@ -3059,6 +3076,22 @@ impl Link {
 
     /// Handle link closure cleanup
     fn link_closed(&mut self) {
+        // A request still pending when the link closes fails now, exactly
+        // once. In the reference its timeout does not die with the link: it
+        // rides on the request packet's receipt in Transport (RNS/Link.py:499,
+        // :1333), or on the response-timeout thread of a request sent as a
+        // Resource (:1373-1376), and `request_timed_out` (:1397) fails it
+        // after the close just as before it. Here the timeout is checked by
+        // this link's actor (`actor_check_request_timeouts`), and the actor
+        // exits as soon as the link is CLOSED, so the failed callback never
+        // ran and the caller waited forever. The close is the failure event.
+        // Drained under the lock before the resources are cancelled below, so
+        // a response Resource's cancellation finds nothing left to fail, and
+        // a second pass through here fails nothing.
+        let pending_requests: Vec<PendingRequest> = match self.pending_requests.lock() {
+            Ok(mut pending) => pending.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
         // RNS/Link.py link_closed(): every in-flight resource is cancelled,
         // which concludes it (status FAILED) through its own callback. The
         // cancellations run off the actor thread: `Resource::cancel` asks
@@ -3085,7 +3118,22 @@ impl Link {
         if let Ok(mut token) = self.token.lock() {
             *token = None;
         }
-        
+
+        if !pending_requests.is_empty() {
+            let closed_link = Arc::new(Mutex::new(self.clone()));
+            for request in pending_requests {
+                crate::log(
+                    &format!(
+                        "[REQ] request {} failed: link {} closed before it concluded",
+                        crate::hexrep(&request.request_id, false),
+                        crate::hexrep(&self.link_id, false),
+                    ),
+                    crate::LOG_NOTICE, false, false,
+                );
+                request.fail(Arc::clone(&closed_link));
+            }
+        }
+
         if let Some(callback) = &self.callbacks.link_closed {
             // Use the actor's own handle, or try the registry.
             let handle = self.self_handle.clone()
@@ -4744,6 +4792,28 @@ impl Link {
     /// packet to avoid calling `Transport::outbound` while holding the link mutex
     /// (same pattern as [`request`]).
     pub fn send_packet(&self, data: &[u8]) -> Result<(), String> {
+        let mut packet = self.hand_packed_data_packet(data, false)?;
+        packet.send().map(|_| ()).map_err(|e| format!("send_packet failed: {e}"))
+    }
+
+    /// [`send_packet`] with a PacketReceipt, for a sender that must know
+    /// whether the peer got the packet: `Ok(Some(receipt))` when it went out
+    /// (the peer's link proof delivers the receipt; its RTT-scaled timeout
+    /// fails it), `Ok(None)` when no interface transmitted it.
+    ///
+    /// Packed by hand like `send_packet`, so it keeps that path's reach: a
+    /// payload over the link MDU still goes out as one packet (a normal
+    /// `Packet::pack` refuses it). rfed's legacy stream pushes relied on that;
+    /// they moved to receipts on 2026-09-24 and briefly lost every push over
+    /// 431 bytes.
+    pub fn send_packet_with_receipt(&self, data: &[u8]) -> Result<Option<crate::packet::PacketReceipt>, String> {
+        let mut packet = self.hand_packed_data_packet(data, true)?;
+        packet.send().map_err(|e| format!("send_packet_with_receipt failed: {e}"))
+    }
+
+    /// The DATA packet `send_packet` puts on the link: encrypted with the
+    /// link key and packed by hand, ready for `Packet::send`.
+    fn hand_packed_data_packet(&self, data: &[u8], create_receipt: bool) -> Result<Packet, String> {
         if self.state != STATE_ACTIVE {
             return Err(format!("Link is not active (state={})", self.state));
         }
@@ -4770,7 +4840,7 @@ impl Link {
             crate::packet::HEADER_1,
             None,
             None,
-            false,
+            create_receipt,
             0,
         );
         packet.ciphertext = Some(ciphertext);
@@ -4786,7 +4856,7 @@ impl Link {
             packet.packed = true;
             packet.update_hash();
         }
-        packet.send().map(|_| ()).map_err(|e| format!("send_packet failed: {e}"))
+        Ok(packet)
     }
 
     /// Update keepalive interval based on measured RTT (matches Python __update_keepalive)
@@ -5035,6 +5105,37 @@ fn now_seconds() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hand-packed link DATA packet behind `send_packet` and
+    /// `send_packet_with_receipt` carries a payload over the link MDU as one
+    /// packet (a normal `Packet::pack` refuses it), and asks for a receipt
+    /// only when told to. rfed's legacy stream pushes rely on both.
+    #[test]
+    fn a_hand_packed_link_packet_takes_a_payload_over_the_mdu_and_can_ask_for_a_receipt() {
+        let destination = crate::destination::Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "handpacked".to_string(),
+            vec!["test".to_string()],
+        )
+        .expect("destination");
+        let mut link = Link::new_outbound(destination, MODE_DEFAULT).expect("link");
+        link.link_id = vec![0x5A; 16];
+        link.derived_key = Some(vec![7u8; 64]);
+        link.state = STATE_ACTIVE;
+        let payload = vec![0xAB; 1000];
+
+        let with_receipt = link.hand_packed_data_packet(&payload, true).expect("packs a payload over the MDU");
+        assert!(with_receipt.packed);
+        assert!(with_receipt.raw.len() > 1000, "one packet carries the whole payload: {} bytes", with_receipt.raw.len());
+        assert!(with_receipt.should_generate_receipt(), "Transport::outbound will create a receipt for it");
+
+        let without = link.hand_packed_data_packet(&payload, false).expect("packs");
+        assert!(!without.should_generate_receipt(), "send_packet stays receipt-less");
+
+        link.state = STATE_STALE;
+        assert!(link.hand_packed_data_packet(&payload, true).is_err(), "only an ACTIVE link carries data");
+    }
     use std::sync::mpsc;
 
     /// Every decrypt-failure branch in the packet pipeline must log.
@@ -5605,6 +5706,82 @@ mod tests {
         link.status = STATE_ACTIVE;
         link.teardown();
         assert_eq!(link.teardown_reason, REASON_DESTINATION_CLOSED, "we closed, and we are the destination");
+    }
+
+    /// A request is still pending when the link closes: its failed callback
+    /// runs then, once, on every close path. The response timer lived in the
+    /// link's actor, which exits on close, so the callback never ran and the
+    /// requester waited forever (RNS/Link.py fails it from the request
+    /// packet's receipt timeout, which the close does not stop).
+    #[test]
+    fn a_pending_request_fails_once_when_the_link_closes() {
+        let closes: [(&str, fn(&mut Link)); 2] = [
+            ("teardown", |link| link.teardown()),
+            ("LINKCLOSE from the peer", |link| {
+                let link_id = link.link_id.clone();
+                link.teardown_packet(&link_id)
+            }),
+        ];
+        for (index, (path, close)) in closes.into_iter().enumerate() {
+            let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(103 + index as u8)).collect());
+            link.state = STATE_ACTIVE;
+            link.status = STATE_ACTIVE;
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let now = now_seconds();
+            for (request_id, clock) in [(vec![0xA1; 16], Some(now)), (vec![0xA2; 16], None)] {
+                // One waiting for its response, far from its timeout; one
+                // still uploading as a Resource.
+                let failed = Mutex::new(tx.clone());
+                link.pending_requests.lock().unwrap().push(PendingRequest::new(
+                    request_id, now, 3600.0, None, clock, None,
+                    Some(Arc::new(move |receipt: RequestReceipt| {
+                        assert_eq!(receipt.get_status(), REQUEST_FAILED);
+                        let _ = failed.lock().unwrap().send(receipt.request_id);
+                    })),
+                    None,
+                ));
+            }
+
+            close(&mut link);
+
+            let mut failed: Vec<Vec<u8>> = (0..2)
+                .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("{}: a pending request's failed callback", path)))
+                .collect();
+            failed.sort();
+            assert_eq!(failed, vec![vec![0xA1; 16], vec![0xA2; 16]], "{}: both requests fail", path);
+            assert!(link.pending_requests.lock().unwrap().is_empty(), "{}: and are concluded", path);
+
+            // Closing again (a Teardown queued behind the close) fails nothing twice.
+            link.teardown();
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "{}: each request fails once", path);
+        }
+    }
+
+    /// The same through the actor, which is where the timer lived: a
+    /// teardown ends the actor, and the request it was timing still fails.
+    #[test]
+    fn a_pending_request_fails_when_the_actor_tears_the_link_down() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(109)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let failed = Mutex::new(tx);
+        let now = now_seconds();
+        link.pending_requests.lock().unwrap().push(PendingRequest::new(
+            vec![0xA3; 16], now, 3600.0, None, Some(now), None,
+            Some(Arc::new(move |receipt: RequestReceipt| {
+                let _ = failed.lock().unwrap().send(receipt.request_id);
+            })),
+            None,
+        ));
+        let handle = LinkHandle::spawn(link);
+
+        handle.teardown();
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("the failed callback runs when the link closes"),
+            vec![0xA3; 16]
+        );
     }
 
     /// B31: the runtime link registry is process-global; the library
