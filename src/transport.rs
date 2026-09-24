@@ -213,9 +213,6 @@ pub struct InterfaceStub {
     /// Our own announces waiting for the spacing window: (destination, raw),
     /// in the order they were asked; one entry per destination (newest wins).
     pub own_announce_queue: VecDeque<(Vec<u8>, Vec<u8>)>,
-    /// When each of our destinations last left this interface, for
-    /// coalescing a repeat inside the spacing window.
-    pub own_announce_last_sent: std::collections::HashMap<Vec<u8>, f64>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<f64>,
     pub announce_rate_penalty: Option<f64>,
@@ -290,9 +287,6 @@ pub enum OwnAnnounce {
     Sent,
     /// Waiting in the interface's queue; the jobs loop releases it.
     Queued,
-    /// The same destination left this interface inside the current spacing
-    /// window; this copy is redundant and is dropped.
-    Coalesced,
 }
 
 impl InterfaceStub {
@@ -300,19 +294,8 @@ impl InterfaceStub {
     /// out at once; the rest wait, in order, one per OWN_ANNOUNCE_SPACING_SECS.
     /// A newer announce for a destination already waiting replaces it.
     pub fn admit_own_announce(&mut self, destination: &[u8], raw: &[u8], now: f64) -> OwnAnnounce {
-        // A destination that left this interface inside the current spacing
-        // window is already fresh at every peer; a second announce for it
-        // would only be a duplicate ten seconds later. Applications do call
-        // announce() twice at start (rfed's propagation node did until
-        // 2026-09-24), so coalesce here rather than queue.
-        if let Some(sent_at) = self.own_announce_last_sent.get(destination) {
-            if now - sent_at < OWN_ANNOUNCE_SPACING_SECS {
-                return OwnAnnounce::Coalesced;
-            }
-        }
         if self.own_announce_queue.is_empty() && now >= self.own_announce_allowed_at {
             self.own_announce_allowed_at = now + OWN_ANNOUNCE_SPACING_SECS;
-            self.own_announce_last_sent.insert(destination.to_vec(), now);
             return OwnAnnounce::Sent;
         }
         if let Some(entry) = self.own_announce_queue.iter_mut().find(|(d, _)| d.as_slice() == destination) {
@@ -330,7 +313,6 @@ impl InterfaceStub {
         }
         let next = self.own_announce_queue.pop_front()?;
         self.own_announce_allowed_at = now + OWN_ANNOUNCE_SPACING_SECS;
-        self.own_announce_last_sent.insert(next.0.clone(), now);
         Some(next)
     }
 }
@@ -3898,21 +3880,12 @@ impl Transport {
                         && packet.context != crate::packet::PATH_RESPONSE
                     {
                         if let Some(ref dest) = packet.destination_hash {
-                            match interface.admit_own_announce(dest, &packet.raw, outbound_time) {
-                                OwnAnnounce::Sent => {}
-                                OwnAnnounce::Queued => {
-                                    queued_own_announces.push(interface.name.clone());
-                                    crate::log(&format!("[ANNOUNCE-PACE] queued own announce dest={} iface={} ahead={}",
-                                        crate::hexrep(dest, false), interface.name, interface.own_announce_queue.len() - 1),
-                                        crate::LOG_DEBUG, false, false);
-                                    should_transmit = false;
-                                }
-                                OwnAnnounce::Coalesced => {
-                                    crate::log(&format!("[ANNOUNCE-PACE] coalesced repeat announce dest={} iface={} (left within {}s)",
-                                        crate::hexrep(dest, false), interface.name, OWN_ANNOUNCE_SPACING_SECS),
-                                        crate::LOG_DEBUG, false, false);
-                                    should_transmit = false;
-                                }
+                            if interface.admit_own_announce(dest, &packet.raw, outbound_time) == OwnAnnounce::Queued {
+                                queued_own_announces.push(interface.name.clone());
+                                crate::log(&format!("[ANNOUNCE-PACE] queued own announce dest={} iface={} ahead={}",
+                                    crate::hexrep(dest, false), interface.name, interface.own_announce_queue.len() - 1),
+                                    crate::LOG_DEBUG, false, false);
+                                should_transmit = false;
                             }
                         }
                     }
@@ -10713,46 +10686,5 @@ mod route_eviction_tests {
         assert_eq!(d.len(), 2);
         let a = d.iter().find(|e| e.receiving_interface.as_deref() == Some("A")).unwrap();
         assert_eq!((a.hops, a.timestamp), (1, 3.0));
-    }
-}
-
-#[cfg(test)]
-mod own_announce_coalesce_tests {
-    use super::{InterfaceStub, OwnAnnounce, OWN_ANNOUNCE_SPACING_SECS};
-
-    /// rfed announced its propagation node twice within a second at start;
-    /// the second copy must not go out ten seconds later as a duplicate.
-    #[test]
-    fn a_repeat_inside_the_window_is_coalesced_not_queued() {
-        let mut iface = InterfaceStub::default();
-        iface.online = true;
-        let t0 = 1_000.0;
-        assert_eq!(iface.admit_own_announce(&[1; 16], b"a1", t0), OwnAnnounce::Sent);
-        assert_eq!(iface.admit_own_announce(&[1; 16], b"a2", t0 + 0.5), OwnAnnounce::Coalesced);
-        assert!(iface.own_announce_queue.is_empty(), "nothing queued for the repeat");
-        // A different destination still queues behind the window.
-        assert_eq!(iface.admit_own_announce(&[2; 16], b"b1", t0 + 0.6), OwnAnnounce::Queued);
-        // Once the window has passed the destination may be announced again.
-        assert_eq!(
-            iface.admit_own_announce(&[1; 16], b"a3", t0 + OWN_ANNOUNCE_SPACING_SECS + 0.1),
-            OwnAnnounce::Queued,
-            "after the window it is admitted (queued behind the pending one)"
-        );
-    }
-
-    /// Releases from the queue count as sends for coalescing too.
-    #[test]
-    fn a_released_announce_starts_its_own_window() {
-        let mut iface = InterfaceStub::default();
-        iface.online = true;
-        let t0 = 1_000.0;
-        assert_eq!(iface.admit_own_announce(&[1; 16], b"a1", t0), OwnAnnounce::Sent);
-        assert_eq!(iface.admit_own_announce(&[2; 16], b"b1", t0 + 1.0), OwnAnnounce::Queued);
-        let released = iface.next_own_announce(t0 + OWN_ANNOUNCE_SPACING_SECS).expect("released");
-        assert_eq!(released.0, vec![2u8; 16]);
-        assert_eq!(
-            iface.admit_own_announce(&[2; 16], b"b2", t0 + OWN_ANNOUNCE_SPACING_SECS + 2.0),
-            OwnAnnounce::Coalesced
-        );
     }
 }
