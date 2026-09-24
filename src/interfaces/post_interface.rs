@@ -873,9 +873,24 @@ impl PostInterface {
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, addr)) => {
-                    let mut buf = [0u8; 4096];
-                    if let Ok(n) = stream.read(&mut buf) {
-                        let request = String::from_utf8_lossy(&buf[..n]);
+                    let request = match read_wake_request(&mut stream) {
+                        Ok(r) if !r.trim().is_empty() => r,
+                        Ok(_) => {
+                            log(
+                                &format!("PostInterface wake connection from {} closed without sending a request — wake lost", addr),
+                                crate::LOG_WARNING, false, false,
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            log(
+                                &format!("PostInterface wake connection from {} unreadable ({}) — wake lost", addr, e),
+                                crate::LOG_WARNING, false, false,
+                            );
+                            continue;
+                        }
+                    };
+                    {
                         // POST /v1/interfaces/exchange — PHP peer pushing exchange to us
                         // We signal the exchange worker to do an immediate exchange.
                         if request.starts_with("POST /v1/interfaces/exchange") || request.contains("POST /v1/interfaces/exchange") {
@@ -1017,6 +1032,44 @@ mod tests {
 /// "waker_url '…\/\/…' does not match node_url". Anything that is not a JSON
 /// object with a string `waker_url` yields an empty string, which the caller
 /// rejects.
+/// Read one HTTP request from a freshly accepted wake connection.
+///
+/// The wake listener is non-blocking so its accept loop can watch `running`.
+/// Where accept(2) hands the new socket the listener's O_NONBLOCK — macOS,
+/// which has no accept4 — the single read() this replaced raced the client's
+/// first segment: a wake whose bytes had not landed yet read WouldBlock and
+/// was dropped without a log line. Linux and FreeBSD (accept4) return a
+/// blocking socket, so only the macOS-hosted staging gateway lost wakes, and
+/// with them every LINKREQUEST a browser queued at a quiet PHP node until the
+/// gateway next had traffic of its own (~50 s). Read blocking, under a short
+/// deadline, until the headers and the Content-Length body are in.
+pub(crate) fn read_wake_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    const MAX_REQUEST: usize = 4096;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
+    while buf.len() < MAX_REQUEST {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break; // client closed: what we have is the whole request
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + body_len {
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub(crate) fn wake_body_waker_url(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1026,7 +1079,41 @@ pub(crate) fn wake_body_waker_url(body: &str) -> String {
 
 #[cfg(test)]
 mod wake_body_tests {
-    use super::wake_body_waker_url;
+    use super::{read_wake_request, wake_body_waker_url};
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    /// A wake whose bytes arrive after the accept, split across segments,
+    /// through a non-blocking listener as the wake server uses — the case
+    /// that lost every late wake on macOS.
+    #[test]
+    fn a_late_split_wake_is_read_whole_from_a_nonblocking_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"waker_url":"http:\/\/127.0.0.1:8080"}"#;
+        let head = format!("POST /v1/wake HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            c.write_all(head.as_bytes()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            c.write_all(body.as_bytes()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let request = read_wake_request(&mut stream).unwrap();
+        client.join().unwrap();
+        assert!(request.starts_with("POST /v1/wake"), "{request:?}");
+        let body_start = request.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(wake_body_waker_url(&request[body_start..]), "http://127.0.0.1:8080");
+    }
 
     #[test]
     fn php_escaped_slashes_decode_to_the_configured_url() {
