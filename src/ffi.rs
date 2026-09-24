@@ -119,7 +119,12 @@ pub fn init(config_dir: &str, loglevel: i32) -> Result<(), String> {
 }
 
 /// Shut down Reticulum (best-effort).
+///
+/// Every runtime link is torn down first, while the interfaces are still
+/// attached, so peers get a LINKCLOSE and a stack started later in this
+/// process does not inherit link actors from this one (B31).
 pub fn shutdown() -> Result<(), String> {
+    crate::link::teardown_all_runtime_links();
     crate::reticulum::exit_handler();
     Transport::reset_announce_history();
     Ok(())

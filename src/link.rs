@@ -1282,6 +1282,30 @@ pub fn unregister_runtime_link(link_id: &[u8]) {
     }
 }
 
+/// Tear down every registered runtime link and empty the registry.
+///
+/// The registry is process-global and outlives the Reticulum instance, so
+/// a stack that is stopped and started again in the same process (the
+/// Android service on 2026-09-24) otherwise inherits actors whose
+/// interfaces are gone and still report `STATE_ACTIVE`. Called from the
+/// library shutdown; returns the number of links torn down.
+pub fn teardown_all_runtime_links() -> usize {
+    let handles: Vec<LinkHandle> = match RUNTIME_LINKS.lock() {
+        Ok(mut links) => links.drain().map(|(_, h)| h).collect(),
+        Err(_) => return 0,
+    };
+    for handle in &handles {
+        handle.teardown();
+    }
+    crate::log(
+        &format!("RUNTIME teardown_all: {} link(s) torn down", handles.len()),
+        crate::LOG_NOTICE,
+        false,
+        false,
+    );
+    handles.len()
+}
+
 /// Look up a LinkHandle by link_id. Returns a clone of the handle.
 pub fn get_runtime_link_handle(link_id: &[u8]) -> Option<LinkHandle> {
     let links = RUNTIME_LINKS.lock().ok()?;
@@ -5581,6 +5605,30 @@ mod tests {
         link.status = STATE_ACTIVE;
         link.teardown();
         assert_eq!(link.teardown_reason, REASON_DESTINATION_CLOSED, "we closed, and we are the destination");
+    }
+
+    /// B31: the runtime link registry is process-global; the library
+    /// shutdown must empty it so a stack restarted in the same process
+    /// does not inherit the previous stack's link actors.
+    #[test]
+    fn teardown_all_runtime_links_empties_the_registry() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(97)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let handle = LinkHandle::spawn(link);
+        let link_id = handle.link_id();
+        register_runtime_link_handle(handle.clone());
+        assert!(get_runtime_link_handle(&link_id).is_some());
+
+        let torn_down = teardown_all_runtime_links();
+
+        assert!(torn_down >= 1, "the registered link is torn down");
+        assert!(get_runtime_link_handle(&link_id).is_none(), "the registry is empty afterwards");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.status() != STATE_CLOSED && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(handle.status(), STATE_CLOSED, "the actor closed its link");
     }
 
     /// A6: RNS/Link.py RequestReceipt - status, accessors, and the order of
