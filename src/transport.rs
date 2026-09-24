@@ -1328,6 +1328,9 @@ impl Transport {
 
         drop(state);
 
+        if !is_connected_to_shared_instance {
+            Transport::load_tunnel_table();
+        }
         let _ = thread::spawn(|| Transport::jobloop());
         let _ = thread::spawn(|| Transport::count_traffic_loop());
 
@@ -2499,6 +2502,10 @@ impl Transport {
         if let Some(tunnel_entry) = state.tunnels.get_mut(&tunnel_id) {
             // Tunnel exists, restore it
             log(&format!("Tunnel endpoint restored"), LOG_DEBUG, false, false);
+            // A peer synthesizes its tunnel on every heartbeat as well as on
+            // reconnect; only a change of interface is a reappearance worth
+            // a NOTICE line.
+            let interface_changed = !matches!(tunnel_entry.get(IDX_TT_IF), Some(TunnelEntryValue::Interface(Some(prev))) if prev == &interface);
             
             // Update interface and expiry
             match tunnel_entry.get_mut(IDX_TT_IF) {
@@ -2514,8 +2521,18 @@ impl Transport {
                 }
                 _ => {}
             }
-            
-            // TODO: Restore paths from tunnel paths table
+            let recorded: Vec<(Vec<u8>, Vec<PathEntryValue>)> = match tunnel_entry.get(IDX_TT_PATHS) {
+                Some(TunnelEntryValue::Paths(paths)) => paths.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                _ => Vec::new(),
+            };
+            let deprecated = Transport::restore_tunnel_paths(&mut state, &interface, recorded, current_time, interface_changed);
+            if let Some(entry) = state.tunnels.get_mut(&tunnel_id) {
+                if let Some(TunnelEntryValue::Paths(paths)) = entry.get_mut(IDX_TT_PATHS) {
+                    for dest in deprecated {
+                        paths.remove(&dest);
+                    }
+                }
+            }
         } else {
             // Create new tunnel entry
             log(&format!("Tunnel endpoint established"), LOG_DEBUG, false, false);
@@ -2528,6 +2545,190 @@ impl Transport {
             
             state.tunnels.insert(tunnel_id, tunnel_entry);
         }
+    }
+
+    /// RNS/Transport.py inbound(): a path learned over an interface that
+    /// carries a tunnel is also recorded in that tunnel, so that
+    /// `handle_tunnel` can put it back when the peer reconnects (a TCP
+    /// server spawns a fresh interface per connection) or after we restart
+    /// with the tunnel table loaded from disk. Until 2026-09-24 nothing was
+    /// recorded, so every reconnect and every restart lost the routes to the
+    /// clients behind it until they announced again — six hours, since B28.
+    pub(crate) fn record_tunnel_path(
+        state: &mut TransportState,
+        receiving_interface: Option<&str>,
+        destination_hash: &[u8],
+        next_hop: &[u8],
+        hops: u8,
+        expires: f64,
+        random_blob: Option<Vec<u8>>,
+        packet_hash: &[u8],
+    ) {
+        let Some(iface_name) = receiving_interface else { return };
+        let Some(tunnel_id) = state
+            .interfaces
+            .iter()
+            .find(|i| i.name == iface_name)
+            .and_then(|i| i.tunnel_id.clone())
+        else {
+            return;
+        };
+        let Some(entry) = state.tunnels.get_mut(&tunnel_id) else { return };
+        if let Some(TunnelEntryValue::Paths(paths)) = entry.get_mut(IDX_TT_PATHS) {
+            paths.insert(
+                destination_hash.to_vec(),
+                vec![
+                    PathEntryValue::Timestamp(now()),
+                    PathEntryValue::NextHop(next_hop.to_vec()),
+                    PathEntryValue::Hops(hops),
+                    PathEntryValue::Expires(expires),
+                    PathEntryValue::RandomBlobs(random_blob.into_iter().collect()),
+                    PathEntryValue::ReceivingInterface(Some(iface_name.to_string())),
+                    PathEntryValue::PacketHash(packet_hash.to_vec()),
+                ],
+            );
+        }
+    }
+
+    /// RNS/Transport.py handle_tunnel(): put a reappearing tunnel's recorded
+    /// paths back into the path table on the interface it reappeared on. A
+    /// path is restored when it has not expired and no unexpired route with
+    /// fewer hops is known; the rest are dropped from the tunnel. Returns the
+    /// destinations dropped.
+    pub(crate) fn restore_tunnel_paths(
+        state: &mut TransportState,
+        interface: &str,
+        recorded: Vec<(Vec<u8>, Vec<PathEntryValue>)>,
+        current_time: f64,
+        reappeared: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut deprecated = Vec::new();
+        let mut restored = 0usize;
+        for (destination_hash, values) in recorded {
+            let mut next_hop = None;
+            let mut hops = None;
+            let mut path_expires = None;
+            let mut packet_hash = Vec::new();
+            for value in &values {
+                match value {
+                    PathEntryValue::NextHop(n) => next_hop = Some(n.clone()),
+                    PathEntryValue::Hops(h) => hops = Some(*h),
+                    PathEntryValue::Expires(e) => path_expires = Some(*e),
+                    PathEntryValue::PacketHash(p) => packet_hash = p.clone(),
+                    _ => {}
+                }
+            }
+            let (Some(next_hop), Some(hops), Some(path_expires)) = (next_hop, hops, path_expires) else {
+                deprecated.push(destination_hash);
+                continue;
+            };
+            if current_time > path_expires {
+                log(
+                    &format!("Did not restore path to {} because it has expired", crate::hexrep(&destination_hash, true)),
+                    LOG_DEBUG, false, false,
+                );
+                deprecated.push(destination_hash);
+                continue;
+            }
+            let best_live_hops = state
+                .path_table
+                .get(&destination_hash)
+                .and_then(|dq| dq.iter().filter(|e| e.expires > current_time).map(|e| e.hops).min());
+            if let Some(best) = best_live_hops {
+                if hops > best {
+                    log(
+                        &format!("Did not restore path to {} because a newer path with fewer hops exist", crate::hexrep(&destination_hash, true)),
+                        LOG_DEBUG, false, false,
+                    );
+                    deprecated.push(destination_hash);
+                    continue;
+                }
+            }
+            let deque = state.path_table.entry(destination_hash.clone()).or_insert_with(VecDeque::new);
+            admit_route(deque, PathEntry {
+                timestamp: current_time,
+                next_hop: next_hop.clone(),
+                hops,
+                expires: path_expires,
+                receiving_interface: Some(interface.to_string()),
+                packet_hash,
+            });
+            state.path_table_dirty = true;
+            restored += 1;
+            log(
+                &format!(
+                    "Restored path to {} is now {} hops away via {} on {}",
+                    crate::hexrep(&destination_hash, true), hops, crate::hexrep(&next_hop, true), interface
+                ),
+                LOG_DEBUG, false, false,
+            );
+        }
+        if restored > 0 || !deprecated.is_empty() {
+            log(
+                &format!("Tunnel {} on {}: restored {} path(s), dropped {}",
+                    if reappeared { "reappeared" } else { "refreshed" }, interface, restored, deprecated.len()),
+                if reappeared { LOG_NOTICE } else { LOG_DEBUG }, false, false,
+            );
+        }
+        deprecated
+    }
+
+    /// Load the tunnel table saved by `save_tunnel_table` (RNS/Transport.py
+    /// start(): tunnels come back with their paths and no interface; the
+    /// interface is attached again when the peer synthesizes the tunnel).
+    pub fn load_tunnel_table() {
+        let path = crate::reticulum::storage_path().join("tunnels");
+        let Ok(mut file) = File::open(&path) else { return };
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            return;
+        }
+        let Ok(entries) = from_slice::<Vec<SerializedTunnelEntry>>(&buf) else {
+            log("Could not load tunnel table from disk; starting with an empty one", LOG_ERROR, false, false);
+            return;
+        };
+        let now_ts = now();
+        let mut state = TRANSPORT.lock().unwrap();
+        let mut tunnels = 0usize;
+        let mut paths_loaded = 0usize;
+        for entry in entries {
+            if entry.expires < now_ts {
+                continue;
+            }
+            let mut paths: HashMap<Vec<u8>, Vec<PathEntryValue>> = HashMap::new();
+            for p in entry.paths {
+                if p.expires < now_ts {
+                    continue;
+                }
+                paths.insert(
+                    p.destination_hash,
+                    vec![
+                        PathEntryValue::Timestamp(p.timestamp),
+                        PathEntryValue::NextHop(p.received_from),
+                        PathEntryValue::Hops(p.hops),
+                        PathEntryValue::Expires(p.expires),
+                        PathEntryValue::RandomBlobs(p.random_blobs),
+                        PathEntryValue::ReceivingInterface(None),
+                        PathEntryValue::PacketHash(p.packet_hash),
+                    ],
+                );
+                paths_loaded += 1;
+            }
+            state.tunnels.insert(
+                entry.tunnel_id.clone(),
+                vec![
+                    TunnelEntryValue::TunnelId(entry.tunnel_id),
+                    TunnelEntryValue::Interface(None),
+                    TunnelEntryValue::Paths(paths),
+                    TunnelEntryValue::Expires(entry.expires),
+                ],
+            );
+            tunnels += 1;
+        }
+        log(
+            &format!("Loaded {} tunnel(s) with {} path(s) from disk", tunnels, paths_loaded),
+            LOG_NOTICE, false, false,
+        );
     }
 
     pub fn set_network_identity(identity: Identity) {
@@ -5467,6 +5668,16 @@ impl Transport {
                         admit_route(deque, new_entry);
 
                         state.path_table_dirty = true;
+                        Transport::record_tunnel_path(
+                            &mut state,
+                            packet.receiving_interface.as_deref(),
+                            destination_hash,
+                            &received_from,
+                            packet.hops,
+                            expires,
+                            new_blob.clone(),
+                            &packet_hash,
+                        );
                         state.path_verified_this_session.insert(destination_hash.clone());
                         crate::transport::notify_path_added();
                         crate::announce_log::count_path_added();
@@ -7756,6 +7967,78 @@ mod tests {
             let mut state = TRANSPORT.lock().unwrap();
             state.interfaces.retain(|i| i.name != iface_name);
             state.tunnels.remove(&tunnel_id);
+        }
+    }
+
+    /// RNS/Transport.py: a path learned over a tunneled interface is recorded
+    /// in the tunnel, and when the tunnel reappears on a new interface (the
+    /// peer reconnected, or we restarted) the path is restored on that
+    /// interface. Until 2026-09-24 neither happened: every gateway restart
+    /// and every client reconnect lost the routes to the clients behind it.
+    #[test]
+    fn tunnel_paths_are_recorded_and_restored_on_the_new_interface() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let old_iface = "test_tunnel_old_conn";
+        let new_iface = "test_tunnel_new_conn";
+        let tunnel_id = vec![0xCC; 32];
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(29)).collect();
+        let next_hop: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(31)).collect();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            for name in [old_iface, new_iface] {
+                let mut stub = InterfaceStub::default();
+                stub.name = name.to_string();
+                stub.out = true;
+                stub.online = true;
+                state.interfaces.push(stub);
+            }
+            state.path_table.remove(&dest);
+        }
+        Transport::handle_tunnel(tunnel_id.clone(), old_iface.to_string());
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let expires = now() + DESTINATION_TIMEOUT;
+            let deque = state.path_table.entry(dest.clone()).or_insert_with(VecDeque::new);
+            admit_route(deque, PathEntry {
+                timestamp: now(), next_hop: next_hop.clone(), hops: 2, expires,
+                receiving_interface: Some(old_iface.to_string()), packet_hash: vec![1; 32],
+            });
+            Transport::record_tunnel_path(&mut state, Some(old_iface), &dest, &next_hop, 2, expires, Some(vec![7; 10]), &[1; 32]);
+            let entry = state.tunnels.get(&tunnel_id).expect("tunnel");
+            match entry.get(IDX_TT_PATHS) {
+                Some(TunnelEntryValue::Paths(paths)) => assert!(paths.contains_key(&dest), "the path is recorded in its tunnel"),
+                _ => panic!("tunnel has no paths slot"),
+            }
+            state.interfaces.retain(|i| i.name != old_iface);
+        }
+        Transport::handle_tunnel(tunnel_id.clone(), new_iface.to_string());
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let dq = state.path_table.get(&dest).expect("path table entry");
+            assert!(
+                dq.iter().any(|e| e.receiving_interface.as_deref() == Some(new_iface) && e.hops == 2),
+                "the path is restored on the new interface: {:?}", dq
+            );
+            let selected = Transport::select_path(&state.path_table, &state.interfaces, &dest, now());
+            assert_eq!(selected.map(|(_, e)| e.receiving_interface), Some(Some(new_iface.to_string())), "and it is the usable route");
+        }
+        Transport::save_tunnel_table();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.tunnels.remove(&tunnel_id);
+        }
+        Transport::load_tunnel_table();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let entry = state.tunnels.get(&tunnel_id).expect("tunnel loaded from disk");
+            match entry.get(IDX_TT_PATHS) {
+                Some(TunnelEntryValue::Paths(paths)) => assert!(paths.contains_key(&dest), "loaded with its path"),
+                _ => panic!("loaded tunnel has no paths"),
+            }
+            state.interfaces.retain(|i| i.name != new_iface);
+            state.tunnels.remove(&tunnel_id);
+            state.path_table.remove(&dest);
         }
     }
 
