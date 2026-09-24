@@ -5360,9 +5360,16 @@ impl Transport {
                     //   3. Dedup by ROUTE (receiving interface + next hop) within
                     //      the same destination — NOT by packet_hash, which is
                     //      identical across every relayed copy of one announce.
-                    //   4. Cap at MAX_PATHS_PER_DEST (=3).
-                    //   5. No quality gate — multiple paths coexist; select_path()
-                    //      picks the best at forwarding time via bitrate/hops score.
+                    //   4. Cap at MAX_PATHS_PER_DEST (=3) — evicting the WORST
+                    //      route (most hops, then oldest), never merely the oldest.
+                    //      Until 2026-09-24 the cap dropped the oldest: a bridge's
+                    //      one-hop LAN route was pushed out seconds later by the
+                    //      three looped copies of that same announce coming back
+                    //      from the backbones at three hops, and the gateway then
+                    //      forwarded LAN-bound pushes out to the public mesh.
+                    //   5. No quality gate on admission — multiple paths coexist;
+                    //      select_path() picks the best at forwarding time via
+                    //      bitrate/hops score.
                     //
                     // This eliminates:
                     //   • Convergence race (fast-WiFi 3-hop vs slow-LoRa 2-hop)
@@ -5448,12 +5455,7 @@ impl Transport {
                         let deque = state.path_table
                             .entry(destination_hash.clone())
                             .or_insert_with(VecDeque::new);
-                        deque.retain(|e| {
-                            e.receiving_interface != new_entry.receiving_interface
-                                || e.next_hop != new_entry.next_hop
-                        });
-                        deque.push_front(new_entry);
-                        deque.truncate(MAX_PATHS_PER_DEST);
+                        admit_route(deque, new_entry);
 
                         state.path_table_dirty = true;
                         state.path_verified_this_session.insert(destination_hash.clone());
@@ -10611,5 +10613,78 @@ mod reannounce_cadence_tests {
         assert!(super::AUTO_ANNOUNCE_HOLDOFF_SECS >= 3600.0);
         // And it is the reference's own cadence: lxmd announce_interval = 360 min.
         assert_eq!(super::AUTO_ANNOUNCE_HOLDOFF_SECS, 6.0 * 60.0 * 60.0);
+    }
+}
+
+
+/// Insert `new_entry` into a destination's route list: replace the entry for
+/// the same route (receiving interface + next hop), keep the list capped at
+/// `MAX_PATHS_PER_DEST` by evicting the worst route — most hops first, oldest
+/// among equals — so a short direct route is never displaced by longer copies
+/// of the same announce that arrive later.
+pub(crate) fn admit_route(deque: &mut VecDeque<PathEntry>, new_entry: PathEntry) {
+    deque.retain(|e| {
+        e.receiving_interface != new_entry.receiving_interface || e.next_hop != new_entry.next_hop
+    });
+    deque.push_front(new_entry);
+    while deque.len() > MAX_PATHS_PER_DEST {
+        let worst = deque
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.hops.cmp(&b.hops).then_with(|| {
+                    b.timestamp.partial_cmp(&a.timestamp).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
+            .map(|(i, _)| i);
+        match worst {
+            Some(i) => { deque.remove(i); }
+            None => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod route_eviction_tests {
+    use super::{admit_route, PathEntry, MAX_PATHS_PER_DEST};
+    use std::collections::VecDeque;
+
+    fn route(iface: &str, hops: u8, ts: f64) -> PathEntry {
+        PathEntry {
+            timestamp: ts,
+            next_hop: iface.as_bytes().to_vec(),
+            hops,
+            expires: ts + 1_000_000.0,
+            receiving_interface: Some(iface.to_string()),
+            packet_hash: vec![0u8; 32],
+        }
+    }
+
+    /// The 2026-09-24 case: a bridge announces over the LAN (1 hop), and the
+    /// same announce comes back from three backbones at 3 hops a few seconds
+    /// later. The LAN route must survive the cap.
+    #[test]
+    fn looped_copies_never_evict_the_direct_route() {
+        let mut d = VecDeque::new();
+        admit_route(&mut d, route("Client on LAN", 1, 100.0));
+        admit_route(&mut d, route("Arborisis", 3, 101.0));
+        admit_route(&mut d, route("zer0bitz", 3, 102.0));
+        admit_route(&mut d, route("Air Barcelona", 3, 103.0));
+        assert_eq!(d.len(), MAX_PATHS_PER_DEST);
+        assert!(d.iter().any(|e| e.receiving_interface.as_deref() == Some("Client on LAN")),
+            "the one-hop route was evicted by later three-hop copies");
+        // Among the equal-hop routes the oldest one went.
+        assert!(!d.iter().any(|e| e.receiving_interface.as_deref() == Some("Arborisis")));
+    }
+
+    #[test]
+    fn a_repeat_over_the_same_route_replaces_in_place() {
+        let mut d = VecDeque::new();
+        admit_route(&mut d, route("A", 2, 1.0));
+        admit_route(&mut d, route("B", 2, 2.0));
+        admit_route(&mut d, route("A", 1, 3.0));
+        assert_eq!(d.len(), 2);
+        let a = d.iter().find(|e| e.receiving_interface.as_deref() == Some("A")).unwrap();
+        assert_eq!((a.hops, a.timestamp), (1, 3.0));
     }
 }
