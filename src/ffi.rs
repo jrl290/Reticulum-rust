@@ -689,13 +689,19 @@ pub fn packet_create(
     Ok(store_handle(packet))
 }
 
-/// Send a packet.  Returns the receipt handle (0 if no receipt).
+/// Send a packet.  Returns the receipt handle (0 when the packet went out
+/// without a receipt being requested).
+///
+/// A packet no interface could take is an error, as it is in the reference
+/// (RNS/Packet.py send() returns False): until 2026-09-24 it returned 0 too,
+/// so hosts read "nothing was sent" as "sent, no receipt".
 pub fn packet_send(packet_handle: u64) -> Result<u64, String> {
     let mut packet: crate::packet::Packet =
         take_handle(packet_handle).ok_or_else(|| "invalid packet handle".to_string())?;
     match packet.send() {
         Ok(Some(receipt)) => Ok(store_handle(receipt)),
-        Ok(None) => Ok(0),
+        Ok(None) if packet.sent => Ok(0),
+        Ok(None) => Err("No interfaces could process the outbound packet".to_string()),
         Err(e) => Err(e),
     }
 }

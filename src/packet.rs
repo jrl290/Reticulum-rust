@@ -322,6 +322,11 @@ impl Packet {
         false
     }
 
+    /// Hand the packet to the transport. `Ok(Some(receipt))` when a receipt was
+    /// requested and the packet went out; `Ok(None)` when it went out without
+    /// one — OR when no interface could take it. Read `self.sent` to tell the
+    /// two apart (RNS/Packet.py send() returns False for the latter; rfed's
+    /// fan-out misread the former as a failure until 2026-09-24).
     pub fn send(&mut self) -> Result<Option<PacketReceipt>, String> {
         if self.sent {
             return Err("Packet was already sent".to_string());
