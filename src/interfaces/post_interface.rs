@@ -884,7 +884,7 @@ impl PostInterface {
                         }
                         Err(e) => {
                             log(
-                                &format!("PostInterface wake connection from {} unreadable ({}) — wake lost", addr, e),
+                                &format!("PostInterface wake connection from {} not read whole ({}) — wake lost", addr, e),
                                 crate::LOG_WARNING, false, false,
                             );
                             continue;
@@ -1023,15 +1023,15 @@ mod tests {
     }
 }
 
-/// The `waker_url` from a `/v1/wake` body.
+/// Whole-request ceiling for one accepted wake connection.
 ///
-/// The body is JSON, so it is parsed as JSON. PHP's `json_encode` escapes
-/// slashes by default (`"https:\/\/retichat.com\/reticulum"`), and the
-/// substring scan this replaced compared the *escaped* text against the
-/// configured node_url, rejecting every wake from a PHP peer with
-/// "waker_url '…\/\/…' does not match node_url". Anything that is not a JSON
-/// object with a string `waker_url` yields an empty string, which the caller
-/// rejects.
+/// The wake server accepts on one thread, one connection at a time, so this
+/// is how long any single client can keep every other wake waiting in the
+/// backlog. It is a hard ceiling on already-correct code (DESIGN_PRINCIPLES.md
+/// §4), not the completion signal: a request is done when its Content-Length
+/// body is in or the client closes.
+const WAKE_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Read one HTTP request from a freshly accepted wake connection.
 ///
 /// The wake listener is non-blocking so its accept loop can watch `running`.
@@ -1041,16 +1041,61 @@ mod tests {
 /// was dropped without a log line. Linux and FreeBSD (accept4) return a
 /// blocking socket, so only the macOS-hosted staging gateway lost wakes, and
 /// with them every LINKREQUEST a browser queued at a quiet PHP node until the
-/// gateway next had traffic of its own (~50 s). Read blocking, under a short
-/// deadline, until the headers and the Content-Length body are in.
+/// gateway next had traffic of its own (~50 s).
+///
+/// So the socket is read blocking until the headers and the Content-Length
+/// body are in, the client closes (what arrived is the request), or
+/// MAX_REQUEST bytes have arrived (the truncated request is returned).
+/// Content-Length is capped at MAX_REQUEST: no larger body can be read whole
+/// anyway, and uncapped, `Content-Length: 18446744073709551615` overflowed the
+/// completeness sum and panicked the wake-server thread.
+///
+/// [`WAKE_REQUEST_DEADLINE`] bounds the whole request, not each read: every
+/// read may only wait for the time left until one deadline fixed on entry.
+/// A per-read timeout let a client trickling a byte every <2 s hold the
+/// single-threaded server for up to MAX_REQUEST reads (over two hours) while
+/// real wakes waited behind it. A request that is not complete by the
+/// deadline is an `ErrorKind::TimedOut` error saying how much arrived, which
+/// the wake server logs as a lost wake.
 pub(crate) fn read_wake_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
     const MAX_REQUEST: usize = 4096;
+    let deadline = Instant::now() + WAKE_REQUEST_DEADLINE;
+
+    // The drop is logged by the wake server, so name what was lost: the byte
+    // count and the request line, if one arrived.
+    fn incomplete(buf: &[u8]) -> std::io::Error {
+        let text = String::from_utf8_lossy(buf);
+        let first_line: String = text.lines().next().unwrap_or("").chars().take(80).collect();
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "no whole request within {:?}: {} bytes arrived, first line {:?}",
+                WAKE_REQUEST_DEADLINE, buf.len(), first_line
+            ),
+        )
+    }
+
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut buf: Vec<u8> = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
     while buf.len() < MAX_REQUEST {
-        let n = stream.read(&mut chunk)?;
+        // The time left on the one deadline, never a fresh 2 s per read.
+        // (set_read_timeout rejects a zero duration, so exhaustion is checked
+        // here rather than handed to the socket.)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(incomplete(&buf));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            // SO_RCVTIMEO expired, so the deadline passed inside this read.
+            // Unix reports it as WouldBlock (EAGAIN), Windows as TimedOut.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                return Err(incomplete(&buf));
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break; // client closed: what we have is the whole request
         }
@@ -1061,8 +1106,9 @@ pub(crate) fn read_wake_request(stream: &mut std::net::TcpStream) -> std::io::Re
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
                 .and_then(|v| v.trim().parse::<usize>().ok())
+                .map(|n| n.min(MAX_REQUEST))
                 .unwrap_or(0);
-            if buf.len() >= end + 4 + body_len {
+            if buf.len() >= end.saturating_add(4).saturating_add(body_len) {
                 break;
             }
         }
@@ -1070,6 +1116,15 @@ pub(crate) fn read_wake_request(stream: &mut std::net::TcpStream) -> std::io::Re
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// The `waker_url` from a `/v1/wake` body.
+///
+/// The body is JSON, so it is parsed as JSON. PHP's `json_encode` escapes
+/// slashes by default (`"https:\/\/retichat.com\/reticulum"`), and the
+/// substring scan this replaced compared the *escaped* text against the
+/// configured node_url, rejecting every wake from a PHP peer with
+/// "waker_url '…\/\/…' does not match node_url". Anything that is not a JSON
+/// object with a string `waker_url` yields an empty string, which the caller
+/// rejects.
 pub(crate) fn wake_body_waker_url(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1080,9 +1135,10 @@ pub(crate) fn wake_body_waker_url(body: &str) -> String {
 #[cfg(test)]
 mod wake_body_tests {
     use super::{read_wake_request, wake_body_waker_url};
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::time::Duration;
+    use std::io::{ErrorKind, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     /// A wake whose bytes arrive after the accept, split across segments,
     /// through a non-blocking listener as the wake server uses — the case
@@ -1113,6 +1169,64 @@ mod wake_body_tests {
         assert!(request.starts_with("POST /v1/wake"), "{request:?}");
         let body_start = request.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(wake_body_waker_url(&request[body_start..]), "http://127.0.0.1:8080");
+    }
+
+    /// A client pacing its bytes under the old per-read timeout — one every
+    /// 300 ms — must not hold the single-threaded wake server past the
+    /// whole-request deadline. With a 2 s timeout per read this read the whole
+    /// ~80-byte request a byte at a time, for over 20 s, while every real wake
+    /// waited in the backlog.
+    #[test]
+    fn a_trickling_client_is_cut_off_at_the_whole_request_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"waker_url":"http:\/\/127.0.0.1:8080"}"#;
+        let request = format!("POST /v1/wake HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        // Dropping stop_tx ends the client as soon as the read has returned.
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            for byte in request.as_bytes() {
+                if c.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if stop_rx.recv_timeout(Duration::from_millis(300)) != Err(mpsc::RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let result = read_wake_request(&mut stream);
+        let elapsed = started.elapsed();
+        drop(stop_tx);
+        drop(stream);
+        client.join().unwrap();
+        assert!(elapsed < Duration::from_millis(2500), "held the wake server for {elapsed:?}");
+        let err = result.expect_err("a request still trickling in at the deadline is not whole");
+        assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
+        // ~7 bytes arrive in 2 s at this pace; the log line shows them.
+        assert!(err.to_string().contains("first line \"POST /"), "the lost wake is named: {err}");
+    }
+
+    /// `Content-Length: 18446744073709551615` overflowed `end + 4 + body_len`,
+    /// which panics the wake-server thread wherever overflow checks are on —
+    /// this test profile included. Capped, the request reads to the client's
+    /// close.
+    #[test]
+    fn a_huge_content_length_does_not_panic_the_wake_thread() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = "POST /v1/wake HTTP/1.0\r\nContent-Length: 18446744073709551615\r\n\r\n{}";
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(sent.as_bytes()).unwrap();
+            c.shutdown(Shutdown::Write).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_wake_request(&mut stream).expect("read to the client's close");
+        client.join().unwrap();
+        assert_eq!(request, sent);
     }
 
     #[test]
