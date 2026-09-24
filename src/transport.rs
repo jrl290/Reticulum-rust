@@ -4003,6 +4003,13 @@ impl Transport {
             filtered.push((iface_name, raw));
         }
         sent = !filtered.is_empty();
+        // An own announce the pacer queued (B25) is on its way, one spacing
+        // window later, and nothing is dropped, so the send succeeded from
+        // the caller's point of view. Until 2026-09-24 this returned false
+        // for it and Packet::send logged "No interfaces could process the
+        // outbound packet" once per queued destination at every rfed start.
+        let queued_for_later = !queued_own_announces.is_empty();
+        sent = sent || queued_for_later;
         let transmissions = filtered;
 
         for name in &offline_drops {
@@ -4071,7 +4078,9 @@ impl Transport {
             crate::LOG_VERBOSE
         };
 
-        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), tx_log_level, false, false);
+        crate::log(&format!("Transport::outbound {} transmissions, sent={}{}", transmissions.len(), sent,
+            if queued_for_later { format!(" (own announce queued on {} interface(s))", queued_own_announces.len()) } else { String::new() }),
+            tx_log_level, false, false);
         drop(state);
 
         for (iface_name, raw) in transmissions {
@@ -8419,6 +8428,14 @@ mod tests {
             assert!(state.announce_sent_at.contains_key(&(d1.hash.clone(), iface.to_string())));
             assert!(state.announce_sent_at.contains_key(&(d2.hash.clone(), iface.to_string())), "a queued announce starts its period too");
         }
+        // A queued own announce is a successful send: the packet reports
+        // sent, and no "No interfaces could process" error is raised for it.
+        let mut d3 = Destination::new_inbound(Some(Identity::new(true)), DestinationType::Single, "pace".to_string(), vec!["three".to_string()]).expect("dest");
+        Transport::register_destination(d3.clone());
+        let mut third = d3.announce(None, false, Some(iface.to_string()), None, false).expect("build announce").expect("unsent packet");
+        third.send().expect("send");
+        assert!(third.sent, "a queued own announce counts as sent");
+        assert_eq!(captured.lock().unwrap().len(), 1, "it still waits for its window");
         Transport::release_own_announces_now(now() + OWN_ANNOUNCE_SPACING_SECS + 1.0);
         // Dispatch goes through the interface's writer thread.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
