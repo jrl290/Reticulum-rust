@@ -1125,16 +1125,29 @@ impl Transport {
         true
     }
 
+    /// A receipt a proof can still deliver: outstanding (SENT), or timed out
+    /// (FAILED) — a late proof still delivers it (PARITY-AUDIT B35).
+    fn provable(receipt: &crate::packet::PacketReceipt) -> bool {
+        let status = receipt.status();
+        status == crate::packet::PacketReceipt::SENT || status == crate::packet::PacketReceipt::FAILED
+    }
+
     /// RNS/Transport.py:2730-2731, 2748-2755 (1.5.2): the receipts a PROOF
     /// can conclude. An explicit proof (EXPL_LENGTH) starts with the hash of
-    /// the packet it proves, so only receipts with that hash are candidates;
-    /// an implicit proof is only a signature, so every receipt is. Receipts
-    /// that have already concluded are left out here (the reference skips
-    /// them at :2758) so they cost no validation, least of all a round trip
-    /// to a link's actor. Clones share state with the tracked receipts.
+    /// the packet it proves, so only receipts with that hash are candidates.
+    /// An implicit proof is only a signature; it is addressed to the proved
+    /// packet's truncated hash (`Packet::generate_proof_destination`), so when
+    /// the caller passes that address (`addressed`) only receipts with that
+    /// truncated hash are candidates — the reference tries every receipt, and
+    /// with timed-out receipts kept for late proofs that would be a signature
+    /// check per retained receipt. Delivered and culled receipts are left out
+    /// (the reference skips concluded ones at :2758), so they cost no
+    /// validation, least of all a round trip to a link's actor. Clones share
+    /// state with the tracked receipts.
     fn proof_candidates(
         receipts: &[crate::packet::PacketReceipt],
         proof: &[u8],
+        addressed: Option<&[u8]>,
     ) -> Vec<crate::packet::PacketReceipt> {
         let proof_hash = if proof.len() == crate::packet::PacketReceipt::EXPL_LENGTH {
             Some(&proof[..crate::identity::HASHLENGTH / 8])
@@ -1143,24 +1156,27 @@ impl Transport {
         };
         receipts
             .iter()
-            .filter(|receipt| proof_hash.map_or(true, |hash| receipt.hash.as_slice() == hash))
-            .filter(|receipt| receipt.status() == crate::packet::PacketReceipt::SENT)
+            .filter(|receipt| match proof_hash {
+                Some(hash) => receipt.hash.as_slice() == hash,
+                None => addressed.map_or(true, |address| receipt.truncated_hash.as_slice() == address),
+            })
+            .filter(|receipt| Self::provable(receipt))
             .cloned()
             .collect()
     }
 
     /// RNS/Transport.py:2757-2761: validate each candidate that is still
-    /// SENT; one the proof concludes leaves the receipt list. Called without
-    /// the TRANSPORT lock — `validate` may be a round trip to a link's actor,
-    /// and it runs the application's delivery callback. Returns how many the
-    /// proof concluded.
+    /// provable; one the proof delivers leaves the receipt list. Called
+    /// without the TRANSPORT lock — `validate` may be a round trip to a
+    /// link's actor, and it runs the application's delivery callback.
+    /// Returns how many the proof concluded.
     fn conclude_proved_receipts<F>(candidates: Vec<crate::packet::PacketReceipt>, mut validate: F) -> usize
     where
         F: FnMut(&mut crate::packet::PacketReceipt) -> bool,
     {
         let mut concluded = 0;
         for mut receipt in candidates {
-            if receipt.status() != crate::packet::PacketReceipt::SENT {
+            if !Self::provable(&receipt) {
                 continue;
             }
             if validate(&mut receipt) {
@@ -2895,7 +2911,7 @@ impl Transport {
                 }
                 log(
                     &format!(
-                        "Receipt list over MAX_RECEIPTS ({}): {} oldest dropped, {} of them culled while still SENT",
+                        "Receipt list over MAX_RECEIPTS ({}): {} oldest dropped ({} culled while still SENT; the rest had timed out and can no longer be proved late)",
                         MAX_RECEIPTS, excess, culled
                     ),
                     LOG_WARNING,
@@ -2905,15 +2921,15 @@ impl Transport {
             }
 
             // RNS/Transport.py:754-761: every receipt is checked for timeout,
-            // and every one that has concluded — delivered, failed or culled —
-            // leaves the list. Concluded receipts used to stay until overflow
-            // pushed them out, so a late proof could still find one.
+            // and a delivered or culled one leaves the list. A timed-out
+            // (FAILED) receipt stays until MAX_RECEIPTS pushes it out, so a
+            // late proof can still find and deliver it (B35; the reference
+            // drops it here). Proof matching is by hash, so keeping them
+            // costs a comparison per proof, not a validation.
             for receipt in state.receipts.iter_mut() {
                 receipt.check_timeout();
             }
-            state
-                .receipts
-                .retain(|receipt| receipt.status() == crate::packet::PacketReceipt::SENT);
+            state.receipts.retain(Self::provable);
             state.receipts_last_checked = now();
         }
 
@@ -6466,7 +6482,11 @@ impl Transport {
                         }
                     }
                 }
-                deferred_proof_receipts = Self::proof_candidates(&state.receipts, &packet.data);
+                deferred_proof_receipts = Self::proof_candidates(
+                    &state.receipts,
+                    &packet.data,
+                    packet.destination_hash.as_deref(),
+                );
             }
         }
 
@@ -6574,7 +6594,7 @@ impl Transport {
                     // identity under the lock again.
                     let (candidates, tracked) = {
                         let state = TRANSPORT.lock().unwrap();
-                        (Self::proof_candidates(&state.receipts, &link_packet.data), state.receipts.len())
+                        (Self::proof_candidates(&state.receipts, &link_packet.data, None), state.receipts.len())
                     };
                     let candidate_count = candidates.len();
                     let validated = Self::conclude_proved_receipts(candidates, |receipt| {
@@ -7458,10 +7478,24 @@ mod tests {
         let mut explicit = named.hash.clone();
         explicit.extend_from_slice(&[0u8; 64]);
         assert_eq!(explicit.len(), crate::packet::PacketReceipt::EXPL_LENGTH);
-        let candidates = Transport::proof_candidates(&[named.clone(), other.clone()], &explicit);
+        let candidates = Transport::proof_candidates(&[named.clone(), other.clone()], &explicit, None);
         assert_eq!(candidates.iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![named.hash.clone()]);
         let implicit = [0u8; 64];
-        assert_eq!(Transport::proof_candidates(&[named, other], &implicit).len(), 2);
+        assert_eq!(Transport::proof_candidates(&[named.clone(), other.clone()], &implicit, None).len(), 2);
+        // An implicit proof is addressed to the proved packet's truncated
+        // hash: with that address, only that receipt is a candidate.
+        let addressed = Transport::proof_candidates(&[named.clone(), other.clone()], &implicit, Some(&named.truncated_hash));
+        assert_eq!(addressed.iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![named.hash.clone()]);
+        // A timed-out receipt is still a candidate; a delivered one is not.
+        other.set_status(crate::packet::PacketReceipt::FAILED);
+        named.set_status(crate::packet::PacketReceipt::DELIVERED);
+        assert_eq!(
+            Transport::proof_candidates(&[named, other.clone()], &implicit, None)
+                .iter()
+                .map(|r| r.hash.clone())
+                .collect::<Vec<_>>(),
+            vec![other.hash.clone()]
+        );
     }
 
     #[test]
@@ -7537,30 +7571,39 @@ mod tests {
         assert_eq!(receipt.status(), crate::packet::PacketReceipt::DELIVERED);
     }
 
-    /// A proof that arrives after the receipt timed out does not deliver it
-    /// too: the timeout callback has run, and only a SENT receipt can become
-    /// DELIVERED (RNS/Transport.py:2758). Before, the late proof marked the
-    /// FAILED receipt DELIVERED and ran the delivery callback as well — a
-    /// sender that deferred on the timeout then also saw a delivery.
+    /// A proof that arrives after the receipt timed out still delivers it:
+    /// the peer holds the packet, so the sender must hear so (B35 — the
+    /// reference forgets a timed-out receipt and drops the late proof). The
+    /// timeout callback has run; the delivery callback runs after it, once,
+    /// and the delivered receipt leaves the list.
     #[test]
-    fn link_proof_after_the_timeout_does_not_deliver_the_receipt() {
+    fn link_proof_after_the_timeout_still_delivers_the_receipt() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
         let proving = Identity::new(true);
-        let receipt = make_receipt(0x64, crate::packet::PacketReceipt::SENT); // past its timeout
+        let receipt = make_receipt(0x64, crate::packet::PacketReceipt::SENT);
+        // Sent half a second ago with a 0.1 s timeout: expired, but inside
+        // the §1 five-second budget the delivery callback asserts.
+        receipt.set_sent_at(now() - 0.5);
+        receipt.set_timeout(0.1);
         let delivered_hits = Arc::new(AtomicUsize::new(0));
         receipt.set_delivery_callback(counting_callback(&delivered_hits));
         let (timeout_cb, timed_out) = reporting_callback();
         receipt.set_timeout_callback(timeout_cb);
-        TRANSPORT.lock().unwrap().receipts.push(receipt.clone());
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.receipts.push(receipt.clone());
+            state.receipts_last_checked = 0.0;
+        }
 
-        // What jobs() does on its next pass, short of forgetting it.
-        receipt.clone().check_timeout();
+        // jobs() times it out, and keeps it for a late proof.
+        Transport::jobs();
         assert_eq!(
             timed_out.recv_timeout(Duration::from_secs(5)).expect("timeout callback"),
             crate::packet::PacketReceipt::FAILED
         );
+        assert_eq!(tracked_hashes(), vec![receipt.hash.clone()], "a timed-out receipt stays tracked");
 
         let (link_id, _link_guard) = runtime_link_proved_by(&proving, 0xD5);
         assert!(Transport::inbound(
@@ -7568,16 +7611,17 @@ mod tests {
             Some("test-if".to_string())
         ));
 
-        assert_eq!(receipt.status(), crate::packet::PacketReceipt::FAILED, "a timed-out receipt stays FAILED");
-        assert_eq!(delivered_hits.load(Ordering::SeqCst), 0, "and its delivery callback never runs");
+        assert_eq!(receipt.status(), crate::packet::PacketReceipt::DELIVERED, "the late proof delivers it");
+        assert_eq!(delivered_hits.load(Ordering::SeqCst), 1, "its delivery callback runs, once");
+        assert!(tracked_hashes().is_empty(), "the delivered receipt is forgotten");
     }
 
     /// RNS/Transport.py:754-761 (1.5.2): every jobs pass checks each receipt
-    /// for timeout and forgets every receipt that has concluded — delivered,
-    /// failed or culled. Before, concluded receipts stayed until overflow
-    /// drained them.
+    /// for timeout and forgets the delivered and culled ones. A timed-out
+    /// (FAILED) receipt is kept until MAX_RECEIPTS pushes it out, so a late
+    /// proof can still deliver it (B35; the reference forgets it too).
     #[test]
-    fn jobs_forgets_concluded_receipts_and_times_out_the_rest() {
+    fn jobs_forgets_delivered_and_culled_receipts_and_keeps_timed_out_ones() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = ReceiptStateRestore::new();
 
@@ -7604,8 +7648,8 @@ mod tests {
         );
         assert_eq!(
             tracked_hashes(),
-            vec![live.hash.clone()],
-            "only the receipt still waiting for its proof is tracked"
+            vec![live.hash.clone(), failed.hash.clone(), expired.hash.clone()],
+            "outstanding and timed-out receipts stay; delivered and culled ones go"
         );
     }
 

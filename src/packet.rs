@@ -728,11 +728,32 @@ impl PacketReceipt {
     /// The inner lock is released before the callback runs: the callback is
     /// handed `&PacketReceipt` and will typically call `get_status()` on it,
     /// which would deadlock against a still-held guard.
+    /// Conclude DELIVERED on a valid proof. A proof is the peer's word that
+    /// it holds the packet, so it is honoured whenever it arrives: a receipt
+    /// that already timed out (FAILED) is still delivered by a late proof,
+    /// and its delivery callback runs after the timeout callback did. The
+    /// timeout is only our estimate of how long a proof should take; telling
+    /// the user a message failed while holding proof that it arrived is wrong.
+    /// This departs from RNS 1.5.2, which forgets a receipt once it times out
+    /// (PARITY-AUDIT B35). The order is one way: a delivered receipt never
+    /// times out, and a second proof delivers nothing.
     fn mark_delivered(&self) -> bool {
         let callback = {
             let mut inner = self.lock();
-            if inner.status != PacketReceipt::SENT {
+            if inner.status != PacketReceipt::SENT && inner.status != PacketReceipt::FAILED {
                 return false;
+            }
+            if inner.status == PacketReceipt::FAILED {
+                crate::log(
+                    &format!(
+                        "Receipt {} proved after its timeout ({:.3}s after sending) — delivered late",
+                        crate::hexrep(&self.hash, false),
+                        now_seconds() - inner.sent_at
+                    ),
+                    crate::LOG_NOTICE,
+                    false,
+                    false,
+                );
             }
             inner.status = PacketReceipt::DELIVERED;
             inner.proved = true;
@@ -1123,13 +1144,18 @@ mod tests {
         (Arc::new(move |receipt: &PacketReceipt| { let _ = tx.lock().unwrap().send(receipt.status()); }), rx)
     }
 
-    // Only a SENT receipt can become DELIVERED (RNS/Transport.py:2758). A
-    // proof that arrives after the timeout fired used to deliver the FAILED
-    // receipt as well, running both callbacks for one packet.
+    // A proof that arrives after the receipt timed out still delivers it:
+    // the peer holds the packet, and the sender must be told so (B35, a
+    // departure from the reference, which forgets the timed-out receipt).
+    // The timeout callback has run; the delivery callback runs after it.
     #[test]
-    fn a_proof_after_the_timeout_does_not_deliver_the_receipt() {
+    fn a_proof_after_the_timeout_still_delivers_the_receipt() {
         let identity = Identity::new(true);
-        let mut receipt = make_receipt(identity.clone()); // sent at 0, timeout 1 s: long expired
+        let mut receipt = make_receipt(identity.clone());
+        // Sent half a second ago with a 0.1 s timeout: expired, but well
+        // inside the §1 five-second budget the delivery callback asserts.
+        receipt.set_sent_at(now_seconds() - 0.5);
+        receipt.set_timeout(0.1);
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_clone = delivered.clone();
         receipt.set_delivery_callback(Arc::new(move |_| { delivered_clone.fetch_add(1, Ordering::SeqCst); }));
@@ -1139,10 +1165,30 @@ mod tests {
         receipt.check_timeout();
         assert_eq!(timed_out.recv_timeout(Duration::from_secs(5)).expect("timeout callback"), PacketReceipt::FAILED);
 
-        assert!(!receipt.validate_proof(&explicit_proof(&identity, &receipt)), "a late proof validates nothing");
-        assert_eq!(receipt.status(), PacketReceipt::FAILED);
-        assert!(!receipt.proved());
-        assert_eq!(delivered.load(Ordering::SeqCst), 0, "the delivery callback never runs for a timed-out receipt");
+        assert!(receipt.validate_proof(&explicit_proof(&identity, &receipt)), "the late proof delivers the receipt");
+        assert_eq!(receipt.status(), PacketReceipt::DELIVERED);
+        assert!(receipt.proved());
+        assert_eq!(delivered.load(Ordering::SeqCst), 1, "the delivery callback runs, once");
+
+        receipt.check_timeout();
+        assert_eq!(receipt.status(), PacketReceipt::DELIVERED, "a delivered receipt never times out");
+        assert!(!receipt.validate_proof(&explicit_proof(&identity, &receipt)), "a second proof delivers nothing");
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    }
+
+    // A receipt Transport culled (CULLED, evicted past MAX_RECEIPTS) is no
+    // longer tracked, so nothing routes a proof to it; if one reaches it
+    // anyway it does not deliver it.
+    #[test]
+    fn a_culled_receipt_is_not_delivered() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        receipt.set_sent_at(now_seconds());
+        receipt.set_timeout(-1.0);
+        receipt.check_timeout();
+        assert_eq!(receipt.status(), PacketReceipt::CULLED);
+        assert!(!receipt.validate_proof(&explicit_proof(&identity, &receipt)));
+        assert_eq!(receipt.status(), PacketReceipt::CULLED);
     }
 
     // A second copy of the proof (it can arrive over two interfaces) does
