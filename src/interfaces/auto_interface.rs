@@ -148,6 +148,24 @@ pub struct AutoInterface {
 
 impl AutoInterface {
     pub fn new(config: AutoInterfaceConfig) -> Result<Arc<Self>, String> {
+        let interface = Self::from_config(config);
+
+        let suitable_interfaces = interface.configure_interfaces()?;
+        if suitable_interfaces == 0 {
+            log(
+                &format!("{} could not autoconfigure. This interface currently provides no connectivity.", interface),
+                crate::LOG_WARNING,
+                false,
+                false,
+            );
+        }
+
+        Ok(interface)
+    }
+
+    /// The interface before `configure_interfaces`: no socket bound and no
+    /// thread started, so tests can drive peer handling without a network.
+    pub(crate) fn from_config(config: AutoInterfaceConfig) -> Arc<Self> {
         // Parse configuration
         let group_id = config.group_id
             .unwrap_or_else(|| DEFAULT_GROUP_ID.to_string())
@@ -180,7 +198,7 @@ impl AutoInterface {
 
         let stub_config = config.stub_config.clone();
 
-        let interface = Arc::new(AutoInterface {
+        Arc::new(AutoInterface {
             name: config.name,
             hw_mtu: HW_MTU,
             online: Arc::new(AtomicBool::new(false)),
@@ -225,19 +243,7 @@ impl AutoInterface {
 
             outbound_udp_socket: Arc::new(Mutex::new(None)),
             interface_listeners: Arc::new(Mutex::new(HashMap::new())),
-        });
-
-        let suitable_interfaces = interface.configure_interfaces()?;
-        if suitable_interfaces == 0 {
-            log(
-                &format!("{} could not autoconfigure. This interface currently provides no connectivity.", interface),
-                crate::LOG_WARNING,
-                false,
-                false,
-            );
-        }
-
-        Ok(interface)
+        })
     }
 
     fn configure_interfaces(self: &Arc<Self>) -> Result<usize, String> {
@@ -853,24 +859,7 @@ impl AutoInterface {
 
             // Remove timed out peers
             for peer_addr in timed_out {
-                let mut peers = self.peers.lock().unwrap();
-                let peer_ifname = peers.get(&peer_addr).map(|info| info.ifname.clone());
-                peers.remove(&peer_addr);
-                drop(peers);
-
-                let mut spawned = self.spawned_interfaces.lock().unwrap();
-                if let Some(mut spawned_if) = spawned.remove(&peer_addr) {
-                    spawned_if.detach();
-                    spawned_if.teardown();
-                }
-                if let Some(ifname) = peer_ifname {
-                    log(
-                        &format!("{} removed peer {} on {}", self, peer_addr, ifname),
-                        crate::LOG_DEBUG,
-                        false,
-                        false,
-                    );
-                }
+                self.remove_peer(&peer_addr);
             }
 
             // Send reverse peering packets
@@ -966,6 +955,30 @@ impl AutoInterface {
         }
     }
 
+    /// Forget a peer that was not heard within the peering timeout: its
+    /// spawned interface goes offline and leaves Transport
+    /// (AutoInterface.py peer_jobs: detach, then teardown).
+    pub(crate) fn remove_peer(&self, peer_addr: &str) {
+        let mut peers = self.peers.lock().unwrap();
+        let peer_ifname = peers.get(peer_addr).map(|info| info.ifname.clone());
+        peers.remove(peer_addr);
+        drop(peers);
+
+        let mut spawned = self.spawned_interfaces.lock().unwrap();
+        if let Some(mut spawned_if) = spawned.remove(peer_addr) {
+            spawned_if.detach();
+            spawned_if.teardown();
+        }
+        if let Some(ifname) = peer_ifname {
+            log(
+                &format!("{} removed peer {} on {}", self, peer_addr, ifname),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+        }
+    }
+
     fn find_link_local(&self, ifname: &str) -> Option<String> {
         if let Ok(if_addrs) = get_if_addrs() {
             for if_addr in if_addrs {
@@ -1058,10 +1071,8 @@ impl AutoInterface {
             .unwrap()
             .insert(addr.to_string(), peer_interface);
 
-        let mut cfg = self.stub_config_template.clone();
-        cfg.name = peer_name.clone();
-        Transport::register_interface_stub_config(cfg);
-
+        // The send path exists before the stub: registering the stub online
+        // is an up-edge, and an up-listener may send through the peer at once.
         let peers_map = Arc::clone(&self.spawned_interfaces);
         let addr_key = addr.to_string();
         Transport::register_outbound_handler(
@@ -1076,6 +1087,15 @@ impl AutoInterface {
                 }
             }),
         );
+
+        // A peer exists because it was just heard, so it is online
+        // (AutoInterface.py:585). Until 2026-09-25 the stub was registered
+        // offline: Transport dropped every send to it and routes through it
+        // were unusable, so the LAN was receive-only.
+        let mut cfg = self.stub_config_template.clone();
+        cfg.name = peer_name.clone();
+        cfg.online = Some(true);
+        Transport::register_auto_interface_peer(cfg);
 
         log(
             &format!("{} added peer {} on {}", self, addr, ifname),
@@ -1260,7 +1280,7 @@ impl AutoInterfacePeer {
         }
 
         self.online = false;
-        Transport::deregister_interface_stub(&self.name);
+        Transport::deregister_auto_interface_peer(&self.name);
         Transport::unregister_outbound_handler(&self.name);
     }
 }

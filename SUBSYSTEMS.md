@@ -195,6 +195,15 @@ Transport::unpublish_destination(&self_dest_hash);
   enable), it must call `Transport::set_interface_online(name, true)`.
   This is what fires both the AppLinks re-trigger AND the published-
   destination up-edge announce (held to its period, see §2).
+- **AutoInterface peers are the exception.** A spawned peer is
+  registered online with `Transport::register_auto_interface_peer`,
+  which fires the AppLinks re-trigger but is not an announce up-edge
+  (the peer joins each published destination's schedule where it
+  stands), and is removed with `Transport::deregister_auto_interface_peer`,
+  which keeps its records of published destinations. A peer that flaps
+  across the peering timeout (22 s, 27.5 s on Android), or returns after
+  any absence, is never announced on for coming back
+  (PARITY-AUDIT-1.5.2.md B41).
 - **Down-edge notification.** Whenever an interface drops from
   `true → false`, it must call `Transport::set_interface_online(name,
   false)` so dependent subsystems can stop trying.

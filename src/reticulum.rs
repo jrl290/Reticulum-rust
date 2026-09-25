@@ -2008,6 +2008,8 @@ impl Reticulum {
                         allowed_interfaces: ai_allowed_interfaces,
                         ignored_interfaces: ai_ignored_interfaces,
                         configured_bitrate: ai_configured_bitrate,
+                        // A template: the AutoInterface itself has no stub;
+                        // each peer registers its own, online, in add_peer.
                         stub_config: stub_config.clone(),
                     };
 

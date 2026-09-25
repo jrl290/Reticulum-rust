@@ -1749,7 +1749,69 @@ impl Transport {
         if state.interfaces.iter().any(|i| i.name == config.name) {
             return;
         }
+        let iface = Self::interface_stub_from_config(config);
 
+        // An interface registered already online (spawned TCP/Backbone
+        // clients, and initial connects that completed before the stub
+        // existed) never reports a transition, so treat the registration
+        // itself as its up-edge: the sweep announces each published
+        // destination on it once, held per interface to its period.
+        if iface.online {
+            state.up_edge_pending_interfaces.insert(iface.name.clone());
+            state.published_last_checked = 0.0;
+        }
+        state.interfaces.push(iface);
+    }
+
+    /// Register a spawned AutoInterface peer, online, as
+    /// RNS/Interfaces/AutoInterface.py:585-586 does (`online = True`, then
+    /// `Transport.add_interface`, which announces nothing).
+    ///
+    /// The registration is an up-edge for the up-listeners (AppLinks can
+    /// race links over the LAN at once) but never an announce: the peer
+    /// does not enter `up_edge_pending_interfaces`, and its record for each
+    /// published destination becomes that destination's latest announce on
+    /// any interface, its own from before a flap included. A new peer and a
+    /// returning one, however long it was away, join the destination's
+    /// schedule where it stands and get its next refresh along with every
+    /// other interface. A peer comes and goes with the peering timeout
+    /// (22 s, 27.5 s on Android); its records outlive
+    /// `deregister_auto_interface_peer`, so a flap never re-announces even
+    /// where the peer was the only interface.
+    pub fn register_auto_interface_peer(config: InterfaceStubConfig) {
+        let name = config.name.clone();
+        let online = {
+            let mut state = TRANSPORT.lock().unwrap();
+            if state.interfaces.iter().any(|i| i.name == name) {
+                return;
+            }
+            let iface = Self::interface_stub_from_config(config);
+            let online = iface.online;
+            // Only the refresh sweep reads these records, and only for
+            // published destinations.
+            let mut latest: HashMap<Vec<u8>, f64> = HashMap::new();
+            for ((hash, _), at) in state.announce_sent_at.iter() {
+                if !state.published_destinations.contains_key(hash) {
+                    continue;
+                }
+                let slot = latest.entry(hash.clone()).or_insert(*at);
+                if *at > *slot {
+                    *slot = *at;
+                }
+            }
+            for (hash, at) in latest {
+                state.announce_sent_at.insert((hash, name.clone()), at);
+            }
+            state.interfaces.push(iface);
+            online
+        };
+        if online {
+            log(&format!("Interface {} registered online", name), LOG_NOTICE, false, false);
+            Self::notify_interface_up(&name);
+        }
+    }
+
+    fn interface_stub_from_config(config: InterfaceStubConfig) -> InterfaceStub {
         let mut iface = InterfaceStub::default();
         iface.name = config.name;
         iface.address = config.address;
@@ -1790,17 +1852,7 @@ impl Transport {
         iface.ifac_key = config.ifac_key;
         iface.ifac_signature = config.ifac_signature;
         iface.repr = config.repr.unwrap_or_default();
-
-        // An interface registered already online (spawned TCP/Backbone
-        // clients, and initial connects that completed before the stub
-        // existed) never reports a transition, so treat the registration
-        // itself as its up-edge: the sweep announces each published
-        // destination on it once, held per interface to its period.
-        if iface.online {
-            state.up_edge_pending_interfaces.insert(iface.name.clone());
-            state.published_last_checked = 0.0;
-        }
-        state.interfaces.push(iface);
+        iface
     }
 
     /// Re-send a `synthesize_tunnel` packet on every TCP tunnel interface
@@ -1829,13 +1881,33 @@ impl Transport {
 
     pub fn deregister_interface_stub(name: &str) {
         let mut state = TRANSPORT.lock().unwrap();
+        Self::remove_interface_stub_locked(&mut state, name);
+        state.announce_sent_at.retain(|(_, n), _| n != name);
+    }
+
+    /// Remove a spawned AutoInterface peer (timed out, or replaced by a new
+    /// peer at the same address). Unlike `deregister_interface_stub` it
+    /// keeps the peer's records of published destinations: a peer's name is
+    /// its address, so the next peer by that name is the same peer back from
+    /// a flap, and where it was the only interface its own record is the
+    /// latest one (see `register_auto_interface_peer`). Records of other
+    /// destinations go, since the refresh sweep never reads them, so what
+    /// stays is bounded by published destinations x peer addresses heard.
+    pub fn deregister_auto_interface_peer(name: &str) {
+        let mut guard = TRANSPORT.lock().unwrap();
+        let state = &mut *guard;
+        Self::remove_interface_stub_locked(state, name);
+        let published = &state.published_destinations;
+        state.announce_sent_at.retain(|(h, n), _| n != name || published.contains_key(h));
+    }
+
+    fn remove_interface_stub_locked(state: &mut TransportState, name: &str) {
         state.interfaces.retain(|iface| iface.name != name);
         state.local_client_interfaces.retain(|iface| iface.name != name);
         state.outbound_handlers.remove(name);
         state.client_announce_pacing.remove(name);
         state.client_announce_last_sent.remove(name);
         state.pending_local_announces.retain(|(_, n, _)| n != name);
-        state.announce_sent_at.retain(|(_, n), _| n != name);
         state.up_edge_pending_interfaces.remove(name);
     }
 
@@ -9485,6 +9557,317 @@ mod tests {
         Transport::unpublish_destination(&dest_hash);
         Transport::reset_announce_history();
         uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// Peers of these tests live on an interface that does not exist, so a
+    /// send that reaches a real peer handler goes nowhere.
+    const TEST_PEER_IF: &str = "rnstest0";
+
+    fn test_peer_name(addr: &str) -> String {
+        format!("AutoInterfacePeer[{}/{}]", TEST_PEER_IF, addr)
+    }
+
+    /// An AutoInterface with no socket bound and no thread started.
+    fn unconfigured_auto_interface(name: &str) -> Arc<crate::interfaces::auto_interface::AutoInterface> {
+        let mut template = InterfaceStubConfig::default();
+        template.name = name.to_string();
+        template.out = true;
+        template.mode = InterfaceStub::MODE_FULL;
+        crate::interfaces::auto_interface::AutoInterface::from_config(
+            crate::interfaces::auto_interface::AutoInterfaceConfig {
+                name: name.to_string(),
+                group_id: None,
+                discovery_scope: None,
+                discovery_port: None,
+                multicast_address_type: None,
+                data_port: None,
+                allowed_interfaces: None,
+                ignored_interfaces: None,
+                configured_bitrate: None,
+                stub_config: template,
+            },
+        )
+    }
+
+    /// Announces of `hashes` among the captured frames (other tests may
+    /// send on every online interface meanwhile).
+    fn announces_of(captured: &Arc<Mutex<Vec<Vec<u8>>>>, hashes: &[&Vec<u8>]) -> usize {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|raw| raw.first().map(|flags| flags & 0x03 == ANNOUNCE).unwrap_or(false))
+            .filter_map(|raw| announce_wire_fields(raw))
+            .filter(|(hash, _)| hashes.iter().any(|h| **h == *hash))
+            .count()
+    }
+
+    fn published_sweep() {
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+            state.published_last_announced_at = 0.0; // pacing is not under test
+        }
+        Transport::jobs();
+    }
+
+    /// An AutoInterface peer is registered online, as the reference does
+    /// (AutoInterface.py:585), so packets go out to it; a peer that times
+    /// out leaves Transport. Until 2026-09-25 peers were registered offline:
+    /// Transport dropped every send to them and routes through them were
+    /// unusable, so the LAN was receive-only.
+    #[test]
+    fn auto_interface_peers_are_registered_online() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+        }
+        let addr = "fe80::5eed:1";
+        let name = test_peer_name(addr);
+        let auto = unconfigured_auto_interface("test-auto-online");
+        auto.add_peer(addr, TEST_PEER_IF);
+
+        let stub = Transport::get_interface_list()
+            .into_iter()
+            .find(|i| i.name == name)
+            .expect("the peer is registered");
+        assert!(stub.online, "a peer is registered online");
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(&name, captured.clone());
+        let dest = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "autotest".to_string(),
+            vec!["online".to_string()],
+        )
+        .expect("plain destination");
+        let mut packet = Packet::new(
+            Some(dest),
+            b"lan".to_vec(),
+            DATA,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            Some(name.clone()),
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        packet.pack().expect("pack");
+        assert!(Transport::outbound(&mut packet), "a packet for the peer is sent, not dropped as offline");
+        assert!(
+            captured.lock().unwrap().iter().any(|raw| *raw == packet.raw),
+            "the packet reaches the peer"
+        );
+
+        auto.remove_peer(addr);
+        assert!(
+            Transport::get_interface_list().iter().all(|i| i.name != name),
+            "a timed-out peer is deregistered"
+        );
+        assert!(auto.spawned_interfaces.lock().unwrap().is_empty(), "and its spawned interface is gone");
+        uninstall_sync_outbound_handler(&name);
+    }
+
+    /// A peer's registration is an up-edge for the up-listeners (AppLinks
+    /// races links over the LAN) but not an announce edge: the reference's
+    /// Transport.add_interface announces nothing, and a peer comes and goes
+    /// with the peering timeout (22 s, 27.5 s on Android). Neither an
+    /// up-edge-only destination nor one with a refresh interval, inside its
+    /// period elsewhere, is announced on a peer for appearing.
+    #[test]
+    fn a_peer_registration_is_a_listener_edge_not_an_announce_edge() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.up_edge_pending_interfaces.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
+        }
+        let up_only = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "peer_edge_test".to_string(),
+            vec!["up_only".to_string()],
+        )
+        .expect("inbound destination");
+        let refreshed = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "peer_edge_test".to_string(),
+            vec!["refreshed".to_string()],
+        )
+        .expect("inbound destination");
+        let up_only_hash = up_only.hash.clone();
+        let refreshed_hash = refreshed.hash.clone();
+        Transport::register_destination(up_only);
+        Transport::register_destination(refreshed);
+        Transport::publish_destination(up_only_hash.clone(), None, None);
+        Transport::publish_destination(refreshed_hash.clone(), Some(Duration::from_secs(3600)), None);
+        let unpublished_hash = vec![0x5e; 16];
+        {
+            // The refreshed destination went out on a backbone a minute ago,
+            // and so did one the application announces but never published.
+            let mut state = TRANSPORT.lock().unwrap();
+            state
+                .announce_sent_at
+                .insert((refreshed_hash.clone(), "test-peer-edge-backbone".to_string()), now() - 60.0);
+            state
+                .announce_sent_at
+                .insert((unpublished_hash.clone(), "test-peer-edge-backbone".to_string()), now() - 60.0);
+        }
+
+        let addr = "fe80::5eed:2";
+        let name = test_peer_name(addr);
+        let (tx, rx) = mpsc::channel::<()>();
+        let tx = Mutex::new(tx);
+        let listened = name.clone();
+        Transport::add_interface_up_listener(Arc::new(move |up: &str| {
+            if up == listened {
+                let _ = tx.lock().unwrap().send(());
+            }
+        }));
+
+        let auto = unconfigured_auto_interface("test-auto-edge");
+        auto.add_peer(addr, TEST_PEER_IF);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the peer's registration is reported to the up-listeners");
+        {
+            let state = TRANSPORT.lock().unwrap();
+            assert!(!state.up_edge_pending_interfaces.contains(&name), "a peer is not an announce up-edge");
+            assert!(
+                !state.announce_sent_at.contains_key(&(unpublished_hash.clone(), name.clone())),
+                "only published destinations' records are copied to a peer (nothing else reads them)"
+            );
+        }
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(&name, captured.clone());
+        published_sweep();
+        published_sweep();
+        assert_eq!(
+            announces_of(&captured, &[&up_only_hash, &refreshed_hash]),
+            0,
+            "nothing is announced on a peer for appearing"
+        );
+
+        auto.remove_peer(addr);
+        Transport::unpublish_destination(&up_only_hash);
+        Transport::unpublish_destination(&refreshed_hash);
+        Transport::reset_announce_history();
+        uninstall_sync_outbound_handler(&name);
+    }
+
+    /// A peer that times out and returns is the same peer (its name is its
+    /// address). Its announce records survive the removal, so the flap
+    /// announces nothing inside the period. deregister_interface_stub
+    /// prunes records, which suits interfaces that never come back under
+    /// the same name; applied to peers, every return after the peering
+    /// timeout (22 s, 27.5 s on Android) was announced on again. A peer
+    /// away for longer than the period, while the refresh went out
+    /// elsewhere, rejoins that schedule rather than its own stale record,
+    /// so a registration never announces.
+    #[test]
+    fn a_peer_re_add_does_not_re_announce() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.up_edge_pending_interfaces.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
+        }
+        let destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "peer_readd_test".to_string(),
+            vec!["parity".to_string()],
+        )
+        .expect("inbound destination");
+        let mut app_copy = destination.clone();
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        Transport::publish_destination(dest_hash.clone(), Some(Duration::from_secs(3600)), None);
+
+        let addr = "fe80::5eed:3";
+        let name = test_peer_name(addr);
+        let auto = unconfigured_auto_interface("test-auto-readd");
+        auto.add_peer(addr, TEST_PEER_IF);
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(&name, captured.clone());
+
+        app_copy
+            .announce(None, false, None, None, true)
+            .expect("application announce");
+        assert_eq!(announces_of(&captured, &[&dest_hash]), 1, "the application's announce reaches the peer");
+        let unpublished_hash = vec![0x5e; 16];
+        {
+            // An announce of a destination that is not published.
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announce_sent_at.insert((unpublished_hash.clone(), name.clone()), now());
+        }
+
+        auto.remove_peer(addr);
+        assert!(
+            Transport::get_interface_list().iter().all(|i| i.name != name),
+            "the timed-out peer left Transport"
+        );
+        {
+            let state = TRANSPORT.lock().unwrap();
+            assert!(
+                state.announce_sent_at.contains_key(&(dest_hash.clone(), name.clone())),
+                "the peer's record of a published destination outlives it"
+            );
+            assert!(
+                !state.announce_sent_at.contains_key(&(unpublished_hash.clone(), name.clone())),
+                "its other records go with it"
+            );
+        }
+        auto.add_peer(addr, TEST_PEER_IF);
+        install_sync_outbound_handler(&name, captured.clone());
+        published_sweep();
+        published_sweep();
+        assert_eq!(
+            announces_of(&captured, &[&dest_hash]),
+            1,
+            "a peer back from a flap is not announced on again inside the period"
+        );
+
+        // Away for longer than the period, while the refresh went out on a
+        // backbone a minute ago: the peer waits for the next refresh too.
+        auto.remove_peer(addr);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.announce_sent_at.insert((dest_hash.clone(), name.clone()), now() - 7200.0);
+            state
+                .announce_sent_at
+                .insert((dest_hash.clone(), "test-peer-readd-backbone".to_string()), now() - 60.0);
+        }
+        auto.add_peer(addr, TEST_PEER_IF);
+        install_sync_outbound_handler(&name, captured.clone());
+        published_sweep();
+        published_sweep();
+        assert_eq!(
+            announces_of(&captured, &[&dest_hash]),
+            1,
+            "a peer back after longer than the period is not announced on for returning"
+        );
+
+        auto.remove_peer(addr);
+        Transport::unpublish_destination(&dest_hash);
+        Transport::reset_announce_history();
+        uninstall_sync_outbound_handler(&name);
     }
 
     /// The sweep announces a COPY of the registered destination (the lock is
