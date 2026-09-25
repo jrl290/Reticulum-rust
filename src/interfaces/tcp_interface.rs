@@ -8,30 +8,39 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // ── Global reconnect nudge ──────────────────────────────────────────────
-// A Condvar shared by all TCP client reconnect loops.  When the platform
-// layer detects that network connectivity has been restored it calls
-// `nudge_reconnect()`, which wakes every sleeping reconnect loop so they
-// can attempt an immediate connect instead of waiting out the full
-// RECONNECT_WAIT interval.
-static RECONNECT_NUDGE: once_cell::sync::Lazy<(Mutex<()>, Condvar)> =
-    once_cell::sync::Lazy::new(|| (Mutex::new(()), Condvar::new()));
+// Shared by all TCP client reconnect loops. When the platform layer sees
+// the network come back (a new network, or its own network access restored)
+// it calls `nudge_reconnect()`, and every reconnect loop attempts at once
+// instead of waiting out its backoff.
+//
+// A generation count, not a bare notify: a nudge that lands while a loop
+// is mid-attempt (connecting, not waiting) must still cut the next wait
+// short. Until 2026-09-25 such a nudge was lost and the loop slept its full
+// backoff — up to RECONNECT_WAIT_MAX — with the network already back.
+static RECONNECT_NUDGE: once_cell::sync::Lazy<(Mutex<u64>, Condvar)> =
+    once_cell::sync::Lazy::new(|| (Mutex::new(0), Condvar::new()));
 
-/// Wake all TCP client reconnect loops immediately.
-/// Safe to call from any thread, including C FFI.
+/// Wake all TCP client reconnect loops immediately, or cut their next wait
+/// short if they are mid-attempt. Safe to call from any thread, including C FFI.
 pub fn nudge_reconnect() {
     let (lock, cvar) = &*RECONNECT_NUDGE;
-    let _guard = lock.lock().unwrap();
+    let mut generation = lock.lock().unwrap();
+    *generation = generation.wrapping_add(1);
     cvar.notify_all();
 }
 
-/// Sleep for up to `secs` but return early if `nudge_reconnect()` is called.
-fn wait_or_nudge(secs: u64) {
+/// The nudge count now. A reconnect loop takes it right before an attempt:
+/// the attempt answers every nudge up to then.
+fn nudge_generation() -> u64 {
+    *RECONNECT_NUDGE.0.lock().unwrap()
+}
+
+/// Sleep for up to `secs`, or not at all once there has been a nudge since
+/// `seen` (taken with `nudge_generation`).
+fn wait_or_nudge(secs: u64, seen: u64) {
     let (lock, cvar) = &*RECONNECT_NUDGE;
-    let nudged = lock.lock().unwrap();
-    // Use wait_timeout (not wait_timeout_while) so that ANY notify_all
-    // wakes us, regardless of whether another thread consumed the flag first.
-    // We don't care about the flag value — the nudge is purely a "try now" hint.
-    let _ = cvar.wait_timeout(nudged, Duration::from_secs(secs));
+    let generation = lock.lock().unwrap();
+    let _ = cvar.wait_timeout_while(generation, Duration::from_secs(secs), |g| *g == seen);
 }
 
 /// HDLC framing for TCP Interface
@@ -555,12 +564,15 @@ impl TcpClientInterface {
 
         self.reconnecting = true;
         let mut attempts = 0;
+        let mut seen = nudge_generation();
 
         while !self.base.online {
             let shift = (attempts as u64).min(6);
             let wait_secs = (Self::RECONNECT_WAIT_BASE << shift)
                 .min(Self::RECONNECT_WAIT_MAX);
-            thread::sleep(Duration::from_secs(wait_secs));
+            // Cut short when the platform says the network is back.
+            wait_or_nudge(wait_secs, seen);
+            seen = nudge_generation();
             attempts += 1;
 
             if let Some(max_tries) = self.max_reconnect_tries {
@@ -1313,13 +1325,16 @@ impl TcpClientInterface {
                 // Start where the last episode left off when the peer keeps
                 // closing us at once; a connection that lasted resets to 0.
                 let mut attempts = short_lived_streak;
+                let mut seen = nudge_generation();
                 let reconnected = 'reconnect: loop {
                     // Exponential backoff: base * 2^attempts, capped at RECONNECT_WAIT_MAX.
                     // attempts==0 on the first iteration → 5 s; 10 s; 20 s; 40 s … 300 s.
                     let wait_secs = Self::reconnect_wait_secs(attempts);
-                    // Wait up to `wait_secs`, but wake immediately
-                    // if the platform signals that network connectivity is back.
-                    wait_or_nudge(wait_secs);
+                    // Wait up to `wait_secs`, but not once the platform has
+                    // said the network is back — including during the last
+                    // attempt (see RECONNECT_NUDGE).
+                    wait_or_nudge(wait_secs, seen);
+                    seen = nudge_generation();
                     attempts += 1;
 
                     let (detached, max_tries) = {
@@ -1855,6 +1870,41 @@ impl std::fmt::Display for TcpServerInterface {
 
 #[cfg(test)]
 mod tests {
+    /// The platform's "the network is back" nudge is never lost. A loop
+    /// takes the nudge count before each attempt, so a nudge that lands
+    /// mid-attempt (not waiting) cuts the next wait short, and one that
+    /// lands during a wait ends it. Until 2026-09-25 the nudge was a bare
+    /// notify: one that came mid-attempt was lost and the loop slept its full
+    /// backoff (on 2026-09-25 an Android phone got its network back at 01:36
+    /// and reconnected at 01:41). One test, run in order: the count is global.
+    #[test]
+    fn a_reconnect_nudge_is_never_lost() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let wait_in_thread = |seen: u64| {
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                super::wait_or_nudge(300, seen);
+                let _ = done_tx.send(());
+            });
+            done_rx
+        };
+
+        // Mid-attempt: the loop took the count, then the network came back.
+        let seen = super::nudge_generation();
+        super::nudge_reconnect();
+        assert!(
+            wait_in_thread(seen).recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a nudge during the attempt must cut the next 300 s wait short"
+        );
+
+        // Waiting: the nudge ends the wait.
+        let seen = super::nudge_generation();
+        let done = wait_in_thread(seen);
+        super::nudge_reconnect();
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok(), "a nudge ends a wait");
+    }
+
     /// A peer that accepts and immediately resets us must not be dialled
     /// every 5 s forever: each short-lived connection advances the backoff.
     #[test]

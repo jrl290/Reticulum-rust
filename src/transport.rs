@@ -920,6 +920,15 @@ pub(crate) static TRANSPORT: Lazy<FastMutex<TransportState>> = Lazy::new(|| Fast
 
 type OutboundHandler = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
+/// Called with an interface's name when it comes online (an up-edge in
+/// `Transport::set_interface_online`). An interface coming back is the
+/// readiness signal for work that failed for want of one — AppLinks
+/// attempts its links once — so no timer has to poll for it (§5).
+pub type InterfaceUpListener = Arc<dyn Fn(&str) + Send + Sync>;
+
+static INTERFACE_UP_LISTENERS: Lazy<Mutex<Vec<InterfaceUpListener>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
 static OUTBOUND_HANDLERS: Lazy<Mutex<HashMap<String, OutboundHandler>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -1893,13 +1902,37 @@ impl Transport {
         // direct paths vanished. PARITY-AUDIT-1.5.2.md B22.
         if transitioned_up {
             log(&format!("Interface {} transitioned online", name), LOG_NOTICE, false, false);
-            let mut state = TRANSPORT.lock().unwrap();
-            state.up_edge_pending_interfaces.insert(name.to_string());
-            state.published_last_checked = 0.0;
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                state.up_edge_pending_interfaces.insert(name.to_string());
+                state.published_last_checked = 0.0;
+            }
+            Self::notify_interface_up(name);
         }
         if transitioned_down {
             log(&format!("Interface {} transitioned offline", name), LOG_NOTICE, false, false);
         }
+    }
+
+    /// Be told whenever an interface comes online (see InterfaceUpListener).
+    pub fn add_interface_up_listener(listener: InterfaceUpListener) {
+        INTERFACE_UP_LISTENERS.lock().unwrap().push(listener);
+    }
+
+    /// Run the up-edge listeners on a thread of their own: the caller is an
+    /// interface's own thread, which can hold that interface's lock, and a
+    /// listener may use the interface (a link attempt sends through it).
+    fn notify_interface_up(name: &str) {
+        let listeners = INTERFACE_UP_LISTENERS.lock().unwrap().clone();
+        if listeners.is_empty() {
+            return;
+        }
+        let name = name.to_string();
+        thread::spawn(move || {
+            for listener in listeners {
+                listener(&name);
+            }
+        });
     }
 
     pub fn get_interface_list() -> Vec<InterfaceStub> {
@@ -9235,6 +9268,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(captured.lock().unwrap().len(), 2, "the release sends it");
+    }
+
+    /// An interface coming online is reported to the up-edge listeners, once
+    /// per up-edge and off the caller's thread (an interface's own thread,
+    /// which can hold its lock); a down-edge, or an interface already
+    /// online, reports nothing. AppLinks re-attempts its links on it.
+    #[test]
+    fn an_interface_up_edge_is_reported_to_the_up_listeners_once() {
+        use std::sync::mpsc;
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+        let name = "test-up-listener";
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = name.to_string();
+        stub_config.online = Some(false);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+
+        let (tx, rx) = mpsc::channel::<std::thread::ThreadId>();
+        let tx = Mutex::new(tx);
+        Transport::add_interface_up_listener(Arc::new(move |up: &str| {
+            if up == name {
+                let _ = tx.lock().unwrap().send(std::thread::current().id());
+            }
+        }));
+
+        Transport::set_interface_online(name, true);
+        let reporter = rx.recv_timeout(Duration::from_secs(5)).expect("the up-edge is reported");
+        assert_ne!(reporter, std::thread::current().id(), "reported off the caller's thread");
+
+        Transport::set_interface_online(name, true); // already online: no edge
+        Transport::set_interface_online(name, false); // a down-edge
+        // A report would arrive at once; the bound only ends the wait.
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "no up-edge, nothing reported");
+
+        Transport::set_interface_online(name, true);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "each up-edge is reported");
     }
 
     #[test]
