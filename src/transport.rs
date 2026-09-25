@@ -4572,6 +4572,28 @@ impl Transport {
                 active_paths.insert(entry.packet_hash.clone());
             }
         }
+        // Announces recorded in a tunnel are kept as well, as the reference
+        // keeps them (Transport.clean_announce_cache: path table OR tunnel
+        // paths). A tunnel puts its paths back when its endpoint reappears
+        // (restore_tunnel_paths, B32), and a path request for a restored path
+        // is answered from this cache. Until 2026-09-25 only the path table
+        // counted: while rfed reconnected to the gateway its routes lapsed,
+        // their announces were cleaned, and the gateway restored routes whose
+        // announces were gone, so it could forward to rfed's lxmf.propagation
+        // but answered no path request for it.
+        for tunnel in state.tunnels.values() {
+            for value in tunnel {
+                if let TunnelEntryValue::Paths(paths) = value {
+                    for recorded in paths.values() {
+                        for field in recorded {
+                            if let PathEntryValue::PacketHash(hash) = field {
+                                active_paths.insert(hash.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if let Ok(entries) = fs::read_dir(&target_path) {
             for entry in entries.flatten() {
@@ -8654,6 +8676,64 @@ mod tests {
             state.tunnels.remove(&tunnel_id);
             state.path_table.remove(&dest);
         }
+    }
+
+    /// A tunnel's recorded paths are restored when its endpoint reconnects,
+    /// and a path request for a restored path is answered from the announce
+    /// cache, so the cache must keep what a tunnel records even while no
+    /// live route refers to it (the reference keeps both). On 2026-09-25 the
+    /// gateway restored rfed's lxmf.propagation route over rfed's new
+    /// connection but had cleaned its announce while rfed was away, and
+    /// logged "Could not retrieve announce packet from cache" for every path
+    /// request after.
+    #[test]
+    fn announces_recorded_in_a_tunnel_survive_cache_cleaning() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let iface = "test_tunnel_cache_conn";
+        let tunnel_id = vec![0xCE; 32];
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(37)).collect();
+        let next_hop: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(41)).collect();
+        let recorded_hash = vec![0x5A; 32];
+        let unreferenced_hash = vec![0x5B; 32];
+        ensure_paths();
+        let announces = crate::reticulum::cache_path().join("announces");
+        let recorded_file = announces.join(crate::hexrep(&recorded_hash, false));
+        let unreferenced_file = announces.join(crate::hexrep(&unreferenced_hash, false));
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut stub = InterfaceStub::default();
+            stub.name = iface.to_string();
+            stub.out = true;
+            stub.online = true;
+            state.interfaces.push(stub);
+            state.path_table.remove(&dest);
+        }
+        Transport::handle_tunnel(tunnel_id.clone(), iface.to_string());
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let expires = now() + DESTINATION_TIMEOUT;
+            Transport::record_tunnel_path(&mut state, Some(iface), &dest, &next_hop, 1, expires, Some(vec![7; 10]), &recorded_hash);
+            // The endpoint went away and its live route with it: only the
+            // tunnel still refers to the announce.
+            state.path_table.remove(&dest);
+        }
+        fs::write(&recorded_file, b"announce").unwrap();
+        fs::write(&unreferenced_file, b"announce").unwrap();
+
+        Transport::clean_announce_cache();
+
+        let kept = recorded_file.exists();
+        let removed = !unreferenced_file.exists();
+        let _ = fs::remove_file(&recorded_file);
+        let _ = fs::remove_file(&unreferenced_file);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.tunnels.remove(&tunnel_id);
+            state.interfaces.retain(|i| i.name != iface);
+        }
+        assert!(kept, "the announce a tunnel records is kept");
+        assert!(removed, "an announce nothing refers to is still cleaned");
     }
 
     /// Regression: When rnsd relays a LINKREQUEST (transport_id matches our identity),
