@@ -1016,10 +1016,37 @@ impl Identity {
             Err(_) => return false,
         };
 
-        match Signature::from_bytes(&sig_bytes) {
+        let signature_valid = match Signature::from_bytes(&sig_bytes) {
             Ok(sig) => signing_pub.verify(&signed_data, &sig).is_ok(),
             Err(_) => false,
+        };
+        if !signature_valid {
+            return false;
         }
+
+        // The destination hash must be the one the announced key derives,
+        // truncated_hash(name_hash + identity_hash), as in RNS 1.5.2
+        // Identity.validate_announce. A signature proves only that the
+        // announcer holds its own key: until 2026-09-25 any node could
+        // announce another destination's hash under its own key, and every
+        // Rust node took the path and remembered the impostor's key for it.
+        // The key checked is the one the signature was verified with, and it
+        // must be the key the announce carries (the one Transport remembers).
+        if pub_key_bytes != public_key {
+            return false;
+        }
+        let mut hash_material = name_hash.to_vec();
+        hash_material.extend_from_slice(&truncated_hash(public_key));
+        if truncated_hash(&hash_material).as_slice() != dest_hash {
+            log(
+                &format!("Received invalid announce for {}: Destination mismatch.", hexrep(dest_hash, true)),
+                crate::LOG_DEBUG,
+                false,
+                false,
+            );
+            return false;
+        }
+        true
     }
 
     /// Set storage path for ratchets and known destinations
@@ -1049,6 +1076,83 @@ mod hex {
 mod tests {
     use super::*;
     use sha2::{Sha256, Digest};
+
+    /// An announce as Python RNS packs it: public_key + name_hash +
+    /// random_hash + [ratchet] + signature + app_data, the signature over
+    /// destination_hash + public_key + name_hash + random_hash + ratchet + app_data.
+    fn signed_announce(signer: &Identity, dest_hash: &[u8], name_hash: &[u8], ratchet: &[u8], app_data: &[u8]) -> Vec<u8> {
+        announce_carrying(&signer.get_public_key().unwrap(), signer, dest_hash, name_hash, ratchet, app_data)
+    }
+
+    /// The same, but carrying `public_key` while `signer` signs it.
+    fn announce_carrying(public_key: &[u8], signer: &Identity, dest_hash: &[u8], name_hash: &[u8], ratchet: &[u8], app_data: &[u8]) -> Vec<u8> {
+        let public_key = public_key.to_vec();
+        let random_hash = vec![0x5a; 10];
+        let mut signed = dest_hash.to_vec();
+        for part in [&public_key[..], name_hash, &random_hash, ratchet, app_data] {
+            signed.extend_from_slice(part);
+        }
+        let mut data = public_key.clone();
+        for part in [name_hash, &random_hash[..], ratchet, &signer.sign(&signed), app_data] {
+            data.extend_from_slice(part);
+        }
+        data
+    }
+
+    fn lxmf_delivery_of(identity: &Identity) -> (Vec<u8>, Vec<u8>) {
+        let name_hash = full_hash(b"lxmf.delivery")[..NAME_HASH_LENGTH / 8].to_vec();
+        let dest_hash = crate::destination::Destination::hash(identity.hash.as_deref(), "lxmf", &["delivery"]);
+        (dest_hash, name_hash)
+    }
+
+    fn accepts(announce: &[u8], dest_hash: &[u8], context_flag: u8) -> bool {
+        Identity::validate_announce(announce, Some(dest_hash), Some(&announce[..KEYSIZE / 8]), context_flag)
+    }
+
+    #[test]
+    fn a_destination_announcing_itself_is_accepted() {
+        let owner = Identity::new(true);
+        let (dest_hash, name_hash) = lxmf_delivery_of(&owner);
+        let plain = signed_announce(&owner, &dest_hash, &name_hash, &[], b"app");
+        assert!(accepts(&plain, &dest_hash, crate::packet::FLAG_UNSET));
+        let ratchet = vec![0x33; RATCHETSIZE / 8];
+        let with_ratchet = signed_announce(&owner, &dest_hash, &name_hash, &ratchet, &[]);
+        assert!(accepts(&with_ratchet, &dest_hash, crate::packet::FLAG_SET));
+    }
+
+    /// Until 2026-09-25 only the signature was checked, so another identity
+    /// could announce a victim's destination hash under its own key and take
+    /// over the victim's path and known key on every Rust node.
+    #[test]
+    fn an_announce_for_a_destination_the_key_does_not_derive_is_rejected() {
+        let victim = Identity::new(true);
+        let impostor = Identity::new(true);
+        let (victim_dest, name_hash) = lxmf_delivery_of(&victim);
+        let spoofed = signed_announce(&impostor, &victim_dest, &name_hash, &[], &[]);
+        assert!(!accepts(&spoofed, &victim_dest, crate::packet::FLAG_UNSET), "a correctly signed announce for someone else's hash");
+        let ratchet = vec![0x33; RATCHETSIZE / 8];
+        let spoofed_with_ratchet = signed_announce(&impostor, &victim_dest, &name_hash, &ratchet, &[]);
+        assert!(!accepts(&spoofed_with_ratchet, &victim_dest, crate::packet::FLAG_SET));
+
+        // The victim's own key under another aspect's name hash is no better.
+        let other_name = full_hash(b"lxmf.propagation")[..NAME_HASH_LENGTH / 8].to_vec();
+        let wrong_name = signed_announce(&victim, &victim_dest, &other_name, &[], &[]);
+        assert!(!accepts(&wrong_name, &victim_dest, crate::packet::FLAG_UNSET));
+    }
+
+    /// The signature is verified with the caller's key; the derivation is
+    /// checked on the key the announce carries. An announce carrying the
+    /// victim's key, signed by an impostor and verified with the impostor's
+    /// key, must not pass on the victim's derivation.
+    #[test]
+    fn the_key_verified_must_be_the_key_announced() {
+        let victim = Identity::new(true);
+        let impostor = Identity::new(true);
+        let (victim_dest, name_hash) = lxmf_delivery_of(&victim);
+        let announce = announce_carrying(&victim.get_public_key().unwrap(), &impostor, &victim_dest, &name_hash, &[], &[]);
+        let impostor_key = impostor.get_public_key().unwrap();
+        assert!(!Identity::validate_announce(&announce, Some(&victim_dest), Some(&impostor_key), crate::packet::FLAG_UNSET));
+    }
 
     /// Build the `signed_part` exactly as Python LXMF does:
     ///   hashed_part = dest_hash + source_hash + packed_payload
