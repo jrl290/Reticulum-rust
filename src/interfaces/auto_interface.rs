@@ -1296,3 +1296,65 @@ impl std::fmt::Display for AutoInterfacePeer {
         write!(f, "AutoInterfacePeer[{}/{}]", self.ifname, self.addr)
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::HashSet;
+    use std::net::Ipv6Addr;
+
+    /// A link-local address with any scope embedded in bytes 2-3 cleared
+    /// (Darwin's kernel form), so the two listings compare equal.
+    fn descoped(ip: Ipv6Addr) -> Option<Ipv6Addr> {
+        let mut octets = ip.octets();
+        if octets[0] != 0xfe || octets[1] & 0xc0 != 0x80 {
+            return None;
+        }
+        octets[2] = 0;
+        octets[3] = 0;
+        Some(Ipv6Addr::from(octets))
+    }
+
+    /// Every link-local IPv6 address the OS reports, straight from getifaddrs.
+    fn os_link_locals() -> HashSet<Ipv6Addr> {
+        let mut found = HashSet::new();
+        unsafe {
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut head) != 0 {
+                return found;
+            }
+            let mut cur = head;
+            while !cur.is_null() {
+                let addr = (*cur).ifa_addr;
+                if !addr.is_null() && (*addr).sa_family as i32 == libc::AF_INET6 {
+                    let sin6 = addr as *const libc::sockaddr_in6;
+                    if let Some(ip) = descoped(Ipv6Addr::from((*sin6).sin6_addr.s6_addr)) {
+                        found.insert(ip);
+                    }
+                }
+                cur = (*cur).ifa_next;
+            }
+            libc::freeifaddrs(head);
+        }
+        found
+    }
+
+    /// AutoInterface adopts a system interface only through its link-local
+    /// address. Until 2026-09-25 if-addrs was built without its "link-local"
+    /// feature, which drops every fe80:: address, so AutoInterface adopted
+    /// nothing on any platform ("could not autoconfigure") and never peered.
+    /// A host with no link-local address passes trivially.
+    #[test]
+    fn interface_enumeration_reports_every_link_local_address() {
+        let ours: HashSet<Ipv6Addr> = if_addrs::get_if_addrs()
+            .expect("enumerate interfaces")
+            .into_iter()
+            .filter_map(|a| match a.addr {
+                if_addrs::IfAddr::V6(v6) => descoped(v6.ip),
+                _ => None,
+            })
+            .collect();
+        for addr in os_link_locals() {
+            assert!(ours.contains(&addr), "link-local {addr} is on this host but not in the enumeration AutoInterface adopts from");
+        }
+    }
+}

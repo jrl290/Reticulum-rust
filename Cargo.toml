@@ -39,7 +39,7 @@ hmac = "=0.12.1"
 block-padding = "=0.3.3"
 libc = "0.2"
 socket2 = "0.5"
-if-addrs = "0.10"
+if-addrs = { version = "0.10", features = ["link-local"] }
 windows-sys = { version = "0.52", features = ["Win32_NetworkManagement_IpHelper", "Win32_Foundation"] }
 serialport = { version = "4.3", optional = true }
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "time"] }
