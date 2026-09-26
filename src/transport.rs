@@ -1692,13 +1692,19 @@ impl Transport {
         // Send through Transport::outbound
         let sent = Transport::outbound(&mut packet);
 
-        // Mark the interface's wants_tunnel = false
+        // Mark the interface's wants_tunnel = false. Our own tunnel id is NOT
+        // the interface's tunnel_id: that is the remote endpoint's, set only
+        // by handle_tunnel when its synthesis arrives (RNS/Transport.py
+        // synthesize_tunnel sets wants_tunnel alone). Until 2026-09-25 this
+        // wrote our id over the remote's on every synthesis, so where both
+        // ends synthesize (the gateway and rfed on the gateway's LAN) the paths
+        // learned there were recorded in no tunnel, the remote's tunnel kept
+        // its oldest records, and every restore put a stale route back.
         {
             let mut state = TRANSPORT.lock().unwrap();
             for iface in state.interfaces.iter_mut() {
                 if iface.name == interface_name {
                     iface.wants_tunnel = false;
-                    iface.tunnel_id = Some(tunnel_id.clone());
                     break;
                 }
             }
@@ -8676,6 +8682,50 @@ mod tests {
             state.tunnels.remove(&tunnel_id);
             state.path_table.remove(&dest);
         }
+    }
+
+    /// Both ends of a TCP connection synthesize a tunnel. Paths learned over
+    /// the connection belong in the REMOTE endpoint's tunnel (the one that
+    /// reappears there), so our own synthesis must not change which tunnel the
+    /// interface records into. On 2026-09-25 it did: the gateway's own
+    /// synthesis on rfed's connection replaced rfed's tunnel id, rfed's fresh
+    /// announces were recorded nowhere, and rfed's tunnel kept restoring a
+    /// route whose announce had been cleaned.
+    #[test]
+    fn our_own_synthesis_leaves_the_remote_tunnel_recording_paths() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let iface = "test_both_ends_synthesize";
+        let remote_tunnel = vec![0xAB; 32];
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(43)).collect();
+        let next_hop: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(47)).collect();
+        let saved_identity = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut stub = InterfaceStub::default();
+            stub.name = iface.to_string();
+            stub.out = true;
+            stub.online = true;
+            state.interfaces.push(stub);
+            state.identity.replace(Identity::new(true))
+        };
+        // The remote end's synthesis arrives, then we send our own.
+        Transport::handle_tunnel(remote_tunnel.clone(), iface.to_string());
+        Transport::synthesize_tunnel(iface, &format!("TCPInterface[{}]", iface));
+
+        let recorded = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let expires = now() + DESTINATION_TIMEOUT;
+            Transport::record_tunnel_path(&mut state, Some(iface), &dest, &next_hop, 1, expires, Some(vec![9; 10]), &[0x77; 32]);
+            let recorded = match state.tunnels.get(&remote_tunnel).and_then(|e| e.get(IDX_TT_PATHS)) {
+                Some(TunnelEntryValue::Paths(paths)) => paths.contains_key(&dest),
+                _ => false,
+            };
+            state.tunnels.remove(&remote_tunnel);
+            state.interfaces.retain(|i| i.name != iface);
+            state.identity = saved_identity;
+            recorded
+        };
+        assert!(recorded, "a path learned on the interface is recorded in the remote endpoint's tunnel");
     }
 
     /// A tunnel's recorded paths are restored when its endpoint reconnects,
