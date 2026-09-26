@@ -21,6 +21,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use crate::log;
 use crate::hexrep;
+use crate::known_destinations::{KnownDestination, KnownDestinationStore};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcEnc = Encryptor<Aes256>;
@@ -41,8 +42,7 @@ pub const TRUNCATED_HASHLENGTH: usize = crate::reticulum::TRUNCATED_HASHLENGTH;
 
 static KNOWN_RATCHETS: Lazy<Mutex<HashMap<Vec<u8>, RatchetEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static RATCHET_PERSIST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static KNOWN_DESTINATIONS: Lazy<Mutex<HashMap<Vec<u8>, KnownDestination>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static KNOWN_DESTINATIONS_LOADED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+static KNOWN_DESTINATIONS: Lazy<Mutex<KnownDestinations>> = Lazy::new(|| Mutex::new(KnownDestinations::default()));
 
 /// Token implementation - Modified Fernet without VERSION/TIMESTAMP overhead
 pub struct Token {
@@ -177,11 +177,43 @@ fn ratchet_entry_fresh(entry: &RatchetEntry, now: u64) -> bool {
     now <= entry.timestamp.saturating_add(known_ratchet_max_age())
 }
 
-/// Known destination data
-#[derive(Serialize, Deserialize, Clone)]
-struct KnownDestination {
-    public_key: Vec<u8>,
-    app_data: Option<Vec<u8>>,
+/// Known destinations in memory, and the store they persist to
+/// (crate::known_destinations).
+#[derive(Default)]
+struct KnownDestinations {
+    /// The storage path the map was loaded from; None until first use.
+    path: Option<PathBuf>,
+    map: HashMap<Vec<u8>, KnownDestination>,
+    /// None when the store could not be opened: the map still works, and
+    /// nothing persists this run (logged once, at open).
+    store: Option<KnownDestinationStore>,
+}
+
+impl KnownDestinations {
+    /// Load from the current storage path on first use, and again if it
+    /// changed (a stack started again in the same process with another path).
+    fn ensure_loaded(&mut self) {
+        let path = crate::reticulum::storage_path();
+        if self.path.as_ref() == Some(&path) {
+            return;
+        }
+        match KnownDestinationStore::open(&path) {
+            Ok((store, map)) => {
+                self.map = map;
+                self.store = Some(store);
+            }
+            Err(e) => {
+                self.store = None;
+                log(
+                    format!("Known destinations will not be saved this run: {} could not be opened: {e}", path.display()),
+                    crate::LOG_ERROR,
+                    false,
+                    false,
+                );
+            }
+        }
+        self.path = Some(path);
+    }
 }
 
 /// Cryptographic identity for encryption, signing, and authentication
@@ -785,48 +817,44 @@ impl Identity {
 
     // ===== Known Destinations =====
 
-    fn load_known_destinations_if_needed() {
-        let mut loaded = KNOWN_DESTINATIONS_LOADED.lock().unwrap();
-        if *loaded {
-            return;
-        }
-
-        let storage_path = crate::reticulum::storage_path();
-        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
-
-        if let Ok(map) = Self::load_known_destinations(&storage_path) {
-            *destinations = map;
-        }
-
-        *loaded = true;
+    /// Remember an announced destination's key (and app data, when the
+    /// announce carried any). Persisted row by row (crate::known_destinations):
+    /// a repeated announce writes nothing. The map is updated even when the
+    /// write fails; the error is returned.
+    pub fn remember_destination(destination_hash: &[u8], public_key: &[u8], app_data: Option<Vec<u8>>) -> Result<(), String> {
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        let Some(entry) = crate::known_destinations::merge(
+            known.map.get(destination_hash),
+            public_key,
+            app_data,
+            unix_now_secs(),
+        ) else {
+            return Ok(());
+        };
+        let stored = match &known.store {
+            Some(store) => store.put(destination_hash, &entry),
+            None => Ok(()),
+        };
+        known.map.insert(destination_hash.to_vec(), entry);
+        stored
     }
 
-    pub fn remember_destination(destination_hash: &[u8], public_key: &[u8], app_data: Option<Vec<u8>>) -> Result<(), String> {
-        Self::load_known_destinations_if_needed();
-
-        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        let entry = destinations.entry(destination_hash.to_vec()).or_insert(KnownDestination {
-            public_key: public_key.to_vec(),
-            app_data: None,
-        });
-
-        if entry.public_key != public_key {
-            entry.public_key = public_key.to_vec();
+    /// Write a consistent copy of the known destinations database to
+    /// `target` (for the iOS notification extension's own storage).
+    pub fn snapshot_known_destinations(target: &Path) -> Result<(), String> {
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        match &known.store {
+            Some(store) => store.snapshot_to(target),
+            None => Err("known destinations store is not open".to_string()),
         }
-
-        if app_data.is_some() {
-            entry.app_data = app_data;
-        }
-
-        let storage_path = crate::reticulum::storage_path();
-        Self::save_known_destinations(&destinations, &storage_path)?;
-        Ok(())
     }
 
     pub fn recall(destination_hash: &[u8]) -> Option<Identity> {
-        Self::load_known_destinations_if_needed();
-        let destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        let entry = destinations.get(destination_hash)?;
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        let entry = known.map.get(destination_hash)?;
         Identity::from_public_key(&entry.public_key).ok()
     }
 
@@ -834,9 +862,9 @@ impl Identity {
     /// Scans all known destinations for a matching public-key hash — O(n) but
     /// only called on subscribe/fanout paths, not hot paths.
     pub fn recall_from_identity_hash(identity_hash: &[u8]) -> Option<Identity> {
-        Self::load_known_destinations_if_needed();
-        let destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        for entry in destinations.values() {
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        for entry in known.map.values() {
             if truncated_hash(&entry.public_key) == identity_hash {
                 return Identity::from_public_key(&entry.public_key).ok();
             }
@@ -845,75 +873,36 @@ impl Identity {
     }
 
     pub fn recall_app_data(destination_hash: &[u8]) -> Option<Vec<u8>> {
-        Self::load_known_destinations_if_needed();
-        let destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        destinations.get(destination_hash).and_then(|entry| entry.app_data.clone())
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        known.map.get(destination_hash).and_then(|entry| entry.app_data.clone())
     }
 
     pub fn recall_public_key(destination_hash: &[u8]) -> Option<Vec<u8>> {
-        Self::load_known_destinations_if_needed();
-        let destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        destinations.get(destination_hash).map(|entry| entry.public_key.clone())
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        known.map.get(destination_hash).map(|entry| entry.public_key.clone())
     }
 
-    /// Test-only: inject a known destination in-memory without disk I/O
+    /// Test-only: inject a known destination in memory, not into storage.
+    /// Loads first, so a later load does not replace it.
     #[cfg(test)]
     pub fn remember_destination_in_memory(destination_hash: &[u8], public_key: &[u8]) {
-        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        destinations.insert(destination_hash.to_vec(), KnownDestination {
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        known.map.insert(destination_hash.to_vec(), KnownDestination {
             public_key: public_key.to_vec(),
             app_data: None,
+            last_seen: unix_now_secs(),
         });
     }
 
-    /// Test-only: remove a known destination from in-memory store
+    /// Test-only: remove a known destination from memory, not from storage.
     #[cfg(test)]
     pub fn forget_destination_in_memory(destination_hash: &[u8]) {
-        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
-        destinations.remove(destination_hash);
-    }
-
-    // ===== Known Destinations Storage =====
-    
-    /// Save known destinations to disk
-    fn save_known_destinations(
-        destinations: &HashMap<Vec<u8>, KnownDestination>,
-        storage_path: &Path,
-    ) -> Result<(), String> {
-        let known_file = storage_path.join("known_destinations");
-        let data = rmp_serde::to_vec(destinations)
-            .map_err(|e| format!("Failed to serialize destinations: {}", e))?;
-        fs::write(known_file, data)
-            .map_err(|e| format!("Failed to write destinations: {}", e))
-    }
-
-    /// Load known destinations from disk
-    fn load_known_destinations(storage_path: &Path) -> Result<HashMap<Vec<u8>, KnownDestination>, String> {
-        let known_file = storage_path.join("known_destinations");
-        if !known_file.exists() {
-            return Ok(HashMap::new());
-        }
-
-        let data = fs::read(known_file)
-            .map_err(|e| format!("Failed to read destinations: {}", e))?;
-
-        if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, KnownDestination>>(&data) {
-            return Ok(map);
-        }
-
-        let legacy = rmp_serde::from_slice::<HashMap<Vec<u8>, Vec<u8>>>(&data)
-            .map_err(|e| format!("Failed to deserialize destinations: {}", e))?;
-        let mut upgraded = HashMap::new();
-        for (hash, public_key) in legacy {
-            upgraded.insert(
-                hash,
-                KnownDestination {
-                    public_key,
-                    app_data: None,
-                },
-            );
-        }
-        Ok(upgraded)
+        let mut known = KNOWN_DESTINATIONS.lock().unwrap();
+        known.ensure_loaded();
+        known.map.remove(destination_hash);
     }
 
     // ===== Announce Validation =====

@@ -906,13 +906,12 @@ impl Destination {
 		let file_data = to_vec(&persisted)
 			.map_err(|e| format!("Failed to serialize persisted ratchets: {}", e))?;
 
-		// Atomic write: write to .tmp then rename
+		// Atomic write: write to .tmp then rename over the old file (the
+		// reference's os.replace). Removing the old file first, as until
+		// 2026-09-26, left a moment with no ratchet file at all.
 		let tmp_path = format!("{}.tmp", ratchets_path);
 		std::fs::write(&tmp_path, &file_data)
 			.map_err(|e| format!("Failed to write ratchet file: {}", e))?;
-		if std::path::Path::new(ratchets_path).exists() {
-			let _ = std::fs::remove_file(ratchets_path);
-		}
 		std::fs::rename(&tmp_path, ratchets_path)
 			.map_err(|e| format!("Failed to rename ratchet file: {}", e))?;
 

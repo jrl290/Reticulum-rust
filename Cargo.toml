@@ -38,6 +38,10 @@ cbc = "=0.1.2"
 hmac = "=0.12.1"
 block-padding = "=0.3.3"
 libc = "0.2"
+# Known destinations store (src/known_destinations.rs). 0.31 with bundled
+# SQLite, as apns-bridge and fcm-bridge use: libsqlite3-sys links one native
+# sqlite3, so every crate in a build must resolve the same version.
+rusqlite = { version = "0.31", features = ["bundled"] }
 socket2 = "0.5"
 if-addrs = { version = "0.10", features = ["link-local"] }
 windows-sys = { version = "0.52", features = ["Win32_NetworkManagement_IpHelper", "Win32_Foundation"] }

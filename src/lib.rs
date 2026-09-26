@@ -18,6 +18,7 @@ pub mod destination;
 pub mod config;
 pub mod discovery;
 pub mod identity;
+pub(crate) mod known_destinations;
 pub mod interface_writer;
 pub mod interfaces;
 pub mod link;
