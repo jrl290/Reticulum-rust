@@ -1498,6 +1498,24 @@ impl Transport {
         });
     }
 
+    /// Replace the app_data of a destination that is published, and only if
+    /// it is: the check and the write happen under one lock. Returns whether
+    /// an entry was updated. A caller that only wants to keep an existing
+    /// publication current must use this, not `published_destinations()`
+    /// followed by `publish_destination()`: an `unpublish_destination` in
+    /// between would be undone, and the daemon would announce again after
+    /// the application stopped it.
+    pub fn update_published_app_data(destination_hash: &[u8], app_data: Option<Vec<u8>>) -> bool {
+        let mut state = TRANSPORT.lock().unwrap();
+        match state.published_destinations.get_mut(destination_hash) {
+            Some(entry) => {
+                entry.app_data = app_data;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Remove a destination from the announce daemon's published set.
     /// Does not send a "goodbye" announce; the destination simply stops
     /// being auto-announced.
@@ -12079,5 +12097,32 @@ mod route_eviction_tests {
         assert_eq!(d.len(), 2);
         let a = d.iter().find(|e| e.receiving_interface.as_deref() == Some("A")).unwrap();
         assert_eq!((a.hops, a.timestamp), (1, 3.0));
+    }
+}
+
+#[cfg(test)]
+mod published_app_data_tests {
+    use super::*;
+
+    /// `update_published_app_data` keeps a publication current and never
+    /// creates one: a name or stamp-cost change that lands after an
+    /// unpublish must not put the destination back in the announce set.
+    #[test]
+    fn updating_app_data_never_republishes() {
+        let hash = crate::identity::Identity::get_random_hash();
+        assert!(!Transport::update_published_app_data(&hash, Some(vec![1])), "nothing to update");
+        assert!(!Transport::is_published(&hash), "an update must not publish");
+
+        Transport::publish_destination(hash.clone(), Some(Duration::from_secs(1800)), Some(vec![0]));
+        TRANSPORT.lock().unwrap().published_destinations.get_mut(&hash).unwrap().last_announced_at = 42.0;
+        assert!(Transport::update_published_app_data(&hash, Some(vec![2])));
+        let entry = TRANSPORT.lock().unwrap().published_destinations.get(&hash).cloned().unwrap();
+        assert_eq!(entry.app_data, Some(vec![2]));
+        assert_eq!(entry.refresh_interval, Some(1800.0), "the interval is kept");
+        assert_eq!(entry.last_announced_at, 42.0, "the announce schedule is kept");
+
+        Transport::unpublish_destination(&hash);
+        assert!(!Transport::update_published_app_data(&hash, Some(vec![3])));
+        assert!(!Transport::is_published(&hash), "an unpublish stays unpublished");
     }
 }
