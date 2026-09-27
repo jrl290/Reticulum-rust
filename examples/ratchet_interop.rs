@@ -99,8 +99,8 @@ fn file_ratchets(path: &Path) -> Result<Vec<Vec<u8>>, String> {
         .ok_or("ratchets is not an array")?
         .iter()
         .map(|v| {
-            // The reference writes each ratchet as bin; this stack's
-            // `to_vec(&Vec<Vec<u8>>)` writes an array of ints. Read either.
+            // Each ratchet is bin, as the reference writes it; this stack
+            // wrote arrays of ints until 2026-09-27. Read either.
             if let Some(b) = v.as_slice() {
                 return Ok(b.to_vec());
             }

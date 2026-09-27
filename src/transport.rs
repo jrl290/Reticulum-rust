@@ -561,10 +561,10 @@ pub struct TransportState {
     pub client_announce_last_sent: HashMap<String, f64>,
     /// Announces deferred until their pacing window opens: (dispatch_at, iface_name, raw_bytes).
     pub pending_local_announces: Vec<(f64, String, Vec<u8>)>,
-    /// App-opted-in destinations managed by Transport's announce daemon.
-    /// Keyed by destination hash. See `PublishedDestination` and
+    /// App-opted-in destinations managed by Transport's announce daemon,
+    /// in publish order. See `PublishedSet`, `PublishedDestination` and
     /// `Transport::publish_destination`.
-    pub published_destinations: HashMap<Vec<u8>, PublishedDestination>,
+    pub published_destinations: PublishedSet,
     /// Wall-clock of the last `published_destinations` refresh sweep.
     pub published_last_checked: f64,
     /// How often jobs() examines the published set for due refreshes.
@@ -765,6 +765,79 @@ pub struct PublishedDestination {
     /// Optional app_data attached to each announce. When `None`, the
     /// destination's currently-configured app_data is used.
     pub app_data: Option<Vec<u8>>,
+}
+
+/// The published destinations, in publish order: the order in which
+/// `publish_destination` was first called for each hash. Publishing a hash
+/// already in the set updates its entry in place and keeps its place;
+/// unpublishing and publishing again puts it at the end.
+///
+/// Every announce sweep walks this order, so a node's first announce on an
+/// interface that comes up is the destination it published first (James,
+/// 2026-09-27: "When rfed restarts, the first announce should be
+/// rfed.link"). It was a HashMap until then, and the sweep sorted by hash,
+/// so which destination went out first, and which waited longest in the
+/// interface's paced queue, had nothing to do with the application.
+///
+/// A published set is a handful of entries per node, so lookups are a scan.
+#[derive(Clone, Debug, Default)]
+pub struct PublishedSet {
+    entries: Vec<(Vec<u8>, PublishedDestination)>,
+}
+
+impl PublishedSet {
+    fn position(&self, destination_hash: &[u8]) -> Option<usize> {
+        self.entries.iter().position(|(h, _)| h.as_slice() == destination_hash)
+    }
+
+    pub fn get(&self, destination_hash: &[u8]) -> Option<&PublishedDestination> {
+        self.position(destination_hash).map(|i| &self.entries[i].1)
+    }
+
+    pub fn get_mut(&mut self, destination_hash: &[u8]) -> Option<&mut PublishedDestination> {
+        match self.position(destination_hash) {
+            Some(i) => Some(&mut self.entries[i].1),
+            None => None,
+        }
+    }
+
+    pub fn contains_key(&self, destination_hash: &[u8]) -> bool {
+        self.position(destination_hash).is_some()
+    }
+
+    /// Insert or update. An existing entry keeps its place; a new one goes
+    /// to the end. Returns the entry it replaced.
+    pub fn insert(&mut self, destination_hash: Vec<u8>, entry: PublishedDestination) -> Option<PublishedDestination> {
+        match self.position(&destination_hash) {
+            Some(i) => Some(std::mem::replace(&mut self.entries[i].1, entry)),
+            None => {
+                self.entries.push((destination_hash, entry));
+                None
+            }
+        }
+    }
+
+    /// Remove, keeping the order of the others.
+    pub fn remove(&mut self, destination_hash: &[u8]) -> Option<PublishedDestination> {
+        self.position(destination_hash).map(|i| self.entries.remove(i).1)
+    }
+
+    /// The entries in publish order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &PublishedDestination)> {
+        self.entries.iter().map(|(h, p)| (h, p))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[derive(Clone)]
@@ -1494,6 +1567,11 @@ impl Transport {
     /// updates the existing entry (e.g. to change the refresh interval
     /// or app_data) without re-announcing.
     ///
+    /// Automatic announces go in publish order: the destination published
+    /// first is announced first on an interface that comes up, the rest
+    /// after it, spaced by the interface's pacing. An update keeps the
+    /// destination's place; unpublishing and publishing again puts it last.
+    ///
     /// The destination must already be registered (i.e. present in
     /// `state.destinations`) before publishing — this call only records
     /// the publication policy; it does not register the destination.
@@ -1587,7 +1665,8 @@ impl Transport {
         now_ts - last >= period
     }
 
-    /// Return a snapshot of currently-published destinations.
+    /// Return a snapshot of currently-published destinations, in publish
+    /// order.
     pub fn published_destinations() -> Vec<(Vec<u8>, PublishedDestination)> {
         let state = TRANSPORT.lock().unwrap();
         state.published_destinations.iter()
@@ -3363,10 +3442,13 @@ impl Transport {
             // (RNS/Transport.py outbound(): an untargeted announce is not
             // sent on MODE_ACCESS_POINT), and a targeted announce would
             // bypass that rule, so they are left out here.
-            let online: Vec<String> = state.interfaces.iter()
+            let mut online: Vec<String> = state.interfaces.iter()
                 .filter(|i| i.online && i.mode != InterfaceStub::MODE_ACCESS_POINT)
                 .map(|i| i.name.clone())
                 .collect();
+            online.sort();
+            // Walked in publish order, destination-major: every due pair of
+            // the first-published destination comes before any of the next.
             let mut due: Vec<(Vec<u8>, Option<Vec<u8>>, String)> = Vec::new();
             for (h, p) in state.published_destinations.iter() {
                 let period = p.refresh_interval.unwrap_or(AUTO_ANNOUNCE_HOLDOFF_SECS);
@@ -3385,8 +3467,10 @@ impl Transport {
             } else if now_ts - state.published_last_announced_at >= LOCAL_CLIENT_ANNOUNCE_PACE {
                 // Snapshot the matching destinations so we can release the
                 // lock before invoking announce() (see deadlock note above).
-                // Sorted by hash then interface so the drain order is
-                // deterministic.
+                // They stay in `due` order, publish order then interface, so
+                // the first announce on an interface that came up is the
+                // destination published first. (Until 2026-09-27 this sorted
+                // by hash, which the application does not choose.)
                 let mut candidates: Vec<(Vec<u8>, Option<Vec<u8>>, String, Destination)> = due.iter()
                     .filter_map(|(hash, app_data, iface)| {
                         state.destinations.iter().find(|d|
@@ -3396,7 +3480,6 @@ impl Transport {
                         ).map(|orig| (hash.clone(), app_data.clone(), iface.clone(), orig.clone()))
                     })
                     .collect();
-                candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
                 let selected = if candidates.is_empty() { None } else { Some(candidates.remove(0)) };
                 let missing: Vec<Vec<u8>> = if selected.is_some() {
                     // Real work to do — keep draining. Unregistered hashes are
@@ -9826,6 +9909,133 @@ mod tests {
         Transport::unpublish_destination(&dest_hash);
         Transport::reset_announce_history();
         uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// Publishing a hash already published updates it in place and keeps its
+    /// place; unpublishing and publishing again puts it last.
+    #[test]
+    fn republishing_keeps_the_publish_order_place() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b, c) = (vec![0xa1; 16], vec![0xb2; 16], vec![0xc3; 16]);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_destinations.clear();
+        }
+        // Published in an order that is neither ascending nor descending.
+        Transport::publish_destination(b.clone(), None, None);
+        Transport::publish_destination(c.clone(), None, None);
+        Transport::publish_destination(a.clone(), None, None);
+        let order = || Transport::published_destinations().into_iter().map(|(h, _)| h).collect::<Vec<_>>();
+        assert_eq!(order(), vec![b.clone(), c.clone(), a.clone()], "publish order");
+
+        Transport::publish_destination(b.clone(), Some(Duration::from_secs(60)), Some(vec![7]));
+        assert_eq!(order(), vec![b.clone(), c.clone(), a.clone()], "re-publishing keeps the place");
+        let entry = Transport::published_destinations().into_iter().find(|(h, _)| *h == b).unwrap().1;
+        assert_eq!((entry.refresh_interval, entry.app_data), (Some(60.0), Some(vec![7])), "and updates the entry");
+        assert!(Transport::update_published_app_data(&c, Some(vec![8])));
+        assert_eq!(order(), vec![b.clone(), c.clone(), a.clone()], "updating app_data keeps the place");
+
+        Transport::unpublish_destination(&b);
+        assert_eq!(order(), vec![c.clone(), a.clone()], "unpublishing keeps the others' order");
+        Transport::publish_destination(b.clone(), None, None);
+        assert_eq!(order(), vec![c.clone(), a.clone(), b.clone()], "publishing again goes to the end");
+
+        for h in [&a, &b, &c] {
+            Transport::unpublish_destination(h);
+        }
+    }
+
+    /// An interface that comes up gets the published destinations in publish
+    /// order: the first straight away, the rest from its paced queue in that
+    /// order (James, 2026-09-27: "When rfed restarts, the first announce
+    /// should be rfed.link"). Until then the sweep went in hash order.
+    #[test]
+    fn an_up_edge_announces_published_destinations_in_publish_order() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let iface = "test-publish-order";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.up_edge_pending_interfaces.clear();
+            state.last_mgmt_announce = now() + 60.0; // suppress mgmt sweep
+        }
+        let mut dests: Vec<Destination> = (0..4)
+            .map(|i| {
+                Destination::new_inbound(
+                    Some(Identity::new(true)),
+                    DestinationType::Single,
+                    "publish_order_test".to_string(),
+                    vec![format!("d{}", i)],
+                )
+                .expect("inbound destination")
+            })
+            .collect();
+        // Publish in descending hash order, so publish order is not hash order.
+        dests.sort_by(|x, y| y.hash.cmp(&x.hash));
+        let hashes: Vec<Vec<u8>> = dests.iter().map(|d| d.hash.clone()).collect();
+        for d in dests {
+            Transport::register_destination(d);
+        }
+        for h in &hashes {
+            Transport::publish_destination(h.clone(), None, None); // up-edges only
+        }
+        // hashes[0] re-published (keeps its place); hashes[1] unpublished and
+        // published again (goes to the end).
+        Transport::publish_destination(hashes[0].clone(), None, Some(vec![1]));
+        Transport::unpublish_destination(&hashes[1]);
+        Transport::publish_destination(hashes[1].clone(), None, None);
+        let expected = vec![hashes[0].clone(), hashes[2].clone(), hashes[3].clone(), hashes[1].clone()];
+        let mut by_hash = expected.clone();
+        by_hash.sort();
+        assert_ne!(expected, by_hash, "the test needs publish order to differ from hash order");
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface, captured.clone());
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface.to_string();
+        stub_config.online = Some(false);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+        Transport::set_interface_online(iface, true);
+
+        // One sweep announce per tick; the first leaves at once, the rest
+        // queue behind the interface's spacing window.
+        for _ in 0..expected.len() {
+            published_sweep();
+        }
+        let sent_order = |c: &Arc<Mutex<Vec<Vec<u8>>>>| -> Vec<Vec<u8>> {
+            c.lock()
+                .unwrap()
+                .iter()
+                .filter(|raw| raw.first().map(|flags| flags & 0x03 == ANNOUNCE).unwrap_or(false))
+                .filter_map(|raw| announce_wire_fields(raw))
+                .map(|(h, _)| h)
+                .filter(|h| expected.contains(h))
+                .collect()
+        };
+        assert_eq!(sent_order(&captured), vec![expected[0].clone()], "the first-published destination goes out first");
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let queued: Vec<Vec<u8>> = state.interfaces.iter().find(|i| i.name == iface).unwrap()
+                .own_announce_queue.iter().map(|(d, _)| d.clone()).collect();
+            assert_eq!(queued, expected[1..].to_vec(), "the rest wait in publish order");
+        }
+        let t0 = now();
+        for k in 1..expected.len() {
+            Transport::release_own_announces_now(t0 + k as f64 * (OWN_ANNOUNCE_SPACING_SECS + 1.0));
+        }
+        assert_eq!(sent_order(&captured), expected, "the paced queue releases in publish order");
+
+        for h in &hashes {
+            Transport::unpublish_destination(h);
+        }
+        Transport::reset_announce_history();
+        uninstall_sync_outbound_handler(iface);
     }
 
     /// Peers of these tests live on an interface that does not exist, so a

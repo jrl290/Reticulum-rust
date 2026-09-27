@@ -1,6 +1,5 @@
 use crate::identity::{Identity, full_hash, truncated_hash, Token};
 use crate::packet::{Packet, LINKREQUEST, DATA, PATH_RESPONSE as PATHRESPONSE, NONE, FLAG_SET, FLAG_UNSET};
-use rmp_serde::{decode::from_slice, encode::to_vec};
 use std::collections::HashMap;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +37,73 @@ fn write_ratchet_file_atomically(path: &str, data: &[u8]) -> Result<(), String> 
 	std::fs::rename(&tmp_path, path)
 		.map_err(|e| format!("Failed to rename ratchet file {} -> {}: {}", tmp_path, path, e))?;
 	Ok(())
+}
+
+/// The ratchet list as RNS/Destination.py `_persist_ratchets` packs it
+/// (`umsgpack.packb(self.ratchets)`): a msgpack array of bin, newest first.
+/// This is the data the file's signature covers.
+///
+/// Until 2026-09-27 this was `rmp_serde::to_vec(&Vec<Vec<u8>>)`, which
+/// writes each ratchet as an array of integers: the reference's
+/// `_reload_ratchets` then loaded lists of ints, not ratchet keys
+/// (CHECK_THESE_THINGS_FIRST.md §11; PARITY-AUDIT-1.5.2.md A30).
+/// `unpack_ratchets` still reads those files.
+fn pack_ratchets(ratchets: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+	let value = rmpv::Value::Array(ratchets.iter().map(|r| rmpv::Value::Binary(r.clone())).collect());
+	let mut out = Vec::new();
+	rmpv::encode::write_value(&mut out, &value)
+		.map_err(|e| format!("Failed to serialize ratchets: {}", e))?;
+	Ok(out)
+}
+
+/// The ratchet list from the signed data of a ratchet file: an array whose
+/// items are bin (the reference, and this stack from 2026-09-27) or arrays
+/// of byte-valued integers (this stack before).
+fn unpack_ratchets(packed: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+	let value = rmpv::decode::read_value(&mut &packed[..])
+		.map_err(|e| format!("Failed to deserialize ratchet keys: {}", e))?;
+	let items = value.as_array().ok_or("Ratchet keys are not an array")?;
+	items
+		.iter()
+		.map(|item| match item {
+			rmpv::Value::Binary(b) => Ok(b.clone()),
+			rmpv::Value::Array(ints) => ints
+				.iter()
+				.map(|n| n.as_u64().filter(|n| *n <= 255).map(|n| n as u8)
+					.ok_or_else(|| "Ratchet key array holds a non-byte".to_string()))
+				.collect(),
+			other => Err(format!("Ratchet key is neither bin nor a byte array: {}", other)),
+		})
+		.collect()
+}
+
+/// The ratchet file: {"signature": bin, "ratchets": bin} in the reference's
+/// key order, so the file is byte for byte the one Python would write.
+fn pack_ratchet_file(signature: &[u8], packed_ratchets: &[u8]) -> Result<Vec<u8>, String> {
+	let value = rmpv::Value::Map(vec![
+		(rmpv::Value::from("signature"), rmpv::Value::Binary(signature.to_vec())),
+		(rmpv::Value::from("ratchets"), rmpv::Value::Binary(packed_ratchets.to_vec())),
+	]);
+	let mut out = Vec::new();
+	rmpv::encode::write_value(&mut out, &value)
+		.map_err(|e| format!("Failed to serialize persisted ratchets: {}", e))?;
+	Ok(out)
+}
+
+/// (signature, signed ratchet data) from a ratchet file, in either key order.
+fn unpack_ratchet_file(file_data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+	let value = rmpv::decode::read_value(&mut &file_data[..])
+		.map_err(|e| format!("Failed to deserialize ratchet file: {}", e))?;
+	let map = value.as_map().ok_or("Ratchet file is not a map")?;
+	let field = |name: &str| -> Option<Vec<u8>> {
+		map.iter()
+			.find(|(k, _)| k.as_str() == Some(name))
+			.and_then(|(_, v)| v.as_slice())
+			.map(|b| b.to_vec())
+	};
+	let signature = field("signature").ok_or("Missing signature in ratchet file")?;
+	let packed = field("ratchets").ok_or("Missing ratchets in ratchet file")?;
+	Ok((signature, packed))
 }
 
 /// Ratchet state shared by every clone of one destination: see
@@ -986,12 +1052,7 @@ impl Destination {
 		// another had already announced.
 		let shared_cell = Arc::clone(&self.ratchet_shared);
 		let mut shared = shared_cell.lock().unwrap_or_else(|e| e.into_inner());
-		if shared.generation != self.ratchet_generation && shared.ratchets.is_some() {
-			// Another clone rotated since this one last synced: adopt it.
-			self.ratchets = shared.ratchets.clone();
-			self.latest_ratchet_time = shared.latest_ratchet_time;
-			self.ratchet_generation = shared.generation;
-		}
+		self.adopt_shared_ratchets(&shared);
 		let now = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.map(|d| d.as_secs())
@@ -1019,6 +1080,17 @@ impl Destination {
 		Ok(false)
 	}
 	
+	/// If another clone rotated since this copy last synced with the shared
+	/// ratchet state, take its list (Python has one live object, so there is
+	/// only ever one list). Called with the shared state locked.
+	fn adopt_shared_ratchets(&mut self, shared: &SharedRatchetState) {
+		if shared.generation != self.ratchet_generation && shared.ratchets.is_some() {
+			self.ratchets = shared.ratchets.clone();
+			self.latest_ratchet_time = shared.latest_ratchet_time;
+			self.ratchet_generation = shared.generation;
+		}
+	}
+
 	/// Clean up old ratchets, keeping only retained_ratchets count
 	fn _clean_ratchets(&mut self) {
 		if let Some(ratchets) = &mut self.ratchets {
@@ -1037,9 +1109,9 @@ impl Destination {
 		let ratchets_path = self.ratchets_path.as_ref().ok_or("No ratchets path set")?;
 		let ratchets = self.ratchets.as_ref().ok_or("No ratchets to persist")?;
 
-		// Serialize the ratchet private keys list as msgpack
-		let packed_ratchets = to_vec(ratchets)
-			.map_err(|e| format!("Failed to serialize ratchets: {}", e))?;
+		// The reference's file, byte for byte: umsgpack.packb(self.ratchets),
+		// signed, in {"signature": bin, "ratchets": bin}.
+		let packed_ratchets = pack_ratchets(ratchets)?;
 
 		// Sign the packed ratchets with our identity
 		let signature = if let Some(identity) = &self.identity {
@@ -1048,13 +1120,7 @@ impl Destination {
 			return Err("No identity for signing ratchets".to_string());
 		};
 
-		// Create persisted data: {"signature": <bytes>, "ratchets": <bytes>}
-		let persisted: HashMap<String, serde_bytes::ByteBuf> = [
-			("signature".to_string(), serde_bytes::ByteBuf::from(signature)),
-			("ratchets".to_string(), serde_bytes::ByteBuf::from(packed_ratchets)),
-		].into_iter().collect();
-		let file_data = to_vec(&persisted)
-			.map_err(|e| format!("Failed to serialize persisted ratchets: {}", e))?;
+		let file_data = pack_ratchet_file(&signature, &packed_ratchets)?;
 
 		// Atomic write (tmp + rename, the reference's os.replace).
 		write_ratchet_file_atomically(ratchets_path, &file_data)?;
@@ -1086,18 +1152,11 @@ impl Destination {
 			let load_attempt = |identity: &Identity| -> Result<Vec<Vec<u8>>, String> {
 				let file_data = std::fs::read(ratchets_path)
 					.map_err(|e| format!("Failed to read ratchet file: {}", e))?;
-				let persisted: HashMap<String, serde_bytes::ByteBuf> = from_slice(&file_data)
-					.map_err(|e| format!("Failed to deserialize ratchet file: {}", e))?;
-				let signature = persisted.get("signature")
-					.ok_or("Missing signature in ratchet file")?;
-				let packed_ratchets = persisted.get("ratchets")
-					.ok_or("Missing ratchets in ratchet file")?;
-				if !identity.validate(signature, packed_ratchets) {
+				let (signature, packed_ratchets) = unpack_ratchet_file(&file_data)?;
+				if !identity.validate(&signature, &packed_ratchets) {
 					return Err("Invalid ratchet file signature".to_string());
 				}
-				let ratchets: Vec<serde_bytes::ByteBuf> = from_slice(packed_ratchets)
-					.map_err(|e| format!("Failed to deserialize ratchet keys: {}", e))?;
-				Ok(ratchets.into_iter().map(|b| b.to_vec()).collect())
+				unpack_ratchets(&packed_ratchets)
 			};
 
 			let identity = self.identity.as_ref()
@@ -1244,7 +1303,17 @@ impl Destination {
 		match self.dest_type {
 			DestinationType::Plain => Ok(ciphertext.to_vec()),
 			DestinationType::Single => {
-				// First attempt: try with current ratchet keys
+				// First attempt: with the newest list any clone of this
+				// destination holds. Transport's registered copy and the
+				// router's copy decrypt; either may have been cloned before
+				// another copy's announce rotated. Until 2026-09-27 each
+				// decrypted with its own list, so a packet to that rotation's
+				// ratchet failed and succeeded only after the reload below.
+				if self.ratchets.is_some() {
+					let shared_cell = Arc::clone(&self.ratchet_shared);
+					let shared = shared_cell.lock().unwrap_or_else(|e| e.into_inner());
+					self.adopt_shared_ratchets(&shared);
+				}
 				let dest_ratchets_clone = self.ratchets.clone();
 				let first_result = if let Some(identity) = self.identity.as_mut() {
 					let dr = dest_ratchets_clone.as_ref().map(|r| r.as_slice());
@@ -1257,7 +1326,10 @@ impl Destination {
 					return first_result;
 				}
 
-				// Ratchet mismatch — try reloading from disk and retry
+				// Ratchet mismatch: reload from disk and try again, for a file
+				// ANOTHER PROCESS changed (the iOS NSE's frozen copy reads the
+				// mirror the app writes; set_ratchets_frozen). Rotations in this
+				// process were adopted above.
 				crate::log(&format!("[RATCHET] decrypt failed with {} ratchets, reloading from disk...",
 					self.ratchets.as_ref().map(|r| r.len()).unwrap_or(0)), crate::LOG_NOTICE, false, false);
 				if let Some(ratchets_path) = self.ratchets_path.clone() {
@@ -1779,5 +1851,176 @@ mod tests {
 		reader.enable_ratchets(mirror.clone()).expect("load the mirror");
 		assert_eq!(reader.ratchets, lists[0], "the mirror holds the one rotation");
 		assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&primary).unwrap());
+	}
+
+	/// A clone taken before another clone rotated (Transport's registered
+	/// copy, registered before the app copy's first announce) decrypts a
+	/// packet to that rotation's ratchet from the shared state, with no
+	/// reload from disk. The file is removed first, so a reload could not
+	/// supply the ratchet: before 2026-09-27 the registered copy decrypted
+	/// with its own stale list, failed, reloaded, and failed here.
+	#[test]
+	fn a_clone_decrypts_with_a_ratchet_another_clone_rotated_without_a_reload() {
+		let dir = TempDir::new("decrypt_shared");
+		let primary = dir.file("app.ratchets");
+		let identity = Identity::new(true);
+
+		let mut app = delivery_destination(&identity);
+		app.enable_ratchets(primary.clone()).expect("enable_ratchets");
+		let mut registered = app.clone();
+		let mut router = app.clone();
+		assert_eq!(registered.ratchets.as_ref().map(|r| r.len()), Some(0));
+
+		let _ = announce_data(&mut app); // rotates on the app copy only
+		let newest = app.ratchets.as_ref().expect("ratchets")[0].clone();
+		std::fs::remove_file(&primary).expect("remove the ratchet file");
+
+		let plaintext = b"to the ratchet the app copy announced".to_vec();
+		let ciphertext = identity.encrypt_with_ratchet(&plaintext, Some(&ratchet_pub(&newest))).expect("encrypt");
+		assert_eq!(registered.decrypt(&ciphertext).expect("the registered copy decrypts from the shared state"), plaintext);
+		assert_eq!(registered.ratchets, app.ratchets, "and now holds the shared list");
+		assert_eq!(router.decrypt(&ciphertext).expect("so does every other clone"), plaintext);
+		assert!(!std::path::Path::new(&primary).exists(), "no reload from disk happened (a reload of a missing file writes a new one)");
+
+		// A second rotation, again on another clone, reaches the others too.
+		registered.latest_ratchet_time = 0;
+		assert!(registered.rotate_ratchets().expect("rotate"));
+		let second = registered.ratchets.as_ref().expect("ratchets")[0].clone();
+		let ciphertext = identity.encrypt_with_ratchet(&plaintext, Some(&ratchet_pub(&second))).expect("encrypt");
+		std::fs::remove_file(&primary).expect("remove the ratchet file again");
+		assert_eq!(app.decrypt(&ciphertext).expect("the app copy decrypts the second rotation's ratchet"), plaintext);
+		assert_eq!(app.ratchets.as_ref().map(|r| r.len()), Some(2), "both ratchets held");
+		assert!(!std::path::Path::new(&primary).exists());
+	}
+
+	/// The ratchet list's signed data is what the reference's
+	/// `umsgpack.packb(self.ratchets)` writes: an array of bin. Until
+	/// 2026-09-27 each ratchet was an array of integers.
+	#[test]
+	fn the_ratchet_file_holds_each_ratchet_as_bin() {
+		let dir = TempDir::new("bin");
+		let path = dir.file("app.ratchets");
+		let identity = Identity::new(true);
+		let mut app = delivery_destination(&identity);
+		app.enable_ratchets(path.clone()).expect("enable_ratchets");
+		assert!(app.rotate_ratchets().expect("rotate"));
+		app.latest_ratchet_time = 0;
+		assert!(app.rotate_ratchets().expect("rotate"));
+		let held = app.ratchets.clone().expect("ratchets");
+
+		let data = std::fs::read(&path).expect("ratchet file");
+		let outer = rmpv::decode::read_value(&mut &data[..]).expect("msgpack");
+		let keys: Vec<&str> = outer.as_map().expect("a map").iter().map(|(k, _)| k.as_str().expect("str key")).collect();
+		assert_eq!(keys, vec!["signature", "ratchets"], "the reference's key order");
+		let (signature, packed) = unpack_ratchet_file(&data).expect("fields");
+		assert!(identity.validate(&signature, &packed), "signed by the identity");
+		let inner = rmpv::decode::read_value(&mut &packed[..]).expect("inner msgpack");
+		let items = inner.as_array().expect("an array");
+		assert_eq!(items.len(), 2);
+		for (item, ratchet) in items.iter().zip(held.iter()) {
+			assert_eq!(item, &rmpv::Value::Binary(ratchet.clone()), "each ratchet is bin, newest first");
+		}
+
+		// Round trip.
+		let mut reader = delivery_destination(&identity);
+		reader.set_ratchets_frozen(true);
+		reader.enable_ratchets(path.clone()).expect("reload");
+		assert_eq!(reader.ratchets, Some(held));
+	}
+
+	/// Ratchet files this stack wrote before 2026-09-27 (each ratchet an
+	/// array of integers, keys in any order) still load, and the next
+	/// rotation rewrites the file as bin.
+	#[test]
+	fn a_legacy_int_array_ratchet_file_still_loads() {
+		let dir = TempDir::new("legacy");
+		let path = dir.file("app.ratchets");
+		let identity = Identity::new(true);
+		let legacy: Vec<Vec<u8>> = vec![(0u8..32).collect(), (200u8..232).collect()];
+		// What `rmp_serde::to_vec(&Vec<Vec<u8>>)` and the HashMap of ByteBuf wrote.
+		let packed = rmp_serde::to_vec(&legacy).expect("legacy pack");
+		assert_eq!(packed[1], 0xdc, "a sanity check: the legacy form is an array (array16 of ints), not bin");
+		let signature = identity.sign(&packed);
+		let outer: HashMap<String, serde_bytes::ByteBuf> = [
+			("ratchets".to_string(), serde_bytes::ByteBuf::from(packed.clone())),
+			("signature".to_string(), serde_bytes::ByteBuf::from(signature)),
+		]
+		.into_iter()
+		.collect();
+		std::fs::write(&path, rmp_serde::to_vec(&outer).expect("legacy outer")).expect("write legacy file");
+
+		let mut app = delivery_destination(&identity);
+		app.enable_ratchets(path.clone()).expect("enable_ratchets");
+		assert_eq!(app.ratchets.as_ref(), Some(&legacy), "the legacy file loads");
+
+		assert!(app.rotate_ratchets().expect("rotate"));
+		let data = std::fs::read(&path).expect("ratchet file");
+		let (_, packed) = unpack_ratchet_file(&data).expect("fields");
+		let inner = rmpv::decode::read_value(&mut &packed[..]).expect("inner");
+		assert!(inner.as_array().expect("array").iter().all(|v| matches!(v, rmpv::Value::Binary(_))), "rewritten as bin");
+		assert_eq!(&app.ratchets.as_ref().expect("ratchets")[1..], &legacy[..], "the legacy ratchets are kept");
+	}
+
+	/// The Python reference (the workspace .venv, rns 1.5.2) loads a ratchet
+	/// file this stack wrote, with its own `_reload_ratchets`, and gets the
+	/// same ratchet keys; the file it writes for the same identity and
+	/// ratchets is byte for byte this stack's (Ed25519 signatures are
+	/// deterministic). The iOS mirror is the same bytes, so it holds too.
+	#[test]
+	fn the_python_reference_loads_a_rust_ratchet_file() {
+		let python = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.venv/bin/python");
+		assert!(python.exists(), "the Python reference is needed: {} (see AGENTS.md, Key environment)", python.display());
+		let dir = TempDir::new("python");
+		let path = dir.file("app.ratchets");
+		let mirror = dir.file("nse.ratchets");
+		let python_path = dir.file("python.ratchets");
+		let identity = Identity::new(true);
+		let mut app = delivery_destination(&identity);
+		app.set_ratchets_mirror_path(Some(mirror.clone()));
+		app.enable_ratchets(path.clone()).expect("enable_ratchets");
+		for _ in 0..3 {
+			app.latest_ratchet_time = 0;
+			assert!(app.rotate_ratchets().expect("rotate"));
+		}
+		let pubs: Vec<String> = app.ratchets.as_ref().expect("ratchets").iter().map(|r| crate::hexrep(&ratchet_pub(r), false)).collect();
+
+		let script = r#"
+import sys, threading, RNS
+identity = RNS.Identity.from_bytes(bytes.fromhex(sys.argv[1]))
+d = object.__new__(RNS.Destination)
+d.type = RNS.Destination.SINGLE
+d.identity = identity
+d.ratchet_file_lock = threading.Lock()
+d.ratchets = None
+d._reload_ratchets(sys.argv[2])
+for r in d.ratchets:
+    if not isinstance(r, bytes) or len(r) != 32:
+        sys.exit("not a ratchet key: %r" % (r,))
+d.ratchets_path = sys.argv[3]
+d._persist_ratchets()
+print(",".join(RNS.Identity._ratchet_public_bytes(r).hex() for r in d.ratchets))
+"#;
+		for file in [&path, &mirror] {
+			let out = std::process::Command::new(&python)
+				.arg("-c")
+				.arg(script)
+				.arg(crate::hexrep(&identity.get_private_key().expect("private key"), false))
+				.arg(file)
+				.arg(&python_path)
+				.output()
+				.expect("run the Python reference");
+			assert!(
+				out.status.success(),
+				"the Python reference could not load {}: {}",
+				file,
+				String::from_utf8_lossy(&out.stderr)
+			);
+			assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), pubs.join(","), "Python loads the same ratchets, newest first");
+			assert_eq!(
+				std::fs::read(&python_path).expect("the file Python wrote"),
+				std::fs::read(&path).expect("the file Rust wrote"),
+				"Python writes the same file byte for byte"
+			);
+		}
 	}
 }

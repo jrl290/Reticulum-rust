@@ -7,6 +7,7 @@ tests/interop/ratchet_run.sh, which builds it and calls `run` here.
   ratchet_interop.py run  <rust_binary> <work_dir>    the orchestrator
   ratchet_interop.py hub  <config_dir>                a bare reference transport node
   ratchet_interop.py peer <config_dir>                the Python reference peer
+  ratchet_interop.py load <identity> <ratchet_file>   the reference loads a ratchet file
 
 Every process is a TCP client of a Python reference transport node (the hub),
 so every exchange crosses a real transport hop. Scenarios, each decided on an
@@ -15,11 +16,15 @@ into a FAIL (DESIGN_PRINCIPLES §1), and a proof later than 5 s is a FAIL too.
 
   a  A Rust IN destination with ratchets announces. The Python peer learns the
      ratchet from the announce, sends a packet encrypted to it, and the Rust
-     side decrypts it and proves it.
+     side decrypts it and proves it, with the ratchet the app copy's
+     announce made, from the state every clone shares: Transport's registered
+     copy, which decrypts, was cloned before that announce, and a decrypt
+     that needed a reload from disk is a FAIL.
   b  The Rust process restarts on the same identity and ratchet file.
      enable_ratchets resets latest_ratchet_time, so its first announce rotates.
      After that announce the peer encrypts to the NEW ratchet and Rust
      decrypts; a packet encrypted to the previous ratchet still decrypts.
+     Neither may need a reload from disk.
   d  The reverse: a Python IN destination with ratchets announces, the Rust
      peer encrypts to the announced ratchet, Python decrypts it with that
      ratchet (not the identity key) and proves it.
@@ -32,7 +37,10 @@ into a FAIL (DESIGN_PRINCIPLES §1), and a proof later than 5 s is a FAIL too.
      destination's shared state holds, Python encrypts to it and Rust
      decrypts; every ratchet of the app copy's list must still decrypt on the
      registered copy without a reload from disk, and the app copy's list and
-     the ratchet file must agree afterwards (no ratchet lost).
+     the ratchet file must agree afterwards (no ratchet lost). The Python
+     reference then loads the Rust-written ratchet file with its own
+     _reload_ratchets and must get the same ratchets (each ratchet bin, as it
+     writes them; until 2026-09-27 this stack wrote arrays of integers).
 
 Exit 0 only if every scenario passes.
 """
@@ -146,6 +154,23 @@ def peer(config_dir):
             os._exit(0)
         else:
             emit(f"@@ERROR unknown command {line.strip()}")
+
+
+def load(identity_path, ratchet_path):
+    """Load a ratchet file as the reference does and print its ratchets'
+    public keys, newest first."""
+    import RNS
+    identity = RNS.Identity.from_file(identity_path)
+    d = object.__new__(RNS.Destination)
+    d.type = RNS.Destination.SINGLE
+    d.identity = identity
+    d.ratchet_file_lock = threading.Lock()
+    d.ratchets = None
+    d._reload_ratchets(ratchet_path)
+    for r in d.ratchets:
+        if not isinstance(r, bytes) or len(r) != 32:
+            sys.exit(f"not a ratchet key: {r!r}")
+    print(",".join(RNS.Identity._ratchet_public_bytes(r).hex() for r in d.ratchets) or "-")
 
 
 # ── orchestrator ────────────────────────────────────────────────────────────
@@ -421,11 +446,10 @@ def run(rust_bin, work):
             sent, ms, reloaded = py_to_rust(peer1, rust1, dest, "a1")
             if sent != r_a:
                 raise Fail(f"Python encrypted to {sent}, not the announced {r_a}")
-            results["a"] = (True, f"announced ratchet {r_a[:16]}.. learned by Python; packet to it decrypted by Rust, proof in {ms} ms"
-                                  + (" (after a ratchet reload from disk)" if reloaded else ""))
             if reloaded:
-                notes.append("a: a1 decrypted only after a ratchet reload from disk: Transport's registered copy, "
-                             "cloned before the app copy's first announce, did not hold the ratchet that announce made")
+                raise Fail("a1 decrypted only after a ratchet reload from disk: Transport's registered copy, "
+                           "cloned before the app copy's first announce, did not take that announce's ratchet from the shared state")
+            results["a"] = (True, f"announced ratchet {r_a[:16]}.. learned by Python; packet to it decrypted by Rust with no reload, proof in {ms} ms")
         except Fail as e:
             results["a"] = (False, str(e))
             raise
@@ -463,14 +487,12 @@ def run(rust_bin, work):
             if sent != r_b:
                 raise Fail(f"Python encrypted to {sent}, not the new {r_b}")
             sent, ms_old, rl_old = py_to_rust(peer1, rust2, dest, "b-old", r_a)
-            detail = (f"restart rotated {r_a[:16]}.. -> {r_b[:16]}..; packet to the new ratchet proven in {ms_new} ms, "
-                      f"packet to the previous ratchet proven in {ms_old} ms")
             reloads = [t for t, rl in (("b-new", rl_new), ("b-old", rl_old)) if rl]
             if reloads:
-                detail += f"; Rust decrypted {', '.join(reloads)} only after reloading the ratchet file (the registered copy was older than the app copy)"
-                notes.append(f"b: {', '.join(reloads)} decrypted only after a ratchet reload from disk: Transport's registered copy, "
-                             "cloned before the app copy's first announce, did not hold the ratchet that announce made")
-            results["b"] = (True, detail)
+                raise Fail(f"{', '.join(reloads)} decrypted only after a ratchet reload from disk: Transport's registered copy, "
+                           "cloned before the app copy's first announce, did not take that announce's ratchet from the shared state")
+            results["b"] = (True, f"restart rotated {r_a[:16]}.. -> {r_b[:16]}..; packet to the new ratchet proven in {ms_new} ms, "
+                                  f"packet to the previous ratchet proven in {ms_old} ms, neither needing a reload")
         except Fail as e:
             results["b"] = (False, str(e))
             raise
@@ -543,8 +565,15 @@ def run(rust_bin, work):
                 raise Fail(f"app copy list {m.group(2)} != ratchet file {m.group(3)}")
             if m.group(2).split(",") != app_list:
                 raise Fail(f"app copy list changed to {m.group(2)} from {','.join(app_list)} (a ratchet was lost or replaced)")
+            loaded = subprocess.run([py, me, "load", os.path.join(rust_state, "identity"), os.path.join(rust_state, "ratchets")],
+                                    capture_output=True, text=True)
+            if loaded.returncode != 0:
+                raise Fail(f"the Python reference could not load the Rust ratchet file: {(loaded.stderr or loaded.stdout).strip()[-400:]}")
+            if loaded.stdout.strip() != m.group(3):
+                raise Fail(f"the Python reference loaded {loaded.stdout.strip()} from the Rust ratchet file, which holds {m.group(3)}")
             results["c"] = (True, f"path response from Transport's clone carried {r_pr[:16]}.. (the app copy's newest, {'==' if r_pr == r_c else '!='} r_c); "
-                                  f"proven in {ms_pr} ms; all {len(app_list)} ratchets decrypted on the registered copy with no reload; app list == file list")
+                                  f"proven in {ms_pr} ms; all {len(app_list)} ratchets decrypted on the registered copy with no reload; app list == file list; "
+                                  f"the Python reference loads the Rust ratchet file")
         except Fail as e:
             results["c"] = (False, str(e))
             raise
@@ -578,6 +607,8 @@ if __name__ == "__main__":
         hub(sys.argv[2])
     elif len(sys.argv) == 3 and sys.argv[1] == "peer":
         peer(sys.argv[2])
+    elif len(sys.argv) == 4 and sys.argv[1] == "load":
+        load(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 4 and sys.argv[1] == "run":
         sys.exit(run(os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3])))
     else:
