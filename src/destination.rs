@@ -40,6 +40,16 @@ fn write_ratchet_file_atomically(path: &str, data: &[u8]) -> Result<(), String> 
 	Ok(())
 }
 
+/// Ratchet state shared by every clone of one destination: see
+/// `Destination::ratchet_shared`. `generation` counts the rotations made by
+/// any clone since `enable_ratchets`. Opaque outside this module.
+#[derive(Default)]
+pub struct SharedRatchetState {
+	ratchets: Option<Vec<Vec<u8>>>,
+	latest_ratchet_time: u64,
+	generation: u64,
+}
+
 // Ratchet settings
 pub const RATCHET_COUNT: usize = 512;
 pub const RATCHET_INTERVAL: u64 = 30 * 60; // 30 minutes in seconds
@@ -132,6 +142,18 @@ pub struct Destination {
 	/// default. Used only by the Retichat iOS Notification Service Extension,
 	/// whose ratchets belong to the app. See `set_ratchets_frozen`.
 	pub ratchets_frozen: bool,
+	/// The ratchet state every clone of this destination shares (Python has
+	/// one live Destination object; Rust clones it into the router, into
+	/// Transport's registered copy and into the copies Transport announces
+	/// with its lock released). A rotation takes this lock, first adopts a
+	/// rotation another clone made since this clone last synced, and
+	/// persists under it, so no two clones rotate from the same stale list
+	/// and ratchet file writes never interleave. Created by
+	/// `enable_ratchets`; shared by `Clone`.
+	pub ratchet_shared: Arc<Mutex<SharedRatchetState>>,
+	/// The `SharedRatchetState::generation` this copy's `ratchets` were last
+	/// synced with (see `ratchet_shared`).
+	pub ratchet_generation: u64,
 	pub enforce_ratchets: bool,
 	pub callbacks: Callbacks,
 	pub request_handlers: HashMap<Vec<u8>, RequestHandler>,
@@ -172,6 +194,8 @@ impl Clone for Destination {
 			ratchets_path: self.ratchets_path.clone(),
 			ratchets_mirror_path: self.ratchets_mirror_path.clone(),
 			ratchets_frozen: self.ratchets_frozen,
+			ratchet_shared: Arc::clone(&self.ratchet_shared),
+			ratchet_generation: self.ratchet_generation,
 			enforce_ratchets: self.enforce_ratchets,
 			callbacks: self.callbacks.clone(),
 			request_handlers: self.request_handlers.clone(),
@@ -223,6 +247,8 @@ impl Default for Destination {
 			ratchets_path: None,
 			ratchets_mirror_path: None,
 			ratchets_frozen: false,
+			ratchet_shared: Arc::new(Mutex::new(SharedRatchetState::default())),
+			ratchet_generation: 0,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -421,6 +447,8 @@ impl Destination {
 			ratchets_path: None,
 			ratchets_mirror_path: None,
 			ratchets_frozen: false,
+			ratchet_shared: Arc::new(Mutex::new(SharedRatchetState::default())),
+			ratchet_generation: 0,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -517,6 +545,8 @@ impl Destination {
 			ratchets_path: None,
 			ratchets_mirror_path: None,
 			ratchets_frozen: false,
+			ratchet_shared: Arc::new(Mutex::new(SharedRatchetState::default())),
+			ratchet_generation: 0,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -851,6 +881,14 @@ impl Destination {
 	pub fn enable_ratchets(&mut self, ratchets_path: String) -> Result<(), String> {
 		self.latest_ratchet_time = 0;
 		self._reload_ratchets(&ratchets_path)?;
+		// A fresh shared ratchet state for this destination and every clone
+		// made from it from now on (router, Transport's registered copy).
+		self.ratchet_generation = 0;
+		self.ratchet_shared = Arc::new(Mutex::new(SharedRatchetState {
+			ratchets: self.ratchets.clone(),
+			latest_ratchet_time: self.latest_ratchet_time,
+			generation: 0,
+		}));
 		Ok(())
 	}
 	
@@ -936,27 +974,49 @@ impl Destination {
 			// ratchet file rotates, never this copy.
 			return Ok(false);
 		}
-		if let Some(ratchets) = &mut self.ratchets {
-			let now = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.map(|d| d.as_secs())
-				.unwrap_or(0);
-			
-			if now > self.latest_ratchet_time + self.ratchet_interval {
-				// Generate a proper X25519 private key (32 random bytes)
-				let mut ratchet_prv = [0u8; 32];
-				use rand::RngCore;
-				rand::rngs::OsRng.fill_bytes(&mut ratchet_prv);
-				ratchets.insert(0, ratchet_prv.to_vec());
-				self.latest_ratchet_time = now;
-				self._clean_ratchets();
-				let _ = self._persist_ratchets();
-				return Ok(true);
-			}
-			Ok(false)
-		} else {
-			Err("Cannot rotate ratchet, ratchets are not enabled".to_string())
+		if self.ratchets.is_none() {
+			return Err("Cannot rotate ratchet, ratchets are not enabled".to_string());
 		}
+		// One rotation at a time across every clone of this destination, and
+		// always from the newest list: Python rotates its one live object;
+		// here the router's copy, Transport's registered copy and the copies
+		// Transport announces with its lock released (a path response, the
+		// publish refresh) would otherwise each rotate from the list they
+		// were cloned with, and the last to persist would drop a ratchet
+		// another had already announced.
+		let shared_cell = Arc::clone(&self.ratchet_shared);
+		let mut shared = shared_cell.lock().unwrap_or_else(|e| e.into_inner());
+		if shared.generation != self.ratchet_generation && shared.ratchets.is_some() {
+			// Another clone rotated since this one last synced: adopt it.
+			self.ratchets = shared.ratchets.clone();
+			self.latest_ratchet_time = shared.latest_ratchet_time;
+			self.ratchet_generation = shared.generation;
+		}
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+
+		if now > self.latest_ratchet_time + self.ratchet_interval {
+			// Generate a proper X25519 private key (32 random bytes)
+			let mut ratchet_prv = [0u8; 32];
+			use rand::RngCore;
+			rand::rngs::OsRng.fill_bytes(&mut ratchet_prv);
+			if let Some(ratchets) = &mut self.ratchets {
+				ratchets.insert(0, ratchet_prv.to_vec());
+			}
+			self.latest_ratchet_time = now;
+			self._clean_ratchets();
+			// Persisted under the shared lock: the primary and mirror writes
+			// of two clones never interleave (they share one <path>.tmp).
+			let _ = self._persist_ratchets();
+			shared.generation += 1;
+			shared.ratchets = self.ratchets.clone();
+			shared.latest_ratchet_time = now;
+			self.ratchet_generation = shared.generation;
+			return Ok(true);
+		}
+		Ok(false)
 	}
 	
 	/// Clean up old ratchets, keeping only retained_ratchets count
@@ -1638,5 +1698,86 @@ mod tests {
 		);
 		assert_eq!(nse.ratchets, app.ratchets, "the reload picked up the app's rotation");
 		assert_eq!(std::fs::read(&mirror).expect("mirror"), mirror_before, "the reload wrote nothing");
+	}
+
+	/// Clones of one destination (the router's, Transport's registered copy,
+	/// the copies Transport announces with its lock released) share their
+	/// ratchet state: a clone that is due to rotate after another clone
+	/// already rotated adopts that rotation instead of rotating again from
+	/// its stale list, so the ratchet the first clone announced stays in the
+	/// list and in the file (primary and mirror).
+	#[test]
+	fn a_clone_due_to_rotate_adopts_a_rotation_another_clone_made() {
+		let dir = TempDir::new("clones");
+		let primary = dir.file("app.ratchets");
+		let mirror = dir.file("nse.ratchets");
+		let identity = Identity::new(true);
+
+		let mut original = delivery_destination(&identity);
+		original.set_ratchets_mirror_path(Some(mirror.clone()));
+		original.enable_ratchets(primary.clone()).expect("enable_ratchets");
+		// Both clones taken before any rotation, both due (enable_ratchets
+		// reset the rotation time): the publish refresh and a path response.
+		let mut sweep = original.clone();
+		let mut path_response = original.clone();
+
+		let sweep_data = announce_data(&mut sweep);
+		let announced = sweep.ratchets.as_ref().expect("ratchets")[0].clone();
+		assert!(contains(&sweep_data, &ratchet_pub(&announced)));
+
+		let pr_data = announce_data(&mut path_response);
+		assert_eq!(path_response.ratchets, sweep.ratchets, "the second clone adopted the first clone's rotation");
+		assert!(contains(&pr_data, &ratchet_pub(&announced)), "and announces the same ratchet");
+		assert_eq!(path_response.rotate_ratchets(), Ok(false), "and is not due again");
+
+		let mut reader = delivery_destination(&identity);
+		reader.set_ratchets_frozen(true);
+		reader.enable_ratchets(primary.clone()).expect("load the primary");
+		assert_eq!(reader.ratchets, sweep.ratchets, "the file holds the announced ratchet");
+		assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&primary).unwrap());
+
+		// The original (the router's copy) adopts it too on its next rotation.
+		assert_eq!(original.rotate_ratchets(), Ok(false));
+		assert_eq!(original.ratchets, sweep.ratchets);
+	}
+
+	/// Clones rotating on different threads at the same moment make exactly
+	/// one rotation, and every clone ends with it: no announced ratchet is
+	/// lost and the file writes (one shared <path>.tmp) never interleave.
+	#[test]
+	fn clones_rotating_at_once_make_one_rotation() {
+		let dir = TempDir::new("threads");
+		let primary = dir.file("app.ratchets");
+		let mirror = dir.file("nse.ratchets");
+		let identity = Identity::new(true);
+
+		let mut original = delivery_destination(&identity);
+		original.set_ratchets_mirror_path(Some(mirror.clone()));
+		original.enable_ratchets(primary.clone()).expect("enable_ratchets");
+
+		let copies = 8;
+		let barrier = Arc::new(std::sync::Barrier::new(copies));
+		let handles: Vec<_> = (0..copies)
+			.map(|_| {
+				let mut copy = original.clone();
+				let barrier = barrier.clone();
+				thread::spawn(move || {
+					barrier.wait();
+					let rotated = copy.rotate_ratchets().expect("rotate");
+					(rotated, copy.ratchets.clone())
+				})
+			})
+			.collect();
+		let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+		assert_eq!(results.iter().filter(|(rotated, _)| *rotated).count(), 1, "exactly one clone rotated");
+		let lists: Vec<_> = results.into_iter().map(|(_, list)| list).collect();
+		assert!(lists.iter().all(|l| l == &lists[0]), "every clone holds the one rotation");
+		assert_eq!(lists[0].as_ref().map(|l| l.len()), Some(1));
+
+		let mut reader = delivery_destination(&identity);
+		reader.set_ratchets_frozen(true);
+		reader.enable_ratchets(mirror.clone()).expect("load the mirror");
+		assert_eq!(reader.ratchets, lists[0], "the mirror holds the one rotation");
+		assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&primary).unwrap());
 	}
 }
