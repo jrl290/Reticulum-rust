@@ -26,6 +26,20 @@ pub const ALLOW_NONE: u8 = 0x00;
 pub const ALLOW_ALL: u8 = 0x01;
 pub const ALLOW_LIST: u8 = 0x02;
 
+/// Write a ratchet file atomically: to `<path>.tmp`, then rename over `path`
+/// (the reference's os.replace), so a reader - this process, or another
+/// process reading a mirror - never sees a missing or half-written file.
+/// (Removing the old file first, as until 2026-09-26, left a moment with no
+/// ratchet file at all.)
+fn write_ratchet_file_atomically(path: &str, data: &[u8]) -> Result<(), String> {
+	let tmp_path = format!("{}.tmp", path);
+	std::fs::write(&tmp_path, data)
+		.map_err(|e| format!("Failed to write ratchet file {}: {}", tmp_path, e))?;
+	std::fs::rename(&tmp_path, path)
+		.map_err(|e| format!("Failed to rename ratchet file {} -> {}: {}", tmp_path, path, e))?;
+	Ok(())
+}
+
 // Ratchet settings
 pub const RATCHET_COUNT: usize = 512;
 pub const RATCHET_INTERVAL: u64 = 30 * 60; // 30 minutes in seconds
@@ -104,6 +118,20 @@ pub struct Destination {
 	pub path_responses: HashMap<Vec<u8>, (u64, Vec<u8>)>, // (timestamp, announce_data)
 	pub default_app_data: Option<Vec<u8>>,
 	pub ratchets_path: Option<String>,
+	/// DEPARTURE from RNS/Destination.py (which has neither): a second file
+	/// that receives the identical signed ratchet file after every write of
+	/// `ratchets_path`. Off (`None`) by default. Used only by the Retichat iOS
+	/// app, whose Notification Service Extension runs a second stack with the
+	/// same identity and decrypts with the ratchets this mirror carries. See
+	/// `set_ratchets_mirror_path` and PARITY-AUDIT-1.5.2.md A29.
+	pub ratchets_mirror_path: Option<String>,
+	/// DEPARTURE from RNS/Destination.py: a read-only ("frozen") ratchet
+	/// list. While set, `rotate_ratchets` never generates a ratchet and the
+	/// ratchet file is never written; announces carry the existing newest
+	/// ratchet and decryption still reloads the file on a miss. Off by
+	/// default. Used only by the Retichat iOS Notification Service Extension,
+	/// whose ratchets belong to the app. See `set_ratchets_frozen`.
+	pub ratchets_frozen: bool,
 	pub enforce_ratchets: bool,
 	pub callbacks: Callbacks,
 	pub request_handlers: HashMap<Vec<u8>, RequestHandler>,
@@ -142,6 +170,8 @@ impl Clone for Destination {
 			path_responses: self.path_responses.clone(),
 			default_app_data: self.default_app_data.clone(),
 			ratchets_path: self.ratchets_path.clone(),
+			ratchets_mirror_path: self.ratchets_mirror_path.clone(),
+			ratchets_frozen: self.ratchets_frozen,
 			enforce_ratchets: self.enforce_ratchets,
 			callbacks: self.callbacks.clone(),
 			request_handlers: self.request_handlers.clone(),
@@ -191,6 +221,8 @@ impl Default for Destination {
 			path_responses: HashMap::new(),
 			default_app_data: None,
 			ratchets_path: None,
+			ratchets_mirror_path: None,
+			ratchets_frozen: false,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -387,6 +419,8 @@ impl Destination {
 			path_responses: HashMap::new(),
 			default_app_data: None,
 			ratchets_path: None,
+			ratchets_mirror_path: None,
+			ratchets_frozen: false,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -481,6 +515,8 @@ impl Destination {
 			path_responses: HashMap::new(),
 			default_app_data: None,
 			ratchets_path: None,
+			ratchets_mirror_path: None,
+			ratchets_frozen: false,
 			enforce_ratchets: false,
 			callbacks: Callbacks::default(),
 			request_handlers: HashMap::new(),
@@ -848,8 +884,58 @@ impl Destination {
 		}
 	}
 	
+	/// DEPARTURE from RNS/Destination.py (named, off by default): mirror the
+	/// ratchet file. From now on every write of the ratchet file is followed
+	/// by an atomic write (tmp + rename) of the identical signed bytes to
+	/// `mirror_path`. A failed mirror write is logged and never fails the
+	/// primary write. `None` turns the mirror off.
+	///
+	/// Why: the Retichat iOS app and its Notification Service Extension run
+	/// separate stacks with the same identity and lxmf.delivery destination.
+	/// The extension decrypts propagated messages with the app's ratchets,
+	/// which it loads from a file in the App Group. The app's first announce
+	/// of a run rotates a ratchet (`enable_ratchets` resets the rotation
+	/// time); a copy of the file taken before that announce lacked the ratchet
+	/// senders then encrypted to, and the extension could not decrypt them.
+	/// The mirror makes the App Group file follow every rotation as it is
+	/// persisted.
+	///
+	/// Set it before the first announce and on every copy of the destination
+	/// that can announce (Transport's registered copy too:
+	/// `Transport::set_registered_ratchets_mirror_path`).
+	pub fn set_ratchets_mirror_path(&mut self, mirror_path: Option<String>) {
+		self.ratchets_mirror_path = mirror_path;
+	}
+
+	/// DEPARTURE from RNS/Destination.py (named, off by default): freeze the
+	/// ratchet list read-only. While frozen, `rotate_ratchets` returns
+	/// `Ok(false)` without generating a ratchet and the ratchet file is never
+	/// written (not even the empty file `enable_ratchets` creates when none
+	/// exists). Announces still carry the newest ratchet held, and `decrypt`
+	/// still reloads the file after a miss, so a ratchet another process
+	/// wrote to that file is picked up.
+	///
+	/// Why: the Retichat iOS Notification Service Extension runs a second
+	/// stack with the app's identity and reads the app's ratchets from the
+	/// App Group. If it rotated (its first announce, e.g. a path response),
+	/// peers would encrypt to a ratchet only the extension's copy held and the
+	/// app could not decrypt their messages; if it wrote the file it would
+	/// overwrite the app's mirror.
+	///
+	/// Freeze before `enable_ratchets` and before the destination is
+	/// registered with Transport, or on every copy that can announce
+	/// (`Transport::set_registered_ratchets_frozen`).
+	pub fn set_ratchets_frozen(&mut self, frozen: bool) {
+		self.ratchets_frozen = frozen;
+	}
+
 	/// Rotate ratchets - generates new ratchet and persists
 	pub fn rotate_ratchets(&mut self) -> Result<bool, String> {
+		if self.ratchets.is_some() && self.ratchets_frozen {
+			// Read-only ratchets (set_ratchets_frozen): the owner of the
+			// ratchet file rotates, never this copy.
+			return Ok(false);
+		}
 		if let Some(ratchets) = &mut self.ratchets {
 			let now = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
@@ -884,6 +970,10 @@ impl Destination {
 	
 	/// Persist ratchets to file with signature (Python: _persist_ratchets)
 	fn _persist_ratchets(&self) -> Result<(), String> {
+		if self.ratchets_frozen {
+			// set_ratchets_frozen: this copy never writes the ratchet file.
+			return Err("Ratchets are frozen (read-only); not persisting".to_string());
+		}
 		let ratchets_path = self.ratchets_path.as_ref().ok_or("No ratchets path set")?;
 		let ratchets = self.ratchets.as_ref().ok_or("No ratchets to persist")?;
 
@@ -906,14 +996,24 @@ impl Destination {
 		let file_data = to_vec(&persisted)
 			.map_err(|e| format!("Failed to serialize persisted ratchets: {}", e))?;
 
-		// Atomic write: write to .tmp then rename over the old file (the
-		// reference's os.replace). Removing the old file first, as until
-		// 2026-09-26, left a moment with no ratchet file at all.
-		let tmp_path = format!("{}.tmp", ratchets_path);
-		std::fs::write(&tmp_path, &file_data)
-			.map_err(|e| format!("Failed to write ratchet file: {}", e))?;
-		std::fs::rename(&tmp_path, ratchets_path)
-			.map_err(|e| format!("Failed to rename ratchet file: {}", e))?;
+		// Atomic write (tmp + rename, the reference's os.replace).
+		write_ratchet_file_atomically(ratchets_path, &file_data)?;
+
+		// set_ratchets_mirror_path: the identical signed bytes, after the
+		// primary. The primary is already the truth for this process; a mirror
+		// failure is reported loudly and does not undo it.
+		if let Some(mirror_path) = self.ratchets_mirror_path.as_ref() {
+			match write_ratchet_file_atomically(mirror_path, &file_data) {
+				Ok(()) => crate::log(
+					&format!("[RATCHET] mirrored {} ratchets to {}", ratchets.len(), mirror_path),
+					crate::LOG_DEBUG, false, false,
+				),
+				Err(e) => crate::log(
+					&format!("[RATCHET] MIRROR WRITE FAILED for {} -> {}: {} (the primary ratchet file was written; the mirror's reader will not have the newest ratchet)", ratchets_path, mirror_path, e),
+					crate::LOG_CRITICAL, false, false,
+				),
+			}
+		}
 
 		Ok(())
 	}
@@ -1355,5 +1455,188 @@ mod tests {
 			.is_err(),
 			"an outbound SINGLE destination still cannot be created without an identity"
 		);
+	}
+
+	// --- Ratchet mirror and frozen ratchets (A29; Retichat iOS app + NSE) ---
+
+	/// A fresh directory under the system temp dir, removed on drop.
+	struct TempDir(std::path::PathBuf);
+	impl TempDir {
+		fn new(tag: &str) -> Self {
+			let dir = std::env::temp_dir().join(format!(
+				"rns_ratchet_{}_{}",
+				tag,
+				crate::hexrep(&crate::identity::get_random_hash(), false)
+			));
+			std::fs::create_dir_all(&dir).expect("temp dir");
+			TempDir(dir)
+		}
+		fn file(&self, name: &str) -> String {
+			self.0.join(name).to_string_lossy().to_string()
+		}
+	}
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn delivery_destination(identity: &Identity) -> Destination {
+		Destination::new_inbound(
+			Some(identity.clone()),
+			DestinationType::Single,
+			"ratchettest".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("inbound destination")
+	}
+
+	fn ratchet_pub(prv: &[u8]) -> Vec<u8> {
+		Identity::ratchet_public_bytes(prv).expect("ratchet public bytes")
+	}
+
+	fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+		haystack.windows(needle.len()).any(|w| w == needle)
+	}
+
+	/// Build (never send) an announce and return its announce data.
+	fn announce_data(destination: &mut Destination) -> Vec<u8> {
+		destination
+			.announce(None, false, None, None, false)
+			.expect("announce")
+			.expect("an unsent announce packet")
+			.data
+	}
+
+	#[test]
+	fn the_ratchet_mirror_receives_the_identical_signed_file_on_every_rotation() {
+		let dir = TempDir::new("mirror");
+		let primary = dir.file("app.ratchets");
+		let mirror = dir.file("nse.ratchets");
+		let identity = Identity::new(true);
+
+		let mut app = delivery_destination(&identity);
+		app.set_ratchets_mirror_path(Some(mirror.clone()));
+		app.enable_ratchets(primary.clone()).expect("enable_ratchets");
+		assert_eq!(
+			std::fs::read(&mirror).expect("the empty ratchet file enable_ratchets creates is mirrored"),
+			std::fs::read(&primary).expect("primary"),
+		);
+
+		// The first announce of a run rotates (enable_ratchets resets the
+		// rotation time): exactly the rotation the NSE's copy used to miss.
+		let data = announce_data(&mut app);
+		let newest = app.ratchets.as_ref().expect("ratchets")[0].clone();
+		assert!(contains(&data, &ratchet_pub(&newest)), "the announce carries the new ratchet");
+		assert_eq!(
+			std::fs::read(&mirror).expect("mirror"),
+			std::fs::read(&primary).expect("primary"),
+			"the mirror holds byte for byte the signed file the primary holds"
+		);
+
+		// A second rotation is mirrored too.
+		app.latest_ratchet_time = 0;
+		assert!(app.rotate_ratchets().expect("rotate"));
+		assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&primary).unwrap());
+
+		// The mirror is a valid ratchet file for the same identity: a second
+		// copy of the destination loads both ratchets from it.
+		let mut reader = delivery_destination(&identity);
+		reader.set_ratchets_frozen(true);
+		reader.enable_ratchets(mirror.clone()).expect("enable_ratchets on the mirror");
+		assert_eq!(reader.ratchets, app.ratchets, "the mirror loads the app's ratchets, newest first");
+		assert!(!std::path::Path::new(&format!("{}.tmp", mirror)).exists(), "no temporary file is left behind");
+	}
+
+	#[test]
+	fn a_failed_mirror_write_never_fails_the_primary() {
+		let dir = TempDir::new("mirrorfail");
+		let primary = dir.file("app.ratchets");
+		let unwritable = dir.file("no_such_directory/nse.ratchets");
+		let identity = Identity::new(true);
+
+		let mut app = delivery_destination(&identity);
+		app.set_ratchets_mirror_path(Some(unwritable.clone()));
+		app.enable_ratchets(primary.clone()).expect("enable_ratchets succeeds although the mirror cannot be written");
+		assert!(app.rotate_ratchets().expect("rotation succeeds although the mirror cannot be written"));
+		assert!(!std::path::Path::new(&unwritable).exists());
+
+		let mut reloaded = delivery_destination(&identity);
+		reloaded.enable_ratchets(primary.clone()).expect("reload the primary");
+		assert_eq!(reloaded.ratchets, app.ratchets, "the primary holds the rotated ratchet");
+		assert_eq!(reloaded.ratchets.as_ref().map(|r| r.len()), Some(1));
+	}
+
+	#[test]
+	fn frozen_ratchets_never_rotate_or_write_and_announces_carry_the_existing_ratchet() {
+		let dir = TempDir::new("frozen");
+		let path = dir.file("shared.ratchets");
+		let identity = Identity::new(true);
+
+		// The owner (the app) writes one ratchet.
+		let mut owner = delivery_destination(&identity);
+		owner.enable_ratchets(path.clone()).expect("enable_ratchets");
+		assert!(owner.rotate_ratchets().expect("rotate"));
+		let owned = owner.ratchets.clone().expect("ratchets");
+		let before = std::fs::read(&path).expect("ratchet file");
+
+		// The frozen copy (the NSE) loads it and announces: enable_ratchets
+		// reset its rotation time, so an unfrozen copy would rotate here.
+		let mut frozen = delivery_destination(&identity);
+		frozen.set_ratchets_frozen(true);
+		frozen.enable_ratchets(path.clone()).expect("enable_ratchets");
+		let data = announce_data(&mut frozen);
+		assert!(contains(&data, &ratchet_pub(&owned[0])), "the announce carries the existing newest ratchet");
+		assert_eq!(frozen.ratchets.as_ref(), Some(&owned), "no ratchet was generated");
+		assert_eq!(frozen.rotate_ratchets(), Ok(false), "a frozen destination never rotates");
+		assert_eq!(std::fs::read(&path).expect("ratchet file"), before, "the ratchet file is untouched");
+		assert!(!std::path::Path::new(&format!("{}.tmp", path)).exists(), "not even a temporary file was written");
+
+		// Frozen before enable_ratchets, a missing file is not created.
+		let missing = dir.file("missing.ratchets");
+		let mut frozen_empty = delivery_destination(&identity);
+		frozen_empty.set_ratchets_frozen(true);
+		frozen_empty.enable_ratchets(missing.clone()).expect("enable_ratchets");
+		let _ = announce_data(&mut frozen_empty);
+		assert!(!std::path::Path::new(&missing).exists(), "a frozen destination never creates the ratchet file");
+		assert_eq!(frozen_empty.ratchets.as_ref().map(|r| r.len()), Some(0));
+	}
+
+	#[test]
+	fn a_frozen_destination_reloads_a_ratchet_the_owner_mirrored_after_it_loaded() {
+		let dir = TempDir::new("reload");
+		let primary = dir.file("app.ratchets");
+		let mirror = dir.file("nse.ratchets");
+		let identity = Identity::new(true);
+
+		let mut app = delivery_destination(&identity);
+		app.set_ratchets_mirror_path(Some(mirror.clone()));
+		app.enable_ratchets(primary.clone()).expect("enable_ratchets");
+		assert!(app.rotate_ratchets().expect("first rotation"));
+
+		// The NSE starts with the one ratchet the mirror holds.
+		let mut nse = delivery_destination(&identity);
+		nse.set_ratchets_frozen(true);
+		nse.enable_ratchets(mirror.clone()).expect("enable_ratchets");
+		assert_eq!(nse.ratchets.as_ref().map(|r| r.len()), Some(1));
+
+		// While it runs, the app rotates; the rotation reaches the mirror.
+		app.latest_ratchet_time = 0;
+		assert!(app.rotate_ratchets().expect("second rotation"));
+		let newest = app.ratchets.as_ref().expect("ratchets")[0].clone();
+
+		// A sender encrypts to the newest ratchet (the app's announce).
+		let plaintext = b"propagated to the newest ratchet".to_vec();
+		let ciphertext = identity
+			.encrypt_with_ratchet(&plaintext, Some(&ratchet_pub(&newest)))
+			.expect("encrypt");
+
+		let mirror_before = std::fs::read(&mirror).expect("mirror");
+		assert_eq!(
+			nse.decrypt(&ciphertext).expect("the frozen copy reloads the mirror after a miss and decrypts"),
+			plaintext
+		);
+		assert_eq!(nse.ratchets, app.ratchets, "the reload picked up the app's rotation");
+		assert_eq!(std::fs::read(&mirror).expect("mirror"), mirror_before, "the reload wrote nothing");
 	}
 }

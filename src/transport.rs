@@ -2304,9 +2304,15 @@ impl Transport {
                     LOG_NOTICE, false, false,
                 );
                 let _ = dest.announce(app_data.as_deref(), true, attached_interface, tag, true);
+                // Write back only what the announce changed, to the entry with
+                // this hash. Until 2026-09-27 the whole copy was written back
+                // by index: a setting changed on the registered copy meanwhile
+                // (default app_data, the ratchet mirror or freeze) was undone,
+                // and a deregistration meanwhile put the copy over a different
+                // destination's slot.
                 let mut state = TRANSPORT.lock().unwrap();
-                if idx < state.destinations.len() {
-                    state.destinations[idx] = dest;
+                if let Some(slot) = state.destinations.iter_mut().find(|d| d.hash == destination_hash) {
+                    Transport::store_announced_state(slot, &dest);
                 }
             }
             return;
@@ -5270,6 +5276,63 @@ impl Transport {
             }
             None => false,
         }
+    }
+
+    /// `Destination::set_ratchets_mirror_path` on Transport's registered copy
+    /// of a destination, in place. That copy announces on its own (path
+    /// responses, the published-destination refresh) and so rotates and
+    /// persists ratchets itself: a mirror set only on the application's copy
+    /// would miss those rotations. Only an existing registration is changed
+    /// and nothing else in it; returns whether one was found.
+    /// A named departure used only by the Retichat iOS app (A29).
+    pub fn set_registered_ratchets_mirror_path(destination_hash: &[u8], mirror_path: Option<String>) -> bool {
+        let mut state = TRANSPORT.lock().unwrap();
+        match state.destinations.iter_mut().find(|d| d.hash == destination_hash) {
+            Some(existing) => {
+                existing.set_ratchets_mirror_path(mirror_path);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `Destination::set_ratchets_frozen` on Transport's registered copy of a
+    /// destination, in place (see `set_registered_ratchets_mirror_path` for
+    /// why that copy needs it). Returns whether a registration was found.
+    /// A named departure used only by the Retichat iOS extension (A29).
+    pub fn set_registered_ratchets_frozen(destination_hash: &[u8], frozen: bool) -> bool {
+        let mut state = TRANSPORT.lock().unwrap();
+        match state.destinations.iter_mut().find(|d| d.hash == destination_hash) {
+            Some(existing) => {
+                existing.set_ratchets_frozen(frozen);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The (mirror path, frozen) ratchet settings of a registered
+    /// destination: None when no destination with this hash is registered.
+    pub fn registered_ratchet_settings(destination_hash: &[u8]) -> Option<(Option<String>, bool)> {
+        let state = TRANSPORT.lock().unwrap();
+        state
+            .destinations
+            .iter()
+            .find(|d| d.hash == destination_hash)
+            .map(|d| (d.ratchets_mirror_path.clone(), d.ratchets_frozen))
+    }
+
+    /// Write what announcing a COPY of a registered destination changed back
+    /// into the registered destination: the ratchet list and rotation time
+    /// (announce may rotate) and the path-response cache (a tagged announce
+    /// caches its data). Nothing else: the copy was taken with the TRANSPORT
+    /// lock released, so any other field of the registered destination may
+    /// have been changed meanwhile (default app_data, the ratchet mirror or
+    /// freeze, an application's update_destination) and must be kept.
+    fn store_announced_state(slot: &mut Destination, announced: &Destination) {
+        slot.ratchets = announced.ratchets.clone();
+        slot.latest_ratchet_time = announced.latest_ratchet_time;
+        slot.path_responses = announced.path_responses.clone();
     }
 
     /// The default app_data of a registered destination: None when no
@@ -10114,6 +10177,257 @@ mod tests {
         Transport::reset_announce_history();
         uninstall_sync_outbound_handler(iface_name);
         let _ = std::fs::remove_file(&ratchet_path);
+    }
+
+    /// A29: a temp directory for the ratchet mirror/freeze tests, removed on drop.
+    struct RatchetTestDir(std::path::PathBuf);
+    impl RatchetTestDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rns_transport_ratchet_{}_{}",
+                tag,
+                crate::hexrep(&Identity::get_random_hash(), false)
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            RatchetTestDir(dir)
+        }
+        fn file(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().to_string()
+        }
+    }
+    impl Drop for RatchetTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn register_online_capture_interface(iface_name: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(iface_name, captured.clone());
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = iface_name.to_string();
+        stub_config.online = Some(true);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub_config);
+        captured
+    }
+
+    fn wait_for_capture(captured: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = captured.lock().unwrap().clone();
+            if !seen.is_empty() {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "the path response never reached the wire");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A29: Transport's registered copy answers path requests by announcing,
+    /// and its first announce rotates. With the mirror set on that copy, the
+    /// rotation it persists reaches the mirror, byte for byte.
+    #[test]
+    fn a_path_response_rotation_by_the_registered_copy_reaches_the_ratchet_mirror() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let dir = RatchetTestDir::new("pr_mirror");
+        let primary = dir.file("app.ratchets");
+        let mirror = dir.file("nse.ratchets");
+
+        let iface_name = "test-ratchet-mirror-pr";
+        let captured = register_online_capture_interface(iface_name);
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "ratchet_mirror".to_string(),
+            vec!["pathresponse".to_string()],
+        )
+        .expect("inbound destination");
+        destination.enable_ratchets(primary.clone()).expect("enable_ratchets");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        assert!(Transport::set_registered_ratchets_mirror_path(&dest_hash, Some(mirror.clone())));
+        assert!(!Transport::set_registered_ratchets_mirror_path(&Identity::get_random_hash(), Some(mirror.clone())),
+            "an unregistered hash reports that nothing was set");
+
+        Transport::path_request(dest_hash.clone(), false, Some(iface_name.to_string()), None, Some(Identity::get_random_hash()));
+        let _ = wait_for_capture(&captured);
+
+        let ratchets = {
+            let state = TRANSPORT.lock().unwrap();
+            state.destinations.iter().find(|d| d.hash == dest_hash).expect("registered").ratchets.clone()
+        };
+        assert_eq!(ratchets.as_ref().map(|r| r.len()), Some(1), "the path response rotated on the registered copy");
+        assert_eq!(
+            std::fs::read(&mirror).expect("the rotation was mirrored"),
+            std::fs::read(&primary).expect("primary"),
+            "the mirror holds the identical signed file"
+        );
+        assert_eq!(
+            Transport::registered_ratchet_settings(&dest_hash),
+            Some((Some(mirror.clone()), false)),
+            "the write-back after the path response keeps the mirror setting"
+        );
+
+        Transport::deregister_destination(&dest_hash);
+        uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// A29: a frozen registered copy (the iOS NSE's) answers a path request
+    /// with the ratchet it holds and never rotates or writes the file.
+    #[test]
+    fn a_frozen_registered_copy_answers_path_requests_without_rotating_or_writing() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let dir = RatchetTestDir::new("pr_frozen");
+        let path = dir.file("shared.ratchets");
+        let identity = Identity::new(true);
+
+        // The owner writes one ratchet to the shared file.
+        let mut owner = Destination::new_inbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "ratchet_frozen".to_string(),
+            vec!["pathresponse".to_string()],
+        )
+        .expect("owner destination");
+        owner.enable_ratchets(path.clone()).expect("enable_ratchets");
+        assert!(owner.rotate_ratchets().expect("rotate"));
+        let owned = owner.ratchets.clone().expect("ratchets");
+        let before = std::fs::read(&path).expect("ratchet file");
+
+        let iface_name = "test-ratchet-frozen-pr";
+        let captured = register_online_capture_interface(iface_name);
+        let mut copy = Destination::new_inbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "ratchet_frozen".to_string(),
+            vec!["pathresponse".to_string()],
+        )
+        .expect("second copy");
+        copy.enable_ratchets(path.clone()).expect("enable_ratchets");
+        let dest_hash = copy.hash.clone();
+        Transport::register_destination(copy);
+        assert!(Transport::set_registered_ratchets_frozen(&dest_hash, true));
+
+        Transport::path_request(dest_hash.clone(), false, Some(iface_name.to_string()), None, Some(Identity::get_random_hash()));
+        let sent = wait_for_capture(&captured);
+        let ratchet_pub = Identity::ratchet_public_bytes(&owned[0]).expect("ratchet pub");
+        assert!(
+            sent.iter().any(|raw| raw.windows(ratchet_pub.len()).any(|w| w == &ratchet_pub[..])),
+            "the path response carries the existing ratchet"
+        );
+        let held = {
+            let state = TRANSPORT.lock().unwrap();
+            state.destinations.iter().find(|d| d.hash == dest_hash).expect("registered").ratchets.clone()
+        };
+        assert_eq!(held.as_ref(), Some(&owned), "the frozen registered copy generated no ratchet");
+        assert_eq!(std::fs::read(&path).expect("ratchet file"), before, "the ratchet file is untouched");
+        assert_eq!(Transport::registered_ratchet_settings(&dest_hash), Some((None, true)));
+
+        Transport::deregister_destination(&dest_hash);
+        uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// A29: the published-destination refresh also announces a copy of the
+    /// registered destination; its rotation reaches the mirror too.
+    #[test]
+    fn a_refresh_sweep_rotation_reaches_the_ratchet_mirror() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let dir = RatchetTestDir::new("sweep_mirror");
+        let primary = dir.file("app.ratchets");
+        let mirror = dir.file("nse.ratchets");
+
+        let iface_name = "test-ratchet-mirror-sweep";
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(Identity::new(true));
+            state.published_destinations.clear();
+            state.announce_sent_at.clear();
+            state.last_mgmt_announce = now() + 60.0;
+        }
+        let mut destination = Destination::new_inbound(
+            Some(Identity::new(true)),
+            DestinationType::Single,
+            "ratchet_mirror".to_string(),
+            vec!["sweep".to_string()],
+        )
+        .expect("inbound destination");
+        destination.enable_ratchets(primary.clone()).expect("enable_ratchets");
+        let dest_hash = destination.hash.clone();
+        Transport::register_destination(destination);
+        assert!(Transport::set_registered_ratchets_mirror_path(&dest_hash, Some(mirror.clone())));
+        Transport::publish_destination(dest_hash.clone(), Some(Duration::from_secs(3600)), None);
+
+        let captured = register_online_capture_interface(iface_name);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.published_last_checked = 0.0;
+            state.published_last_announced_at = 0.0;
+        }
+        Transport::jobs();
+        assert_eq!(captured.lock().unwrap().len(), 1, "one refresh announce went out");
+        assert_eq!(
+            std::fs::read(&mirror).expect("the sweep's rotation was mirrored"),
+            std::fs::read(&primary).expect("primary"),
+        );
+        let mut reader = Destination::new_inbound(
+            {
+                let state = TRANSPORT.lock().unwrap();
+                state.destinations.iter().find(|d| d.hash == dest_hash).expect("registered").identity.clone()
+            },
+            DestinationType::Single,
+            "ratchet_mirror".to_string(),
+            vec!["sweep".to_string()],
+        )
+        .expect("reader");
+        reader.set_ratchets_frozen(true);
+        reader.enable_ratchets(mirror.clone()).expect("load the mirror");
+        assert_eq!(reader.ratchets.as_ref().map(|r| r.len()), Some(1), "the mirror carries the advertised ratchet");
+
+        Transport::unpublish_destination(&dest_hash);
+        Transport::reset_announce_history();
+        Transport::deregister_destination(&dest_hash);
+        uninstall_sync_outbound_handler(iface_name);
+    }
+
+    /// The write-back after announcing a copy of a registered destination
+    /// takes the ratchet state and path-response cache from the copy and
+    /// keeps every other field of the registered destination, which may have
+    /// changed while the copy announced without the TRANSPORT lock.
+    #[test]
+    fn announced_state_write_back_keeps_settings_changed_meanwhile() {
+        let identity = Identity::new(true);
+        let mut slot = Destination::new_inbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "writeback".to_string(),
+            vec!["fields".to_string()],
+        )
+        .expect("destination");
+        let mut announced = slot.clone();
+        announced.ratchets = Some(vec![vec![7u8; 32]]);
+        announced.latest_ratchet_time = 1234;
+        announced.path_responses.insert(vec![1, 2, 3], (99, vec![4, 5, 6]));
+
+        // Changed on the registered copy while the copy announced.
+        slot.set_ratchets_mirror_path(Some("/mirror".to_string()));
+        slot.set_ratchets_frozen(true);
+        slot.set_default_app_data(Some(b"renamed".to_vec()));
+
+        Transport::store_announced_state(&mut slot, &announced);
+        assert_eq!(slot.ratchets, announced.ratchets);
+        assert_eq!(slot.latest_ratchet_time, 1234);
+        assert_eq!(slot.path_responses.get(&vec![1, 2, 3]), Some(&(99, vec![4, 5, 6])));
+        assert_eq!(slot.ratchets_mirror_path.as_deref(), Some("/mirror"), "the mirror set meanwhile is kept");
+        assert!(slot.ratchets_frozen, "the freeze set meanwhile is kept");
+        assert_eq!(slot.default_app_data.as_deref(), Some(&b"renamed"[..]), "the app_data set meanwhile is kept");
     }
 
     #[test]

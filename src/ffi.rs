@@ -50,6 +50,14 @@ pub fn get_handle<T: Clone + 'static>(id: u64) -> Option<T> {
         .cloned()
 }
 
+/// Run `f` on the value behind a handle in place (the handle keeps its id).
+/// `None` when the handle does not exist or holds another type.
+pub fn with_handle_mut<T: 'static, R>(id: u64, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+    let mut handles = HANDLES.lock().unwrap();
+    let value = handles.get_mut(&id)?.downcast_mut::<T>()?;
+    Some(f(value))
+}
+
 /// Remove a value from the registry and return it (transfers ownership).
 pub fn take_handle<T: 'static>(id: u64) -> Option<T> {
     let boxed = HANDLES.lock().unwrap().remove(&id)?;
@@ -935,4 +943,19 @@ pub fn link_request(
         .map_err(|_| "response lock poisoned")?
         .take();
     result.ok_or_else(|| "Request failed or timed out".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_handle_mut_changes_the_value_in_place_and_keeps_the_handle() {
+        let id = store_handle(41u32);
+        assert_eq!(with_handle_mut(id, |v: &mut u32| { *v += 1; *v }), Some(42));
+        assert_eq!(get_handle::<u32>(id), Some(42), "the same handle holds the changed value");
+        assert_eq!(with_handle_mut(id, |_: &mut String| ()), None, "another type is not found");
+        destroy_handle(id);
+        assert_eq!(with_handle_mut(id, |_: &mut u32| ()), None, "a destroyed handle is not found");
+    }
 }
