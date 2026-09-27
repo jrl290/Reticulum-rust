@@ -5254,6 +5254,35 @@ impl Transport {
         }
     }
 
+    /// Replace the default app_data of an already-registered destination in
+    /// place. A path request for a local destination that is not published
+    /// is answered by announcing Transport's copy with its default app_data
+    /// (see the path request handler), so an application that changes what
+    /// it announces must change that copy too. Only an existing registration
+    /// is changed and nothing else in it (the ratchets are kept); returns
+    /// whether one was found.
+    pub fn update_registered_default_app_data(destination_hash: &[u8], app_data: Option<Vec<u8>>) -> bool {
+        let mut state = TRANSPORT.lock().unwrap();
+        match state.destinations.iter_mut().find(|d| d.hash == destination_hash) {
+            Some(existing) => {
+                existing.set_default_app_data(app_data);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The default app_data of a registered destination: None when no
+    /// destination with this hash is registered.
+    pub fn registered_default_app_data(destination_hash: &[u8]) -> Option<Option<Vec<u8>>> {
+        let state = TRANSPORT.lock().unwrap();
+        state
+            .destinations
+            .iter()
+            .find(|d| d.hash == destination_hash)
+            .map(|d| d.default_app_data.clone())
+    }
+
     pub fn deregister_destination(destination_hash: &[u8]) {
         let mut state = TRANSPORT.lock().unwrap();
         state.destinations.retain(|d| d.hash != destination_hash);
@@ -12124,5 +12153,38 @@ mod published_app_data_tests {
         Transport::unpublish_destination(&hash);
         assert!(!Transport::update_published_app_data(&hash, Some(vec![3])));
         assert!(!Transport::is_published(&hash), "an unpublish stays unpublished");
+    }
+
+    /// A path request for a local destination that is not published is
+    /// answered with Transport's copy's default app_data, so a change to
+    /// what the destination announces must reach that copy (the iOS
+    /// notification extension runs a copy of the device's delivery
+    /// destination it never publishes). Only an existing registration is
+    /// changed, and it is changed in place.
+    #[test]
+    fn updating_a_registered_destination_s_default_app_data() {
+        let identity = crate::identity::Identity::new(true);
+        let destination = Destination::new_inbound(
+            Some(identity),
+            DestinationType::Single,
+            "published_app_data_tests".to_string(),
+            vec!["registered".to_string()],
+        )
+        .expect("inbound destination");
+        let hash = destination.hash.clone();
+        assert!(!Transport::update_registered_default_app_data(&hash, Some(vec![1])), "nothing registered yet");
+        assert_eq!(Transport::registered_default_app_data(&hash), None, "an update registers nothing");
+
+        Transport::register_destination(destination);
+        assert_eq!(Transport::registered_default_app_data(&hash), Some(None));
+        assert!(Transport::update_registered_default_app_data(&hash, Some(vec![2])));
+        assert_eq!(Transport::registered_default_app_data(&hash), Some(Some(vec![2])));
+        assert!(!Transport::is_published(&hash), "an update does not publish");
+        assert!(Transport::update_registered_default_app_data(&hash, None));
+        assert_eq!(Transport::registered_default_app_data(&hash), Some(None));
+
+        Transport::deregister_destination(&hash);
+        assert!(!Transport::update_registered_default_app_data(&hash, Some(vec![3])));
+        assert_eq!(Transport::registered_default_app_data(&hash), None, "a deregistration stays");
     }
 }
