@@ -14,6 +14,8 @@ pub mod i2p;
 pub mod rnode_interface;
 #[cfg(feature = "post-interface")]
 pub mod post_interface;
+#[cfg(feature = "prns-ble")]
+pub mod prns_ble;
 
 pub use interface::Interface;
 pub use local_interface::{LocalClientInterface, LocalServerInterface};

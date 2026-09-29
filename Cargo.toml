@@ -11,6 +11,9 @@ path = "src/bin/rnsd.rs"
 default = ["serial", "post-interface"]
 serial = ["dep:serialport", "dep:btleplug", "dep:uuid", "dep:futures"]
 post-interface = ["dep:reqwest", "dep:base64", "dep:serde_json"]
+# Phone-to-RTNode Bluetooth LE (Prns native protocol, central side); the
+# phone apps drive the radio. Off by default: rnsd and rfed never use it.
+prns-ble = []
 python-oracle-tests = []
 
 [dependencies]
