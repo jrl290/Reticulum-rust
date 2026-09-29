@@ -7338,13 +7338,18 @@ mod tests {
         saved_identity: Option<Identity>,
     }
 
+    /// Takes a test's link out of the runtime registry when the test ends.
+    /// Made before the link is registered: it holds the registry shared
+    /// until then, so `teardown_all_runtime_links_empties_the_registry` does
+    /// not tear the link down while the test uses it.
     struct RuntimeLinkGuard {
         link_id: Vec<u8>,
+        _registry: std::sync::RwLockReadGuard<'static, ()>,
     }
 
     impl RuntimeLinkGuard {
         fn new(link_id: Vec<u8>) -> Self {
-            Self { link_id }
+            Self { link_id, _registry: crate::link::runtime_links_shared() }
         }
     }
 
@@ -7678,8 +7683,8 @@ mod tests {
 
         let runtime_link = Arc::new(Mutex::new(runtime_link));
         let runtime_link_handle = runtime_link.clone();
-        crate::link::register_runtime_link(runtime_link);
         let _runtime_guard = RuntimeLinkGuard::new(runtime_link_id.clone());
+        crate::link::register_runtime_link(runtime_link);
 
         let signature = proving_identity.sign(&receipt.hash);
         let mut proof_data = receipt.hash.clone();
@@ -7756,8 +7761,9 @@ mod tests {
         let public = proving.get_public_key().expect("proving identity public key");
         link.load_peer(vec![0u8; 32], public[32..64].to_vec())
             .expect("load proving key into runtime link");
+        let guard = RuntimeLinkGuard::new(link_id.clone());
         crate::link::register_runtime_link(Arc::new(Mutex::new(link)));
-        (link_id.clone(), RuntimeLinkGuard::new(link_id))
+        (link_id, guard)
     }
 
     /// The raw explicit PROOF, over link `link_id`, of the packet `receipt_hash`.

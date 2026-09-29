@@ -1266,6 +1266,25 @@ fn actor_check_request_timeouts(link: &mut Link) {
 static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, LinkHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// The registry is process-global and libtest runs tests in parallel in one
+/// process. A test that keeps a link in the registry holds this lock shared
+/// for as long as it needs the link (`runtime_links_shared`); a test that
+/// empties the registry (`teardown_all_runtime_links`) holds it exclusively
+/// (`runtime_links_exclusive`), so it never tears down another test's link
+/// half way through that test.
+#[cfg(test)]
+static RUNTIME_LINKS_TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+pub(crate) fn runtime_links_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    RUNTIME_LINKS_TEST_LOCK.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_links_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    RUNTIME_LINKS_TEST_LOCK.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Register a link handle in the global registry.
 /// The actor thread is already running (spawned in LinkHandle::spawn),
 /// so no separate watchdog thread is needed.
@@ -5213,6 +5232,7 @@ mod tests {
     /// while the caller already holds the link's Mutex.
     #[test]
     fn unregister_runtime_link_no_deadlock_while_holding_link_mutex() {
+        let _registry = runtime_links_shared();
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
         let link = make_incoming_link(link_id.clone());
         let link_arc = Arc::new(Mutex::new(link));
@@ -5236,6 +5256,7 @@ mod tests {
     /// be absent from RUNTIME_LINKS.
     #[test]
     fn unregister_runtime_link_removes_from_registry() {
+        let _registry = runtime_links_shared();
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(17)).collect();
         let link = make_incoming_link(link_id.clone());
         let link_arc = Arc::new(Mutex::new(link));
@@ -5258,6 +5279,7 @@ mod tests {
     /// Both inbound and outbound links should appear in RUNTIME_LINKS.
     #[test]
     fn register_runtime_link_outbound_stored_in_registry() {
+        let _registry = runtime_links_shared();
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(19)).collect();
         let dest = crate::destination::Destination::default();
         let mut link = Link::new_inbound(dest).expect("new_inbound");
@@ -5805,6 +5827,9 @@ mod tests {
     /// does not inherit the previous stack's link actors.
     #[test]
     fn teardown_all_runtime_links_empties_the_registry() {
+        // It tears down every registered link, so no other test may have one
+        // in the registry meanwhile.
+        let _registry = runtime_links_exclusive();
         let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(97)).collect());
         link.state = STATE_ACTIVE;
         link.status = STATE_ACTIVE;
@@ -6211,8 +6236,11 @@ mod tests {
     /// its own watchdog leaves it as it is for the length of a test. It is in
     /// the runtime registry, as a real link is, so a packet to it can be
     /// packed (encrypted through the actor) and would go out; the close takes
-    /// it out again.
-    fn live_keyed_link(seed: u8, status: u8) -> LinkHandle {
+    /// it out again. The test holds the registry shared (the guard returned)
+    /// until it ends, so `teardown_all_runtime_links_empties_the_registry`
+    /// cannot tear the link down under it.
+    fn live_keyed_link(seed: u8, status: u8) -> (LinkHandle, std::sync::RwLockReadGuard<'static, ()>) {
+        let registry = runtime_links_shared();
         let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(seed)).collect());
         link.state = status;
         link.status = status;
@@ -6229,7 +6257,7 @@ mod tests {
         install_session_key(&mut link);
         let handle = LinkHandle::spawn(link);
         register_runtime_link_handle(handle.clone());
-        handle
+        (handle, registry)
     }
 
     /// An outgoing single-segment Resource with data, built through `link`,
@@ -6270,7 +6298,7 @@ mod tests {
     /// Resource's data, and the callback never ran.
     #[test]
     fn a_resource_advertised_on_a_closed_link_concludes_failed() {
-        let link = live_keyed_link(151, STATE_ACTIVE);
+        let (link, _registry) = live_keyed_link(151, STATE_ACTIVE);
         let (resource, concluded) = outgoing_resource(&link);
         link.teardown();
         assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
@@ -6293,7 +6321,7 @@ mod tests {
     /// and is never advertised.
     #[test]
     fn a_resource_queued_when_its_link_closes_concludes_failed_within_one_wait_step() {
-        let link = live_keyed_link(157, STATE_ACTIVE);
+        let (link, _registry) = live_keyed_link(157, STATE_ACTIVE);
         let (in_flight, in_flight_concluded) = outgoing_resource(&link);
         link.register_outgoing_resource(Arc::clone(&in_flight));
         let (queued, concluded) = outgoing_resource(&link);
@@ -6324,7 +6352,7 @@ mod tests {
     /// the link is left as it was.
     #[test]
     fn a_resource_is_not_advertised_on_a_link_that_is_not_active() {
-        let link = live_keyed_link(163, STATE_STALE);
+        let (link, _registry) = live_keyed_link(163, STATE_STALE);
         let (resource, concluded) = outgoing_resource(&link);
 
         let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
