@@ -10,7 +10,11 @@ A phone running Retichat reaches the mesh through a nearby RTNode over Bluetooth
   - The phone advertises nothing and hosts no GATT service.
   - It dials only advertisements carrying the peripheral-only role flag, which RTNode sends and no phone or Prns daemon does.
 - **Zero configuration.** "It should be any RTNode in range. Zero config."
-  - There is no picker. One switch, Nearby RTNode, is on by default.
+  - There is no picker, only one switch, Nearby RTNode, which is **off by default** (James, 2026-09-29). On by default would have shown every existing user a Bluetooth permission prompt at launch.
+  - Turning the switch on asks for the Bluetooth permission.
+    - iOS starts the link on Apply.
+    - Android starts it as soon as the permission is granted and the stack is up (`StackRuntime.applyRtnodeBluetoothSetting`).
+  - Refusing the permission turns the switch back off.
   - The phone is linked to one RTNode at a time (`engine::MAX_NODES`), so several nodes in range don't each rebroadcast the phone's traffic onto LoRa.
 - **A persistent Bluetooth identity:** 16 random bytes in `<config dir>/ble_identity`, in the Prns record format.
 - **No L2CAP and no Columba characteristics.** The Hello offers no PSM, so a Prns peer never tries to move the link off GATT.
