@@ -6378,7 +6378,7 @@ mod tests {
         link.teardown();
     }
 
-    /// RNS/Resource.py:426: a Resource's data is encrypted by its link, and a
+    /// RNS/Resource.py:432: a Resource's data is encrypted by its link, and a
     /// link that cannot encrypt it (Link.py:1166-1178 raises) gets no
     /// Resource. Until 2026-09-28 a Resource on a closed link was built on
     /// the plaintext, marked encrypted, and with a payload that repeats an

@@ -438,7 +438,7 @@ impl Resource {
         }
 
         resource.prepare_metadata(metadata, sent_metadata_size)?;
-        resource.prepare_data(data, original_hash)?;
+        let hashed_data = resource.prepare_data(data)?;
 
         resource.max_retries = Resource::MAX_RETRIES;
         resource.max_adv_retries = Resource::MAX_ADV_RETRIES;
@@ -473,9 +473,9 @@ impl Resource {
             }
         });
 
-        if resource.data.is_some() {
+        if let Some(hashed_data) = hashed_data {
             resource.initiator = true;
-            resource.prepare_outgoing(advertise)?;
+            resource.prepare_outgoing(advertise, &hashed_data, original_hash)?;
         } else {
             resource.receive_lock = Arc::new(Mutex::new(()));
         }
@@ -504,7 +504,11 @@ impl Resource {
         Ok(())
     }
 
-    fn prepare_data(&mut self, data: Option<ResourceData>, original_hash: Option<Vec<u8>>) -> Result<(), String> {
+    /// Sets up the outgoing stream: the data with its metadata, compressed
+    /// or not, behind a random prefix, encrypted by the link. Returns the
+    /// data the Resource's hashes cover (`prepare_outgoing` salts them), or
+    /// `None` for a Resource that receives.
+    fn prepare_data(&mut self, data: Option<ResourceData>) -> Result<Option<Vec<u8>>, String> {
         let mut resource_data: Option<Vec<u8>> = None;
 
         if let Some(ResourceData::Bytes(bytes)) = &data {
@@ -591,29 +595,17 @@ impl Resource {
                 self.compressed = false;
             }
 
-            let mut random = identity::get_random_hash();
-            random.truncate(Resource::RANDOM_HASH_SIZE);
-            self.random_hash = random.clone();
-
-            let mut hash_material = uncompressed_payload.clone();
-            hash_material.extend_from_slice(&self.random_hash);
-
             self.compressed_size = payload.len();
             self.uncompressed_size = data.len();
 
-            let hash = identity::full_hash(&hash_material);
-            self.hash = hash.clone();
-            self.truncated_hash = identity::truncated_hash(&hash_material);
-
-            let mut proof_material = uncompressed_payload;
-            proof_material.extend_from_slice(&hash);
-            self.expected_proof = identity::full_hash(&proof_material);
-
-            self.original_hash = original_hash.unwrap_or_else(|| hash.clone());
-
-            let mut data_with_random = self.random_hash.clone();
+            // RNS/Resource.py:407-418: the stream starts with a random prefix
+            // of its own. The salt (`random_hash`) that the hashes and the
+            // part map use is drawn apart from it, afresh on every pass of
+            // the map (`prepare_outgoing`); the receiver drops the prefix
+            // and checks the hash against the advertised salt.
+            let mut data_with_random = Resource::new_random_hash();
             data_with_random.extend_from_slice(&payload);
-            // RNS/Resource.py:426: the link encrypts the whole stream, and
+            // RNS/Resource.py:432: the link encrypts the whole stream, and
             // when it cannot (Link.py:1166-1178 logs and raises) no Resource
             // is built. Here that is a link that has closed, or is not yet
             // or no longer ACTIVE or STALE. Until 2026-09-28 the plaintext
@@ -633,12 +625,79 @@ impl Resource {
 
             self.size = self.data.as_ref().unwrap().len();
             self.total_parts = ((self.size as f64) / (self.sdu as f64)).ceil() as usize;
+            return Ok(Some(uncompressed_payload));
+        }
+
+        Ok(None)
+    }
+
+    /// RNS/Resource.py:447 `get_random_hash()[:RANDOM_HASH_SIZE]`.
+    fn new_random_hash() -> Vec<u8> {
+        let mut random = identity::get_random_hash();
+        random.truncate(Resource::RANDOM_HASH_SIZE);
+        random
+    }
+
+    /// RNS/Resource.py:447-453: `random_hash`, and everything derived from
+    /// it: the hash and truncated hash of `hashed_data` (the data with its
+    /// metadata, before compression), the proof the receiver must return,
+    /// and the original hash of a first segment.
+    fn salt(&mut self, random_hash: Vec<u8>, hashed_data: &[u8], original_hash: Option<&[u8]>) {
+        self.random_hash = random_hash;
+        let mut hash_material = hashed_data.to_vec();
+        hash_material.extend_from_slice(&self.random_hash);
+        self.hash = identity::full_hash(&hash_material);
+        self.truncated_hash = identity::truncated_hash(&hash_material);
+
+        let mut proof_material = hash_material;
+        proof_material.truncate(hashed_data.len());
+        proof_material.extend_from_slice(&self.hash);
+        self.expected_proof = identity::full_hash(&proof_material);
+
+        self.original_hash = match original_hash {
+            Some(original_hash) => original_hash.to_vec(),
+            None => self.hash.clone(),
+        };
+    }
+
+    fn prepare_outgoing(
+        &mut self,
+        advertise: bool,
+        hashed_data: &[u8],
+        original_hash: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        self.map_parts(hashed_data, original_hash.as_deref(), &mut Resource::new_random_hash)?;
+
+        // Set hashmap_height to the total number of hashmap segments so the
+        // sender correctly responds to hashmap-update requests from the
+        // receiver.  Without this, hashmap_height stays at 0 and every HMU
+        // request is silently rejected, stalling transfers that need more
+        // than HASHMAP_MAX_LEN (~74) parts.
+        self.hashmap_height = (self.total_parts + ResourceAdvertisement::HASHMAP_MAX_LEN - 1)
+            / ResourceAdvertisement::HASHMAP_MAX_LEN;
+
+        if advertise {
+            self.advertise();
         }
 
         Ok(())
     }
 
-    fn prepare_outgoing(&mut self, advertise: bool) -> Result<(), String> {
+    /// RNS/Resource.py:441-470: cuts the stream into parts and maps each by
+    /// a 4-byte hash salted with `random_hash`. No map hash may repeat within
+    /// `COLLISION_GUARD_SIZE` parts, or the receiver could not tell those
+    /// parts apart; on a collision the whole map is made again under a new
+    /// salt, drawn from `new_random_hash`, with the hashes that follow it.
+    ///
+    /// Until 2026-09-28 the map was made again under the same salt, which
+    /// collides again: one collision (about 3e-5 for a 300 KB Resource) and
+    /// the constructor spun forever.
+    fn map_parts(
+        &mut self,
+        hashed_data: &[u8],
+        original_hash: Option<&[u8]>,
+        new_random_hash: &mut dyn FnMut() -> Vec<u8>,
+    ) -> Result<(), String> {
         let mut parts = Vec::new();
         let mut hashmap = Vec::new();
         let mut packets = Vec::new();
@@ -646,6 +705,7 @@ impl Resource {
 
         let mut hashmap_ok = false;
         while !hashmap_ok {
+            self.salt(new_random_hash(), hashed_data, original_hash);
             let mut collision_guard_list: Vec<Vec<u8>> = Vec::new();
             hashmap_ok = true;
             hashmap.clear();
@@ -659,6 +719,7 @@ impl Resource {
                 let map_hash = self.get_map_hash(&part_data);
 
                 if collision_guard_list.iter().any(|h| h == &map_hash) {
+                    crate::log("Found hash collision in resource map, remapping...", crate::LOG_DEBUG, false, false);
                     hashmap_ok = false;
                     break;
                 }
@@ -692,19 +753,6 @@ impl Resource {
         self.parts = parts;
         self.hashmap = hashmap;
         self.packets = packets;
-
-        // Set hashmap_height to the total number of hashmap segments so the
-        // sender correctly responds to hashmap-update requests from the
-        // receiver.  Without this, hashmap_height stays at 0 and every HMU
-        // request is silently rejected, stalling transfers that need more
-        // than HASHMAP_MAX_LEN (~74) parts.
-        self.hashmap_height = (self.total_parts + ResourceAdvertisement::HASHMAP_MAX_LEN - 1)
-            / ResourceAdvertisement::HASHMAP_MAX_LEN;
-
-        if advertise {
-            self.advertise();
-        }
-
         Ok(())
     }
 
@@ -2657,6 +2705,61 @@ mod tests {
             Some(&ctx),
         )
         .expect("test resource")
+    }
+
+    /// RNS/Resource.py:440-470: when two parts' map hashes collide, the map
+    /// is made again under a new salt, and the hash, truncated hash, expected
+    /// proof and original hash follow that salt. Until 2026-09-28 the map was
+    /// made again under the same salt, collided again, and the constructor
+    /// spun forever.
+    #[test]
+    fn a_part_map_collision_is_mapped_again_under_a_new_salt() {
+        // Two 4-byte parts whose map hashes collide (3551e28b) under the salt
+        // 01020304 and differ under 05060708; found by search.
+        let colliding = vec![0x01u8, 0x02, 0x03, 0x04];
+        let fresh = vec![0x05u8, 0x06, 0x07, 0x08];
+        let parts = [vec![0x00u8, 0x00, 0x0a, 0x7d], vec![0x00u8, 0x00, 0xf9, 0xf3]];
+        let hashed_data = b"the data the hashes cover".to_vec();
+
+        let mut resource = test_resource();
+        resource.sdu = 4;
+        resource.data = Some(parts.concat());
+        resource.total_parts = 2;
+        resource.random_hash = colliding.clone();
+        assert_eq!(resource.get_map_hash(&parts[0]), resource.get_map_hash(&parts[1]),
+            "the parts collide under the first salt");
+
+        // On its own thread: the map that never ends shows as a timeout here.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (salts, hashed) = (vec![colliding, fresh.clone()], hashed_data.clone());
+        thread::spawn(move || {
+            let mut salts = salts.into_iter();
+            let mut drawn = 0;
+            let mapped = resource.map_parts(&hashed, None, &mut || {
+                drawn += 1;
+                salts.next().expect("no third salt is drawn")
+            });
+            let _ = tx.send((mapped, resource, drawn));
+        });
+        let (mapped, mut resource, drawn) = rx.recv_timeout(Duration::from_secs(5))
+            .expect("the part map is made; a collision does not spin");
+        mapped.expect("the parts are mapped");
+
+        assert_eq!(drawn, 2, "one new salt after the collision");
+        assert_eq!(resource.random_hash, fresh);
+        let map_hash = |part: &[u8]| identity::full_hash(&[part, &fresh[..]].concat())[..Resource::MAPHASH_LEN].to_vec();
+        assert_eq!(resource.hashmap, [map_hash(&parts[0]), map_hash(&parts[1])].concat());
+        assert_eq!(resource.parts, parts.iter().cloned().map(Some).collect::<Vec<_>>());
+        let salted = [&hashed_data[..], &fresh[..]].concat();
+        let hash = identity::full_hash(&salted);
+        assert_eq!(resource.hash, hash, "the hash follows the salt");
+        assert_eq!(resource.truncated_hash, identity::truncated_hash(&salted));
+        assert_eq!(resource.expected_proof, identity::full_hash(&[&hashed_data[..], &hash[..]].concat()));
+        assert_eq!(resource.original_hash, hash, "a first segment's original hash is its own hash");
+
+        // A later segment keeps the original hash it was given.
+        resource.salt(fresh, &hashed_data, Some(&[0xAB; 32]));
+        assert_eq!(resource.original_hash, vec![0xAB; 32]);
     }
 
     fn bz2(payload: &[u8]) -> Vec<u8> {
