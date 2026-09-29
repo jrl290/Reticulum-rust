@@ -31,6 +31,9 @@ pub const BITRATE: u64 = 700_000;
 /// engine-internal threads as well as the caller's; implementations hand the
 /// work to their own Bluetooth queue and return.
 pub trait Host: Send + Sync {
+    /// Start or stop scanning for advertisements of the Prns service. The
+    /// host scans from start until told otherwise.
+    fn scan(&self, on: bool);
     fn write(&self, link: u64, characteristic: Characteristic, bytes: &[u8]);
     fn disconnect(&self, link: u64);
     fn link_state(&self, link: u64, state: LinkState, peer: Option<&[u8; IDENTITY_LEN]>, interface: Option<&str>);
@@ -155,6 +158,20 @@ pub fn is_running() -> bool {
     RUNTIME.lock().unwrap().is_some()
 }
 
+/// See `Engine::sighted`: the link to dial the device on, if any.
+pub fn sighted(address: &str, company_id: u16, data: &[u8]) -> Result<Option<u64>, String> {
+    let mut dialled = None;
+    with_engine(|engine| {
+        let (link, effects) = engine.sighted(address, company_id, data, Instant::now(), unix_now());
+        dialled = link;
+        Ok(effects)
+    })??;
+    if dialled.is_some() {
+        wake_timer();
+    }
+    Ok(dialled)
+}
+
 /// See `Engine::link_ready`.
 pub fn link_ready(link: u64, max_write_len: usize) -> Result<(), String> {
     let result = with_engine(|engine| engine.link_ready(link, max_write_len, Instant::now(), unix_now()))?;
@@ -171,7 +188,7 @@ pub fn link_write_done(link: u64, ok: bool) -> Result<(), String> {
 }
 
 pub fn link_closed(link: u64) -> Result<(), String> {
-    with_engine(|engine| Ok(engine.link_closed(link)))?
+    with_engine(|engine| Ok(engine.link_closed(link, Instant::now())))?
 }
 
 /// Runs one engine call under the lock: Transport effects are queued in
@@ -228,6 +245,7 @@ fn route(transport: &Sender<TransportJob>, effects: Vec<Effect>) -> Vec<Effect> 
 fn run_host(host: &Arc<dyn Host>, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
+            Effect::Scan { on } => host.scan(on),
             Effect::Write { link, characteristic, bytes } => host.write(link, characteristic, &bytes),
             Effect::Disconnect { link } => host.disconnect(link),
             Effect::State { link, state, peer, interface } => host.link_state(link, state, peer.as_ref(), interface.as_deref()),
