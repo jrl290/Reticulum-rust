@@ -580,10 +580,23 @@ impl LinkHandle {
         let _ = self.tx.send(LinkMsg::CancelOutgoingResource(resource));
     }
 
-    /// Check if the link is ready for a new outgoing resource.
+    /// RNS/Link.py ready_for_new_resource(): no outgoing Resource is in
+    /// flight on this link.
+    ///
+    /// A link whose actor is gone has closed, and closing cancelled every
+    /// outgoing Resource it held (`link_closed`, RNS/Link.py:686), so the
+    /// answer is the one the reference gives on a closed link: ready. The
+    /// Resource waiting on it then finds the link is not ACTIVE
+    /// (`Resource::ensure_link`, RNS/Resource.py:529) and concludes FAILED.
+    /// The same holds when the actor exits with the question still in its
+    /// mailbox: the reply is dropped and `recv` fails.
+    ///
+    /// Until 2026-09-28 a gone actor answered "not ready": every Resource
+    /// waiting to be advertised on a link that had closed asked again every
+    /// 250 ms forever, holding its data, and its callback never ran.
     pub fn ready_for_new_resource(&self) -> bool {
         let (tx, rx) = oneshot();
-        if self.tx.send(LinkMsg::ReadyForNewResource(tx)).is_err() { return false; }
+        if self.tx.send(LinkMsg::ReadyForNewResource(tx)).is_err() { return true; }
         rx.recv().unwrap_or(true)
     }
 
@@ -804,8 +817,11 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
 /// done on the actor thread itself, where both callers live, it would wait on
 /// its own mailbox forever.
 ///
-/// `concluded` fires exactly once with whether the peer proved receipt. The
-/// Resource's watchdog bounds the transfer, so it always fires.
+/// `concluded` fires exactly once with whether the peer proved receipt. Once
+/// advertised, the Resource's watchdog bounds the transfer and a closing link
+/// cancels it; before that, while it waits for the link's outgoing slot, a
+/// link that closes or is not ACTIVE fails it (`Resource::ensure_link`). So
+/// it always fires.
 fn send_request_resource(
     link: LinkHandle,
     data: Vec<u8>,
@@ -6189,5 +6205,138 @@ mod tests {
                 "resource {} was cancelled by the link closing; it cannot have completed",
                 crate::hexrep(hash, false));
         }
+    }
+
+    /// A live link actor with a session key, in `status`, fresh enough that
+    /// its own watchdog leaves it as it is for the length of a test. It is in
+    /// the runtime registry, as a real link is, so a packet to it can be
+    /// packed (encrypted through the actor) and would go out; the close takes
+    /// it out again.
+    fn live_keyed_link(seed: u8, status: u8) -> LinkHandle {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(seed)).collect());
+        link.state = status;
+        link.status = status;
+        let now = current_time().unwrap_or(0);
+        link.activated_at = Some(now);
+        link.last_inbound = now;
+        link.last_outbound = now;
+        link.last_proof = now;
+        if status == STATE_STALE {
+            // Stale, and an hour from the timeout that would close it.
+            link.stale_since = Some(now);
+            link.stale_grace = 3600.0;
+        }
+        install_session_key(&mut link);
+        let handle = LinkHandle::spawn(link);
+        register_runtime_link_handle(handle.clone());
+        handle
+    }
+
+    /// An outgoing single-segment Resource with data, built through `link`,
+    /// whose callback reports the status it concluded with and when its
+    /// advertisement went out (0.0: never).
+    fn outgoing_resource(
+        link: &LinkHandle,
+    ) -> (Arc<Mutex<Resource>>, mpsc::Receiver<(crate::resource::ResourceStatus, f64)>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let callback: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource: Arc<Mutex<Resource>>| {
+            let resource = resource.lock().unwrap();
+            let _ = tx.lock().unwrap().send((resource.status, resource.adv_sent));
+        });
+        let context = crate::resource::ResourceLinkContext {
+            mtu: 500,
+            rtt: Some(0.1),
+            traffic_timeout_factor: 4.0,
+            establishment_cost: 0,
+            last_resource_window: None,
+            last_resource_eifr: None,
+        };
+        let resource = Resource::new_internal(
+            Some(crate::resource::ResourceData::Bytes(vec![0x5A; 2048])), link.clone(), None, false,
+            crate::resource::AutoCompressOption::Disabled,
+            Some(callback), None, None, 1, None, None, false, 0, Some(&context),
+        ).expect("outgoing resource");
+        assert!(resource.initiator && resource.segment_index == resource.total_segments,
+            "one segment, ours to send");
+        (Arc::new(Mutex::new(resource)), rx)
+    }
+
+    /// RNS/Resource.py:537-545: a Resource advertised on a link that has
+    /// already closed concludes FAILED at once. The closed link has nothing in
+    /// flight, so it is ready for a new Resource, and `ensure_link` finds it
+    /// is not ACTIVE. Until 2026-09-28 the gone actor answered "not ready":
+    /// the advertise thread asked again every 250 ms for good, holding the
+    /// Resource's data, and the callback never ran.
+    #[test]
+    fn a_resource_advertised_on_a_closed_link_concludes_failed() {
+        let link = live_keyed_link(151, STATE_ACTIVE);
+        let (resource, concluded) = outgoing_resource(&link);
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        let advertising = Resource::start_advertising(Arc::clone(&resource));
+
+        let (status, adv_sent) = concluded.recv_timeout(step)
+            .expect("a Resource on a closed link concludes within one wait step");
+        assert_eq!(status, crate::resource::ResourceStatus::Failed);
+        assert_eq!(adv_sent, 0.0, "no advertisement goes out on a closed link");
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert_eq!(Arc::strong_count(&resource), 1, "nothing else holds the Resource or its data");
+        assert!(concluded.recv_timeout(step).is_err(), "the Resource concludes once");
+    }
+
+    /// The same for a Resource already waiting when its link closes: QUEUED
+    /// behind another outgoing Resource, which the close cancels (A11), it
+    /// concludes FAILED at its next ask, within one wait step of the close,
+    /// and is never advertised.
+    #[test]
+    fn a_resource_queued_when_its_link_closes_concludes_failed_within_one_wait_step() {
+        let link = live_keyed_link(157, STATE_ACTIVE);
+        let (in_flight, in_flight_concluded) = outgoing_resource(&link);
+        link.register_outgoing_resource(Arc::clone(&in_flight));
+        let (queued, concluded) = outgoing_resource(&link);
+
+        let advertising = Resource::start_advertising(Arc::clone(&queued));
+        assert!(wait_until(5, || queued.lock().unwrap().status == crate::resource::ResourceStatus::Queued),
+            "the second Resource waits behind the one in flight");
+
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        link.teardown();
+
+        // One wait step, plus one more of slack for a loaded test machine.
+        let (status, adv_sent) = concluded.recv_timeout(2 * step)
+            .expect("a queued Resource concludes within one wait step of its link closing");
+        assert_eq!(status, crate::resource::ResourceStatus::Failed);
+        assert_eq!(adv_sent, 0.0, "it was never advertised");
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert_eq!(Arc::strong_count(&queued), 1, "nothing else holds the Resource or its data");
+        assert!(concluded.recv_timeout(step).is_err(), "the Resource concludes once");
+        assert_eq!(
+            in_flight_concluded.recv_timeout(Duration::from_secs(5)).expect("the close cancels the one in flight").0,
+            crate::resource::ResourceStatus::Failed,
+        );
+    }
+
+    /// RNS/Resource.py:529 ensure_link(): a link that is alive but not ACTIVE
+    /// (here STALE) gets no advertisement. The Resource concludes FAILED, and
+    /// the link is left as it was.
+    #[test]
+    fn a_resource_is_not_advertised_on_a_link_that_is_not_active() {
+        let link = live_keyed_link(163, STATE_STALE);
+        let (resource, concluded) = outgoing_resource(&link);
+
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        let advertising = Resource::start_advertising(Arc::clone(&resource));
+
+        let (status, adv_sent) = concluded.recv_timeout(step)
+            .expect("a Resource on a stale link concludes within one wait step");
+        assert_eq!(status, crate::resource::ResourceStatus::Failed);
+        assert_eq!(adv_sent, 0.0, "no advertisement goes out on a link that is not ACTIVE");
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert_eq!(Arc::strong_count(&resource), 1, "nothing else holds the Resource or its data");
+        assert_eq!(link.status(), STATE_STALE, "failing the transfer leaves the link alone");
+        link.teardown();
     }
 }

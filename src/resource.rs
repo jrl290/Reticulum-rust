@@ -177,6 +177,9 @@ impl Resource {
     pub const RETRY_GRACE_TIME: f64 = 0.25;
     pub const PER_RETRY_DELAY: f64 = 0.5;
     pub const WATCHDOG_MAX_SLEEP: f64 = 1.0;
+    /// RNS/Resource.py:541 `sleep(0.25)`: how often a Resource QUEUED behind
+    /// another outgoing Resource on its link asks again whether it may go.
+    pub const QUEUED_POLL_INTERVAL: f64 = 0.25;
     pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
     pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 
@@ -696,26 +699,13 @@ impl Resource {
         identity::full_hash(&data_with_random)[..Resource::MAPHASH_LEN].to_vec()
     }
 
+    /// RNS/Resource.py:517 advertise(). As before, the advertisement runs on
+    /// a copy of this Resource: the value the caller holds is not the one the
+    /// link and the watchdog hold. `advertise_shared` is the form that keeps
+    /// one instance; this is that form on a fresh `Arc`, so both go through
+    /// the one advertise job.
     pub fn advertise(&mut self) {
-        let resource = Arc::new(Mutex::new(self.clone()));
-        // Clone the Arc so both the locking closure and advertise_job receive
-        // the SAME allocation (advertise_job registers it with the link and
-        // starts the watchdog, avoiding the stale-clone problem).
-        let arc_for_job = resource.clone();
-        thread::spawn(move || {
-            if let Ok(mut r) = resource.lock() {
-                r.advertise_job(arc_for_job);
-            }
-        });
-
-        if self.segment_index < self.total_segments {
-            let resource = Arc::new(Mutex::new(self.clone()));
-            thread::spawn(move || {
-                if let Ok(mut r) = resource.lock() {
-                    r.prepare_next_segment();
-                }
-            });
-        }
+        Resource::advertise_shared(Arc::new(Mutex::new(self.clone())));
     }
 
     /// Advertise using a shared Arc so that the registered outgoing resource,
@@ -723,6 +713,12 @@ impl Resource {
     /// This avoids the stale-clone problem where disconnected copies diverge
     /// in state, causing premature cancellation of large transfers.
     pub fn advertise_shared(resource_arc: Arc<Mutex<Self>>) {
+        let _ = Resource::start_advertising(resource_arc);
+    }
+
+    /// `advertise_shared`, handing back the advertise thread so that a test
+    /// can see it has ended.
+    pub(crate) fn start_advertising(resource_arc: Arc<Mutex<Self>>) -> thread::JoinHandle<()> {
         // Optionally prepare next segment in background
         let needs_next = {
             if let Ok(r) = resource_arc.lock() {
@@ -740,48 +736,68 @@ impl Resource {
             });
         }
 
-        let arc_for_adv = resource_arc.clone();
-        thread::spawn(move || {
-            // Wait until the link is ready for a new resource
-            loop {
-                let ready = {
-                    if let Ok(r) = arc_for_adv.lock() {
-                        r.link.ready_for_new_resource()
-                    } else {
-                        return;
-                    }
-                };
-                if ready {
-                    break;
-                }
-                if let Ok(mut r) = arc_for_adv.lock() {
-                    r.status = ResourceStatus::Queued;
-                }
-                thread::sleep(Duration::from_millis(250));
+        thread::spawn(move || Resource::advertise_job(resource_arc))
+    }
+
+    /// RNS/Resource.py:537 __advertise_job(), on the advertise thread.
+    ///
+    /// `resource_arc` is the one instance that is registered with the link and
+    /// handed to the watchdog, so neither tracks a disconnected copy that
+    /// never sees state updates.
+    ///
+    /// Every way out of here but a poisoned lock concludes the Resource:
+    /// advertised (the watchdog and the link take it from there) or FAILED
+    /// with its callback run.
+    fn advertise_job(resource_arc: Arc<Mutex<Self>>) {
+        // One outgoing Resource at a time per link: while another is in
+        // flight this one is QUEUED and asks again every 0.25 s, as the
+        // reference does. A link that closes cancels the one in flight and
+        // from then on answers "ready" (`LinkHandle::ready_for_new_resource`),
+        // so this wait ends with the link, at the next ask, and `ensure_link`
+        // below fails the transfer. The link is asked without this Resource's
+        // lock held: the question is a round-trip to the link's actor (see the
+        // deadlock note in `start_watchdog`).
+        loop {
+            let link = match resource_arc.lock() {
+                Ok(r) => r.link.clone(),
+                Err(_) => return,
+            };
+            if link.ready_for_new_resource() {
+                break;
             }
+            if let Ok(mut r) = resource_arc.lock() {
+                r.status = ResourceStatus::Queued;
+            }
+            thread::sleep(Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL));
+        }
 
-            // Build and send advertisement
-            let send_ok = {
-                let mut r = match arc_for_adv.lock() {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                let adv = ResourceAdvertisement::new_from_resource(&r);
-                let packed = adv.pack(0).unwrap_or_default();
-                let mut packet = Packet::new(
-                    r.packet_destination(),
-                    packed,
-                    crate::packet::DATA,
-                    RESOURCE_ADV,
-                    BROADCAST,
-                    crate::packet::HEADER_1,
-                    None,
-                    None,
-                    false,
-                    0,
-                );
+        // Build and send advertisement
+        let send_ok = {
+            let mut r = match resource_arc.lock() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            // RNS/Resource.py:544
+            if !r.ensure_link() {
+                return;
+            }
+            let adv = ResourceAdvertisement::new_from_resource(&r);
+            let packed = adv.pack(0).unwrap_or_default();
+            let mut packet = Packet::new(
+                r.packet_destination(),
+                packed,
+                crate::packet::DATA,
+                RESOURCE_ADV,
+                BROADCAST,
+                crate::packet::HEADER_1,
+                None,
+                None,
+                false,
+                0,
+            );
 
-                if packet.send().is_ok() {
+            match packet.send() {
+                Ok(_) => {
                     r.last_activity = now();
                     r.started_transferring = Some(r.last_activity);
                     r.adv_sent = r.last_activity;
@@ -789,70 +805,48 @@ impl Resource {
                     r.status = ResourceStatus::Advertised;
                     r.retries_left = r.max_adv_retries;
                     true
-                } else {
+                }
+                Err(e) => {
+                    // RNS/Resource.py:553-556
+                    crate::log(
+                        &format!("Could not advertise resource {}: {}", &*r, e),
+                        crate::LOG_ERROR, false, false,
+                    );
                     r.cancel();
                     false
                 }
-            };
-
-            if !send_ok {
-                return;
             }
+        };
 
-            // Register the SAME Arc with the link (not a clone)
-            if let Ok(r) = arc_for_adv.lock() {
-                r.link.register_outgoing_resource(arc_for_adv.clone());
-            }
-
-            // Start watchdog on the SAME Arc
-            Resource::start_watchdog(arc_for_adv);
-        });
-    }
-
-    /// Drive advertisement on the background thread.
-    ///
-    /// `self_arc` must be the `Arc<Mutex<Self>>` that wraps `self` so that the
-    /// same allocation is registered with the link and handed to the watchdog.
-    /// This avoids the stale-clone problem where the link and watchdog would
-    /// track a disconnected copy that never sees state updates.
-    fn advertise_job(&mut self, self_arc: Arc<Mutex<Self>>) {
-        while !self.link.ready_for_new_resource() {
-            self.status = ResourceStatus::Queued;
-            thread::sleep(Duration::from_millis(250));
-        }
-
-        let adv = ResourceAdvertisement::new_from_resource(self);
-        let packed = adv.pack(0).unwrap_or_default();
-        let mut packet = Packet::new(
-            self.packet_destination(),
-            packed,
-            crate::packet::DATA,
-            RESOURCE_ADV,
-            BROADCAST,
-            crate::packet::HEADER_1,
-            None,
-            None,
-            false,
-            0,
-        );
-
-        if packet.send().is_ok() {
-            self.last_activity = now();
-            self.started_transferring = Some(self.last_activity);
-            self.adv_sent = self.last_activity;
-            self.rtt = None;
-            self.status = ResourceStatus::Advertised;
-            self.retries_left = self.max_adv_retries;
-            // Register the same Arc (not a new clone) so the link and watchdog
-            // always see up-to-date state.
-            self.link.register_outgoing_resource(self_arc.clone());
-        } else {
-            self.cancel();
+        if !send_ok {
             return;
         }
 
-        // Start watchdog on the same Arc.
-        Resource::start_watchdog(self_arc);
+        // Register the SAME Arc with the link (not a clone)
+        if let Ok(r) = resource_arc.lock() {
+            r.link.register_outgoing_resource(resource_arc.clone());
+        }
+
+        // Start watchdog on the SAME Arc
+        Resource::start_watchdog(resource_arc);
+    }
+
+    /// RNS/Resource.py:529 ensure_link(): a transfer goes on only over an
+    /// ACTIVE link. On any other link (closed, its actor gone, stale, never
+    /// established) the Resource is cancelled, which concludes it FAILED and
+    /// runs its callback, and the abort is logged once, here: at NOTICE, with
+    /// the stack's other drop lines, where the reference logs it at VERBOSE.
+    fn ensure_link(&mut self) -> bool {
+        let status = self.link.status();
+        if status == crate::link::STATE_ACTIVE {
+            return true;
+        }
+        crate::log(
+            &format!("Invalid link state (0x{:02x}) for {}, aborting transfer", status, self),
+            crate::LOG_NOTICE, false, false,
+        );
+        self.cancel();
+        false
     }
 
     /// RNS/Resource.py:610 — how long the receiver still expects to wait for
@@ -2140,6 +2134,16 @@ impl Resource {
 
     fn flags_from_adv(&mut self, adv: &ResourceAdvertisement) {
         self.has_metadata = adv.x;
+    }
+}
+
+/// RNS/Resource.py:1249 `__str__`: `<resource hash/link id>`.
+impl std::fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.hash.is_empty() {
+            return write!(f, "<initializing_resource/unknown>");
+        }
+        write!(f, "<{}/{}>", crate::hexrep(&self.hash, false), crate::hexrep(&self.link.link_id(), false))
     }
 }
 
