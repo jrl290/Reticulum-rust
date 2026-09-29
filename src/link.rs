@@ -6272,6 +6272,19 @@ mod tests {
             let resource = resource.lock().unwrap();
             let _ = tx.lock().unwrap().send((resource.status, resource.adv_sent));
         });
+        let resource = build_outgoing(link, vec![0x5A; 2048], Some(callback)).expect("outgoing resource");
+        assert!(resource.initiator && resource.segment_index == resource.total_segments,
+            "one segment, ours to send");
+        (Arc::new(Mutex::new(resource)), rx)
+    }
+
+    /// `payload`, uncompressed, as an outgoing single-segment Resource on
+    /// `link`, not advertised.
+    fn build_outgoing(
+        link: &LinkHandle,
+        payload: Vec<u8>,
+        callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+    ) -> Result<Resource, String> {
         let context = crate::resource::ResourceLinkContext {
             mtu: 500,
             rtt: Some(0.1),
@@ -6280,14 +6293,11 @@ mod tests {
             last_resource_window: None,
             last_resource_eifr: None,
         };
-        let resource = Resource::new_internal(
-            Some(crate::resource::ResourceData::Bytes(vec![0x5A; 2048])), link.clone(), None, false,
+        Resource::new_internal(
+            Some(crate::resource::ResourceData::Bytes(payload)), link.clone(), None, false,
             crate::resource::AutoCompressOption::Disabled,
-            Some(callback), None, None, 1, None, None, false, 0, Some(&context),
-        ).expect("outgoing resource");
-        assert!(resource.initiator && resource.segment_index == resource.total_segments,
-            "one segment, ours to send");
-        (Arc::new(Mutex::new(resource)), rx)
+            callback, None, None, 1, None, None, false, 0, Some(&context),
+        )
     }
 
     /// RNS/Resource.py:537-545: a Resource advertised on a link that has
@@ -6366,5 +6376,34 @@ mod tests {
         assert_eq!(Arc::strong_count(&resource), 1, "nothing else holds the Resource or its data");
         assert_eq!(link.status(), STATE_STALE, "failing the transfer leaves the link alone");
         link.teardown();
+    }
+
+    /// RNS/Resource.py:426: a Resource's data is encrypted by its link, and a
+    /// link that cannot encrypt it (Link.py:1166-1178 raises) gets no
+    /// Resource. Until 2026-09-28 a Resource on a closed link was built on
+    /// the plaintext, marked encrypted, and with a payload that repeats an
+    /// SDU-sized block the constructor then spun forever.
+    #[test]
+    fn no_resource_is_built_on_a_link_that_cannot_encrypt() {
+        let (link, _registry) = live_keyed_link(167, STATE_ACTIVE);
+        // No SDU-sized block repeats, so a plaintext stream would map without
+        // a collision: kept, it would be built rather than spin.
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+
+        let live = build_outgoing(&link, payload.clone(), None).expect("a live link encrypts the data");
+        assert!(live.encrypted);
+        assert!(live.size > Resource::RANDOM_HASH_SIZE + payload.len(),
+            "the stream is the link's ciphertext (IV, padding, HMAC), not the plaintext");
+
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+
+        match build_outgoing(&link, payload, None) {
+            Ok(resource) => panic!(
+                "a Resource was built on a closed link ({} bytes, from a {} byte payload)",
+                resource.size, 2048,
+            ),
+            Err(reason) => assert!(reason.contains("Encryption on link"), "{}", reason),
+        }
     }
 }

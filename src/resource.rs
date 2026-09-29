@@ -613,7 +613,22 @@ impl Resource {
 
             let mut data_with_random = self.random_hash.clone();
             data_with_random.extend_from_slice(&payload);
-            self.data = Some(self.link.encrypt(&data_with_random).unwrap_or(data_with_random));
+            // RNS/Resource.py:426: the link encrypts the whole stream, and
+            // when it cannot (Link.py:1166-1178 logs and raises) no Resource
+            // is built. Here that is a link that has closed, or is not yet
+            // or no longer ACTIVE or STALE. Until 2026-09-28 the plaintext
+            // was kept and marked encrypted: a payload that repeats an
+            // SDU-sized block then collided in the part map on every pass
+            // and the constructor spun forever.
+            let encrypted = self.link.encrypt(&data_with_random).map_err(|e| {
+                let reason = format!(
+                    "Encryption on link {} failed: {}",
+                    crate::hexrep(&self.link.link_id(), false), e,
+                );
+                crate::log(&reason, crate::LOG_ERROR, false, false);
+                reason
+            })?;
+            self.data = Some(encrypted);
             self.encrypted = true;
 
             self.size = self.data.as_ref().unwrap().len();
