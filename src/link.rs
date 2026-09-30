@@ -3229,9 +3229,13 @@ impl Link {
     
     /// Handle DATA packets
     fn handle_data_packet(&mut self, packet: &Packet) -> Result<(), String> {
+        // Resource parts at DEBUG: one NOTICE line per part is thousands per
+        // photo, and Android's log pruning then dropped the lines that said
+        // why a transfer stalled (2026-09-30). The rest stay at NOTICE.
         crate::log(&format!("[HDR] context=0x{:02x} data_len={} link={}",
             packet.context, packet.data.len(),
-            crate::hexrep(&self.link_id, false)), crate::LOG_NOTICE, false, false);
+            crate::hexrep(&self.link_id, false)),
+            if packet.context == crate::packet::RESOURCE { crate::LOG_DEBUG } else { crate::LOG_NOTICE }, false, false);
 
         if packet.context == crate::packet::RESOURCE {
             // Pre-fetch link state so receive_part can update resource RTT without
