@@ -126,6 +126,10 @@ What limits a transfer now:
 - **The RTNode's WiFi, for traffic to and from the backbone.** A ping from the bench machine averages 93 ms and peaks at 244 ms. WiFi shares the ESP32's radio with Bluetooth, and ESP-IDF requires modem sleep while both are on.
 - **RNS itself.** It grows a Resource's window by one part per round trip, as Python does.
 
-Not yet exercised:
-- A bulk send from the iPad, which is what makes iOS's without-response flow control wait for `peripheralIsReady`.
-- The RTNode's write-queue wait. `write waits` stayed at 0.
+A bulk send from the iPad (2026-09-30):
+- The photo was 3,701 parts, sent to the Pixel through the RTNode. It arrived; James confirmed it.
+- It exercised iOS's without-response flow control. The iPad logged no failed write.
+- Once its window passed 64 parts, the engine's per-link queue overflowed: "64 packets queued, 483 byte packet dropped". The receiver re-requested the lost parts.
+- `MAX_QUEUED_PACKETS` is now 96. A compile-time check holds it above RNS's largest window, `Resource::WINDOW_MAX_FAST` (75).
+
+Not yet exercised: the RTNode's write-queue wait. `write waits` stayed at 0.

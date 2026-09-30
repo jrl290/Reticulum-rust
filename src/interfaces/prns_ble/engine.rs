@@ -38,10 +38,15 @@ pub const DIAL_FAILED_RETRY: Duration = Duration::from_secs(5);
 /// would each rebroadcast the phone's traffic onto LoRa.
 pub const MAX_NODES: usize = 1;
 
-/// Packets waiting on one link, the depth of an interface writer queue
-/// (`interface_writer::DEFAULT_WRITER_QUEUE_DEPTH`). Past it a packet is
-/// dropped with a warning, as a full writer queue does.
-pub const MAX_QUEUED_PACKETS: usize = 64;
+/// Packets waiting on one link: more than RNS's largest Resource window
+/// (`Resource::WINDOW_MAX_FAST`, 75 parts). A sender answers a window
+/// request with every part at once, far faster than Bluetooth carries them,
+/// and a part dropped here costs the receiver a wait and a re-request. At
+/// 64, a writer queue's depth, a photo from the iPad lost parts once its
+/// window passed 64 (2026-09-30). Past it a packet is dropped with a
+/// warning, as a full writer queue does.
+pub const MAX_QUEUED_PACKETS: usize = 96;
+const _: () = assert!(MAX_QUEUED_PACKETS > crate::resource::Resource::WINDOW_MAX_FAST);
 
 /// The largest value this side writes. Hosts pass the value length a write
 /// of one ATT PDU can carry (ATT MTU - 3), so a write never becomes an ATT
