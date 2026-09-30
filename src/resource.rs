@@ -756,6 +756,11 @@ impl Resource {
         Ok(())
     }
 
+    /// The hash's first 4 bytes, as the [RESOURCE] log lines show it.
+    fn short_hash(&self) -> String {
+        crate::hexrep(&self.hash[..4.min(self.hash.len())], false)
+    }
+
     pub fn get_map_hash(&self, data: &[u8]) -> Vec<u8> {
         let mut data_with_random = data.to_vec();
         data_with_random.extend_from_slice(&self.random_hash);
@@ -1021,6 +1026,13 @@ impl Resource {
                 let link_status = link.status();
                 if link_status == crate::link::STATE_CLOSED || link_status == crate::link::STATE_STALE {
                     if let Ok(mut r) = resource_arc.lock() {
+                        // Every way a transfer ends early is logged at NOTICE
+                        // or above: RNS logs these at DEBUG, and a stalled
+                        // photo on the phones (2026-09-30) left no trace of
+                        // which one it was.
+                        crate::log(&format!("[RESOURCE] {}: cancelled, its link is {}",
+                            r.short_hash(), if link_status == crate::link::STATE_CLOSED { "closed" } else { "stale" }),
+                            crate::LOG_NOTICE, false, false);
                         r.cancel();
                     }
                     break;
@@ -1123,6 +1135,12 @@ impl Resource {
 
                                 if st < 0.0 {
                                     if r.retries_left > 0 {
+                                        crate::log(&format!(
+                                            "[RESOURCE] {}: timed out waiting for {} part(s){} at {}/{}; asking again ({} retries left, window {})",
+                                            r.short_hash(), r.outstanding_parts,
+                                            if r.waiting_for_hmu { " and a hashmap update" } else { "" },
+                                            r.received_count, r.total_parts, r.retries_left - 1, r.window),
+                                            crate::LOG_NOTICE, false, false);
                                         if r.window > r.window_min {
                                             r.window -= 1;
                                             if r.window_max > r.window_min {
@@ -1154,6 +1172,10 @@ impl Resource {
                                         ));
                                         (0.001, packet)
                                     } else {
+                                        crate::log(&format!(
+                                            "[RESOURCE] {}: gave up after {} retries, {} part(s) still missing at {}/{}",
+                                            r.short_hash(), r.max_retries, r.outstanding_parts, r.received_count, r.total_parts),
+                                            crate::LOG_WARNING, false, false);
                                         r.cancel();
                                         (0.001, None)
                                     }
@@ -1165,6 +1187,10 @@ impl Resource {
                                 let max_wait = r.rtt.unwrap_or(0.0) * r.timeout_factor * r.max_retries as f64 + r.sender_grace_time + max_extra_wait;
                                 let st = r.last_activity + max_wait - now();
                                 if st < 0.0 {
+                                    crate::log(&format!(
+                                        "[RESOURCE] {}: no request from the receiver for {:.1}s at {}/{} sent; cancelled",
+                                        r.short_hash(), max_wait, r.sent_parts, r.packets.len()),
+                                        crate::LOG_WARNING, false, false);
                                     r.cancel();
                                     (0.001, None)
                                 } else {
@@ -1177,9 +1203,17 @@ impl Resource {
                             let st = r.last_part_sent + (r.rtt.unwrap_or(0.0) * r.timeout_factor + r.sender_grace_time) - now();
                             if st < 0.0 {
                                 if r.retries_left == 0 {
+                                    crate::log(&format!(
+                                        "[RESOURCE] {}: no proof after all {} parts were sent; cancelled",
+                                        r.short_hash(), r.packets.len()),
+                                        crate::LOG_WARNING, false, false);
                                     r.cancel();
                                     (0.001, None)
                                 } else {
+                                    crate::log(&format!(
+                                        "[RESOURCE] {}: no proof yet, asking for it again ({} retries left)",
+                                        r.short_hash(), r.retries_left - 1),
+                                        crate::LOG_NOTICE, false, false);
                                     r.retries_left -= 1;
                                     let mut expected_data = r.hash.clone();
                                     expected_data.extend_from_slice(&r.expected_proof);
@@ -1742,7 +1776,16 @@ impl Resource {
                         }
                     }
 
-                    call_request_next = true;
+                    // RNS/Resource.py:937 calls request_next() here, which
+                    // does nothing while waiting for a hashmap update: the
+                    // HMU's own request_next() asks for the next window. The
+                    // request is decided now, as Python decides it. Deciding
+                    // it in the deferred thread let an HMU landing within
+                    // its 5 ms clear waiting_for_hmu first, and both threads
+                    // then sent the same request: a whole window sent twice
+                    // (27 of 82 requests, 23% more parts, in a 900 KB
+                    // transfer with no loss, 2026-09-30).
+                    call_request_next = !self.waiting_for_hmu;
                 }
             } else {
                 self.receiving_part = false;
@@ -1868,7 +1911,8 @@ impl Resource {
             }
 
             crate::log(&format!("Resource assembly concluded status={:?} data_len={}",
-                self.status, self.data.as_ref().map(|d| d.len()).unwrap_or(0)), crate::LOG_DEBUG, false, false);
+                self.status, self.data.as_ref().map(|d| d.len()).unwrap_or(0)),
+                if self.status == ResourceStatus::Complete { crate::LOG_DEBUG } else { crate::LOG_NOTICE }, false, false);
             self.conclude_on_link();
 
             if self.segment_index == self.total_segments {
@@ -1920,8 +1964,12 @@ impl Resource {
                 0,
             );
             if packet.send().is_ok() {
+                crate::log(&format!("[RESOURCE] {}: complete, {} parts, proof sent", self.short_hash(), self.total_parts),
+                    crate::LOG_NOTICE, false, false);
                 Transport::cache(&packet, true, Some("resource".to_string()));
             } else {
+                crate::log(&format!("[RESOURCE] {}: complete, but the proof could not be sent; cancelled", self.short_hash()),
+                    crate::LOG_WARNING, false, false);
                 self.cancel();
             }
         }
@@ -2919,6 +2967,46 @@ mod tests {
         r.waiting_for_hmu = true;
         assert!(!r.hashmap_update_packet(&hmu_plaintext(0, Vec::new())));
         assert_eq!(r.status, ResourceStatus::Failed);
+    }
+
+    /// RNS/Resource.py:937 — a completed window asks for the next one through
+    /// request_next(), which does nothing while a hashmap update is awaited:
+    /// the HMU's own request_next() asks. receive_part decides this itself.
+    /// Left to the request thread it defers to, an HMU arriving in between
+    /// cleared waiting_for_hmu first and both sent the same request.
+    #[test]
+    fn a_completed_window_requests_more_only_when_not_waiting_for_hmu() {
+        let ctx = ResourceLinkContext {
+            mtu: 500,
+            rtt: Some(0.1),
+            traffic_timeout_factor: 4.0,
+            establishment_cost: 0,
+            last_resource_window: None,
+            last_resource_eifr: None,
+        };
+        for waiting_for_hmu in [true, false] {
+            let mut r = hmu_test_resource();
+            let part = vec![7u8; 32];
+            let map_hash = r.get_map_hash(&part);
+            r.hashmap[..Resource::MAPHASH_LEN].copy_from_slice(&map_hash);
+            r.hashmap_height = 1;
+            r.window = 4;
+            r.outstanding_parts = 1;
+            r.waiting_for_hmu = waiting_for_hmu;
+            let packet = Packet::new(
+                None, part, crate::packet::DATA, RESOURCE, BROADCAST,
+                crate::packet::HEADER_1, None, None, false, 0,
+            );
+
+            let (needs_request_next, _) = r.receive_part(&packet, &ctx);
+
+            assert_eq!(r.outstanding_parts, 0, "the part completed its window");
+            assert_eq!(r.received_count, 1);
+            assert_eq!(
+                needs_request_next, !waiting_for_hmu,
+                "waiting_for_hmu={waiting_for_hmu}: the next window is requested only when no HMU is awaited",
+            );
+        }
     }
 
     // --- 5: advertisement transfer-size check (RNS/Resource.py:1374) ---
