@@ -36,7 +36,7 @@ Taken from Prns 0.3.7 `prns-core/src/interfaces/bluetooth_auto/` (MIT OR Apache-
   - Endpoints: iOS `01 01`, iPadOS `01 02`, Android `03 00`. RTNode answers `05 00` (ESP32).
   - Close is `03 <reason>`.
 - **Packets:** at most 500 bytes, split into fragments of `[kind 01|02|03][seq u16 BE][total u16 BE][payload]`.
-  - The phone writes data fragments with response, one write in flight per link.
+  - The phone writes data fragments without response when the node's data characteristic allows it (RTNode does from its fast-link firmware), and with response otherwise. One write is in flight per link: a write without response is done once the OS has taken it (iOS `canSendWriteWithoutResponse`, then `peripheralIsReady(toSendWriteWithoutResponse:)`; Android `onCharacteristicWrite`).
   - The listener sends its fragments as notifications on data.
   - A fragment is at most one ATT PDU (MTU − 3). A longer write would become an ATT long write, which Prns peers don't handle.
 
@@ -75,6 +75,18 @@ Each settled RTNode becomes one interface, `PrnsBLE[<its 16-byte identity>]`. Th
 - **The apps must start Bluetooth after the delivery destination is published,** so the first link's up-edge announces it (§5). Retichat-android's `RTNodeBluetoothContractTest` pins this order.
 - **A reconnect before the old link is reported gone** hands the interface to the new link (`Effect::HandOver`), with no down and up edge.
 
+## Link speed (James, 2026-09-29: "the fastest bluetooth link that is available")
+
+Each side asks for the fastest link the other will take. The OS and the other side decide; RTNode logs each outcome, and its 60 s report shows each slot's interval and PHY.
+
+- **Android**, on connect and before the MTU exchange: `CONNECTION_PRIORITY_HIGH` (11.25-15 ms) and the 2M PHY. Asking this early lets both settle before the Hello. RTNode asks for its own at the Hello, and two updates at once collide and both fail.
+- **iOS** has no API for either. RTNode asks, and iOS picks its PHY itself.
+- **RTNode**, once the Hello identifies the phone:
+  - 251-byte link-layer packets;
+  - the 2M PHY;
+  - a 15 ms interval, the shortest Apple accepts from an accessory, if the link runs slower. It asks again once if the phone slows the link after setup, as Android does when service discovery ends. A collision with the phone's own update is not a refusal.
+- **L2CAP is not used.** Prns's own table allows it between Android and an ESP32 only, not iOS.
+
 ## Caveats
 
 - **One phone, two apps, one node.** Android shares one BLE connection per phone and node across apps.
@@ -94,3 +106,26 @@ Results:
 |---|---|
 | iPad 9th gen, iPadOS 26.5 | Delivered 3/3 in < 0.7 s. After 90 s in the background: 2/2 delivered. One link dropped with 0x208 (supervision timeout) 5 s after connecting and was re-dialled within 1 s. |
 | Pixel 5 | Delivered 3/3 in < 1.1 s. As the previous app: 2/2 delivered. Cached (frozen): 0/2 delivered. |
+
+### Fast link (2026-09-29, same bench)
+
+The RTNode ran its `feature/ble-fast-link` firmware, and both phones ran the fast-link apps. "Before" is the release firmware with the earlier apps.
+
+| Transfer | Before | After |
+|---|---|---|
+| Backbone peer → Pixel 5, 64 KB of random data | 13.8 s | 4.7-6.7 s |
+| Pixel 5 → backbone peer, 48 KB of text | 14.7 s | 1.6-2.4 s |
+| Backbone peer → iPad, 64 KB of random data | not measured | 6.2-6.8 s |
+| Pixel 5 → iPad through the RTNode, Bluetooth only, 48 KB of text (80 parts after compression) | about 10 parts per 1.2 s round trip | 3.2 s; the last windows moved 12 parts per 0.36 s |
+
+The links as settled:
+- **Pixel 5:** 15 ms, 2M PHY, writes without response.
+- **iPad 9th gen:** 15 ms, asked for by RTNode and accepted; iOS's own choice is 30 ms. It stays on 1M: Bluetooth 4.2, and the 2M request returns 0x21A. Writes without response. Its supervision timeout rises from 720 ms to 2 s, Apple's minimum for an accessory's request.
+
+What limits a transfer now:
+- **The RTNode's WiFi, for traffic to and from the backbone.** A ping from the bench machine averages 93 ms and peaks at 244 ms. WiFi shares the ESP32's radio with Bluetooth, and ESP-IDF requires modem sleep while both are on.
+- **RNS itself.** It grows a Resource's window by one part per round trip, as Python does.
+
+Not yet exercised:
+- A bulk send from the iPad, which is what makes iOS's without-response flow control wait for `peripheralIsReady`.
+- The RTNode's write-queue wait. `write waits` stayed at 0.
