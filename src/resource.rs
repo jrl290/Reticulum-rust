@@ -548,6 +548,14 @@ impl Resource {
                 self.input_file = Some(file);
             }
         } else if let Some(ResourceData::Bytes(bytes)) = data {
+            // KNOWN GAP (round 3, 2026-10-01): RNS/Resource.py splits data
+            // over MAX_EFFICIENT_SIZE into segments; this branch never does.
+            // Whoever fixes it must also carry the sender's advertisement
+            // hook (`advertise_shared_then`) to each later segment, where
+            // `validate_proof`'s next-segment branch advertises it: app-links reports
+            // each advertisement to LXMF's §1 watch (DESIGN_PRINCIPLES §1,
+            // bulk transfers), and without it the gap from one segment's last
+            // request to the next one's first is counted as silence.
             self.total_size = bytes.len() + self.metadata_size;
             self.total_segments = 1;
             self.segment_index = 1;
@@ -2048,6 +2056,11 @@ impl Resource {
                             thread::sleep(Duration::from_millis(50));
                         }
                         if let Some(next) = &self.next_segment {
+                            // No advertisement hook reaches a later segment
+                            // (`advertise_shared_then`). Only file-backed data
+                            // is segmented today, and no AppLinks or LXMF
+                            // send is; see the KNOWN GAP note in `prepare_data`
+                            // before segmenting bytes.
                             Resource::advertise_shared(next.clone());
                         }
                     }
