@@ -531,7 +531,7 @@ This runs on the private chain only: local rfed → RPi rnsd ← local gateway r
   These links are opened by a driver on the RPi, not from the PHP side. On e918f86, select_path_excluding never sends a link that arrived over the Bridge back over it.
 
 1. Baseline on e918f86+A1
-- Run staging.sh up and check (an unset STAGING_PHP is the local node since 2026-09-30), stage_browser.mjs, stage_large.mjs (both on the local node by default since then), distro stages 3-7 with HARNESS_EXCHANGE_A=local HARNESS_EXCHANGE_B=local HARNESS_RFED=<staging rfed identity> (without them those stages attach to selectiv and retichat.com), and py/flood.py 6000 (about 330 msg/s on 2026-09-22).
+- Run staging.sh up and check (an unset STAGING_PHP is the local node since 2026-09-30), stage_browser.mjs, stage_large.mjs (both on the local node by default since then), distro stages 3-7 (on the local node and the staging rfed by default since then too; they reach selectiv and retichat.com only when named, with STAGING_ALLOW_PRODUCTION_PHP=1), and py/flood.py 6000 (about 330 msg/s on 2026-09-22).
 - Record the A1 counters per key over the whole run. A non-zero branch names a flow that A6, A7, A16, B3 or B7 would change; trace it before that step lands.
 - If decision 6 allows, run the same build on the production gateway for a day and read the counters from the summary lines in the NAS syslog.
 
