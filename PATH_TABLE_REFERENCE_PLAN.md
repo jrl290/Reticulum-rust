@@ -531,7 +531,7 @@ This runs on the private chain only: local rfed → RPi rnsd ← local gateway r
   These links are opened by a driver on the RPi, not from the PHP side. On e918f86, select_path_excluding never sends a link that arrived over the Bridge back over it.
 
 1. Baseline on e918f86+A1
-- Run staging.sh up and check, stage_browser.mjs, stage_large.mjs, distro stages 3-7, and py/flood.py 6000 (about 330 msg/s on 2026-09-22).
+- Run staging.sh up and check (an unset STAGING_PHP is the local node since 2026-09-30), stage_browser.mjs, stage_large.mjs (both on the local node by default since then), distro stages 3-7 with HARNESS_EXCHANGE_A=local HARNESS_EXCHANGE_B=local HARNESS_RFED=<staging rfed identity> (without them those stages attach to selectiv and retichat.com), and py/flood.py 6000 (about 330 msg/s on 2026-09-22).
 - Record the A1 counters per key over the whole run. A non-zero branch names a flow that A6, A7, A16, B3 or B7 would change; trace it before that step lands.
 - If decision 6 allows, run the same build on the production gateway for a day and read the counters from the summary lines in the NAS syslog.
 
@@ -638,7 +638,7 @@ These numbers go to you before any deploy (decision 5).
 - Restart rfed with persisted blobs. Pass: rfed refreshes the static peer from remembered app_data at enable, and a log line shows it, before any new emission.
 
 15. Regression suites on the branch
-- staging.sh check, stage_browser, stage_large, distro stages 3-7, and flood 6000 against rfed with blobs present. Pass: no throughput drop against step 1.
+- staging.sh check, stage_browser, stage_large, distro stages 3-7 (on the local node, as in step 1), and flood 6000 against rfed with blobs present. Pass: no throughput drop against step 1.
 - The A1 counters are gone with their branches, and every bridge flow passes.
 
 16. Android (mandatory)
