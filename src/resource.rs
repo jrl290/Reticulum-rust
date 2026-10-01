@@ -784,9 +784,43 @@ impl Resource {
         let _ = Resource::start_advertising(resource_arc);
     }
 
+    /// `advertise_shared`, then `on_advertised` once this Resource's
+    /// advertisement has gone out: at once on a link with nothing else in
+    /// flight, or after its wait behind another outgoing Resource (QUEUED).
+    /// It is never called when the Resource concludes before its
+    /// advertisement (its link closed or not ACTIVE, the packet could not be
+    /// sent). It runs on the advertise thread, without this Resource's lock
+    /// held, so it may take the locks a progress callback takes.
+    ///
+    /// For a sender that watches its transfer from the advertisement on:
+    /// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30), says a
+    /// Resource must show progress at least every 5 s from its advertisement
+    /// on, and the advertisement is not something the progress callback
+    /// hears (RNS/Resource.py calls it after each request served and each
+    /// part received only). app-links reports it to LXMF's send assertion.
+    /// RNS 1.5.2 has no such hook; the Resource itself does exactly what
+    /// `advertise_shared` does. The Resource is registered with its link
+    /// just before the call, so on a fast link the first request's progress
+    /// callback can come first.
+    pub fn advertise_shared_then(
+        resource_arc: Arc<Mutex<Self>>,
+        on_advertised: Box<dyn FnOnce() + Send + 'static>,
+    ) {
+        let _ = Resource::start_advertising_then(resource_arc, Some(on_advertised));
+    }
+
     /// `advertise_shared`, handing back the advertise thread so that a test
     /// can see it has ended.
     pub(crate) fn start_advertising(resource_arc: Arc<Mutex<Self>>) -> thread::JoinHandle<()> {
+        Resource::start_advertising_then(resource_arc, None)
+    }
+
+    /// `advertise_shared_then`, handing back the advertise thread so that a
+    /// test can see it has ended.
+    pub(crate) fn start_advertising_then(
+        resource_arc: Arc<Mutex<Self>>,
+        on_advertised: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> thread::JoinHandle<()> {
         // Optionally prepare next segment in background
         let needs_next = {
             if let Ok(r) = resource_arc.lock() {
@@ -804,7 +838,16 @@ impl Resource {
             });
         }
 
-        thread::spawn(move || Resource::advertise_job(resource_arc))
+        thread::spawn(move || match on_advertised {
+            None => {
+                Resource::advertise_job(resource_arc);
+            }
+            Some(on_advertised) => {
+                if Resource::advertise_job(resource_arc) {
+                    on_advertised();
+                }
+            }
+        })
     }
 
     /// RNS/Resource.py:537 __advertise_job(), on the advertise thread.
@@ -815,8 +858,8 @@ impl Resource {
     ///
     /// Every way out of here but a poisoned lock concludes the Resource:
     /// advertised (the watchdog and the link take it from there) or FAILED
-    /// with its callback run.
-    fn advertise_job(resource_arc: Arc<Mutex<Self>>) {
+    /// with its callback run. True when the advertisement went out.
+    fn advertise_job(resource_arc: Arc<Mutex<Self>>) -> bool {
         // One outgoing Resource at a time per link: while another is in
         // flight this one is QUEUED and asks again every 0.25 s, as the
         // reference does. A link that closes cancels the one in flight and
@@ -828,7 +871,7 @@ impl Resource {
         loop {
             let link = match resource_arc.lock() {
                 Ok(r) => r.link.clone(),
-                Err(_) => return,
+                Err(_) => return false,
             };
             if link.ready_for_new_resource() {
                 break;
@@ -843,11 +886,11 @@ impl Resource {
         let send_ok = {
             let mut r = match resource_arc.lock() {
                 Ok(r) => r,
-                Err(_) => return,
+                Err(_) => return false,
             };
             // RNS/Resource.py:544
             if !r.ensure_link() {
-                return;
+                return false;
             }
             let adv = ResourceAdvertisement::new_from_resource(&r);
             let packed = adv.pack(0).unwrap_or_default();
@@ -887,7 +930,7 @@ impl Resource {
         };
 
         if !send_ok {
-            return;
+            return false;
         }
 
         // Register the SAME Arc with the link (not a clone)
@@ -897,6 +940,7 @@ impl Resource {
 
         // Start watchdog on the SAME Arc
         Resource::start_watchdog(resource_arc);
+        true
     }
 
     /// RNS/Resource.py:529 ensure_link(): a transfer goes on only over an

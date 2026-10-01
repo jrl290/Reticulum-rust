@@ -6382,6 +6382,86 @@ mod tests {
         link.teardown();
     }
 
+    /// The hook of `Resource::advertise_shared_then`: called with what the
+    /// Resource looked like when it ran (status, adv_sent).
+    fn advertised_hook(
+        resource: &Arc<Mutex<Resource>>,
+    ) -> (Box<dyn FnOnce() + Send + 'static>, mpsc::Receiver<(crate::resource::ResourceStatus, f64)>) {
+        let (tx, rx) = mpsc::channel();
+        let resource = Arc::clone(resource);
+        let hook: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+            let seen = resource.lock().map(|r| (r.status, r.adv_sent)).expect("the hook runs without the Resource's lock held");
+            let _ = tx.send(seen);
+        });
+        (hook, rx)
+    }
+
+    /// DESIGN_PRINCIPLES §1, bulk transfers: a Resource is watched from its
+    /// advertisement on, so `advertise_shared_then` tells its caller when
+    /// the advertisement has gone out: once, after the packet is sent, with
+    /// the Resource ADVERTISED and its lock free.
+    #[test]
+    fn the_advertised_hook_runs_once_the_advertisement_has_gone_out() {
+        let (link, _registry) = live_keyed_link(169, STATE_ACTIVE);
+        let (resource, _concluded) = outgoing_resource(&link);
+        let (hook, advertised) = advertised_hook(&resource);
+
+        let advertising = Resource::start_advertising_then(Arc::clone(&resource), Some(hook));
+
+        let (status, adv_sent) = advertised.recv_timeout(Duration::from_secs(5))
+            .expect("the hook runs once the advertisement is sent");
+        assert_eq!(status, crate::resource::ResourceStatus::Advertised);
+        assert!(adv_sent > 0.0, "it runs after the advertisement went out, not before");
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(advertised.recv_timeout(Duration::from_millis(100)).is_err(), "once");
+        link.teardown();
+    }
+
+    /// A Resource that concludes before its advertisement (here its link has
+    /// closed) was never advertised, and the hook says nothing.
+    #[test]
+    fn the_advertised_hook_never_runs_for_a_resource_that_was_never_advertised() {
+        let (link, _registry) = live_keyed_link(173, STATE_ACTIVE);
+        let (resource, concluded) = outgoing_resource(&link);
+        let (hook, advertised) = advertised_hook(&resource);
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+
+        let advertising = Resource::start_advertising_then(Arc::clone(&resource), Some(hook));
+
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        let (status, adv_sent) = concluded.recv_timeout(step).expect("it concludes");
+        assert_eq!((status, adv_sent), (crate::resource::ResourceStatus::Failed, 0.0));
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(advertised.try_recv().is_err(), "no advertisement went out, so the hook did not run");
+    }
+
+    /// A Resource QUEUED behind another outgoing Resource on its link is not
+    /// advertised yet, however long it waits there: the hook runs when its
+    /// turn comes and the advertisement goes out.
+    #[test]
+    fn the_advertised_hook_waits_for_a_queued_resources_turn() {
+        let (link, _registry) = live_keyed_link(179, STATE_ACTIVE);
+        let (in_flight, _in_flight_concluded) = outgoing_resource(&link);
+        link.register_outgoing_resource(Arc::clone(&in_flight));
+        let (queued, _concluded) = outgoing_resource(&link);
+        let (hook, advertised) = advertised_hook(&queued);
+
+        let advertising = Resource::start_advertising_then(Arc::clone(&queued), Some(hook));
+        assert!(wait_until(5, || queued.lock().unwrap().status == crate::resource::ResourceStatus::Queued),
+            "the second Resource waits behind the one in flight");
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        assert!(advertised.recv_timeout(4 * step).is_err(), "nothing is advertised while it is queued");
+
+        link.resource_concluded(Arc::clone(&in_flight));
+        let (status, adv_sent) = advertised.recv_timeout(Duration::from_secs(5))
+            .expect("the hook runs once the queued Resource's advertisement goes out");
+        assert_eq!(status, crate::resource::ResourceStatus::Advertised);
+        assert!(adv_sent > 0.0);
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        link.teardown();
+    }
+
     /// RNS/Resource.py:432: a Resource's data is encrypted by its link, and a
     /// link that cannot encrypt it (Link.py:1166-1178 raises) gets no
     /// Resource. Until 2026-09-28 a Resource on a closed link was built on
