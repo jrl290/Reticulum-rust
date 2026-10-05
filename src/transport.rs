@@ -7328,7 +7328,9 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    /// Serialises every test that changes the process-wide TRANSPORT,
+    /// including those in the sibling test modules below.
+    pub(crate) static TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     struct ReceiptStateRestore {
         saved: Vec<crate::packet::PacketReceipt>,
@@ -12897,12 +12899,21 @@ mod route_eviction_tests {
 #[cfg(test)]
 mod published_app_data_tests {
     use super::*;
+    use super::tests::TEST_GUARD;
 
     /// `update_published_app_data` keeps a publication current and never
     /// creates one: a name or stamp-cost change that lands after an
     /// unpublish must not put the destination back in the announce set.
     #[test]
     fn updating_app_data_never_republishes() {
+        // TRANSPORT is shared by every test thread, so a test that changes it
+        // while another test drives jobs() can change what that test counts:
+        // on 2026-10-05 interface_mode_rules_for_rebroadcast counted 1
+        // rebroadcast where 0 was right, once, only with tests in parallel
+        // (0 failures in 20 runs alone and 3 single-threaded suites). This
+        // test and the next were the only ones changing TRANSPORT without
+        // TEST_GUARD. Every test that changes TRANSPORT takes TEST_GUARD.
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let hash = crate::identity::Identity::get_random_hash();
         assert!(!Transport::update_published_app_data(&hash, Some(vec![1])), "nothing to update");
         assert!(!Transport::is_published(&hash), "an update must not publish");
@@ -12928,6 +12939,9 @@ mod published_app_data_tests {
     /// changed, and it is changed in place.
     #[test]
     fn updating_a_registered_destination_s_default_app_data() {
+        // Registers a destination in the shared TRANSPORT: take TEST_GUARD,
+        // as every test that changes it must.
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let identity = crate::identity::Identity::new(true);
         let destination = Destination::new_inbound(
             Some(identity),
