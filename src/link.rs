@@ -188,6 +188,7 @@ enum LinkMsg {
     Teardown(String),
     SetLinkEstablishedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
     SetLinkClosedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
+    SetLinkRecoveredCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
     SetPacketCallback(Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>),
     SetRemoteIdentifiedCallback(Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>),
     SetResourceStrategy(u8),
@@ -518,6 +519,33 @@ impl LinkHandle {
         callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     ) {
         let _ = self.tx.send(LinkMsg::SetLinkClosedCallback(callback));
+    }
+
+    /// Hear a STALE link become ACTIVE again.
+    ///
+    /// An API extension: RNS 1.5.2 has no such callback. `Link.__receive`
+    /// (Link.py:946) sets a stale link back to ACTIVE and says nothing, so an
+    /// application that waits for its link to "come up" never hears a STALE
+    /// link's recovery (DESIGN_PRINCIPLES.md §3, what a device owes its
+    /// distro: "comes up" includes it). The callback fires once for each
+    /// transition from STALE to ACTIVE, when the peer is heard from again
+    /// (PARITY-AUDIT-1.5.2.md A34), and for no other:
+    ///
+    /// - not for a link's establishment (`link_established` is that event),
+    /// - not for traffic on a link that is ACTIVE already,
+    /// - not when the packet that revived the link also closed it (a LINKCLOSE
+    ///   arriving on a STALE link), and not once the link has closed.
+    ///
+    /// Like `link_closed` it runs on a thread of its own, so it may call back
+    /// into this handle. It changes nothing about the link: state, timing and
+    /// wire behaviour are as they were. A link is never STALE before it has
+    /// been ACTIVE, so `link_established` is the natural place to install it;
+    /// a later call replaces it, as for the other callbacks.
+    pub fn set_link_recovered_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetLinkRecoveredCallback(callback));
     }
 
     pub fn set_packet_callback(
@@ -1068,6 +1096,9 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
         LinkMsg::SetLinkClosedCallback(cb) => {
             link.callbacks.link_closed = cb;
         }
+        LinkMsg::SetLinkRecoveredCallback(cb) => {
+            link.callbacks.link_recovered = cb;
+        }
         LinkMsg::SetPacketCallback(cb) => {
             link.set_packet_callback(cb);
         }
@@ -1118,6 +1149,7 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
             // keepalive period per cycle (66s, 132s, 199s, ...).
             let was_establishing =
                 link.state == STATE_PENDING || link.state == STATE_HANDSHAKE;
+            let was_stale = link.state == STATE_STALE;
             let handled = link.receive(&packet).is_ok();
             let now_active = link.state == STATE_ACTIVE;
 
@@ -1159,6 +1191,26 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
                     let h = self_handle.clone();
                     let done = thread::spawn(move || cb(h));
                     service_mailbox_until_finished(link, rx, self_handle, done);
+                }
+            }
+
+            // STALE → ACTIVE: the peer was heard from again. The reference
+            // does this silently (Link.py:946); this fires link_recovered, on
+            // a dedicated thread as link_closed is (the callback may call
+            // LinkHandle methods, which round-trip through this mailbox), and
+            // changes nothing about the link (PARITY-AUDIT-1.5.2.md A34). It
+            // is the transition that counts: the link must END this packet
+            // ACTIVE having begun it STALE, so a packet that revived the link
+            // and closed it (a LINKCLOSE on a STALE link) recovers nothing,
+            // and traffic on a link that is ACTIVE already fires nothing.
+            if was_stale && now_active {
+                crate::log(
+                    &format!("[LINK] link {} recovered from STALE: the peer was heard from again", crate::hexrep(&link.link_id, false)),
+                    crate::LOG_NOTICE, false, false,
+                );
+                if let Some(cb) = link.callbacks.link_recovered.clone() {
+                    let h = self_handle.clone();
+                    thread::spawn(move || cb(h));
                 }
             }
 
@@ -1653,6 +1705,9 @@ pub type ResourceAcceptCallback = Arc<dyn Fn(&crate::resource::ResourceAdvertise
 pub struct LinkCallbacks {
     pub link_established: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     pub link_closed: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    /// A STALE link heard from its peer again and is ACTIVE (an extension:
+    /// the reference has no such callback, see `LinkHandle::set_link_recovered_callback`).
+    pub link_recovered: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     pub packet: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
     /// RNS/Link.py set_resource_callback(): under ACCEPT_APP the callback
     /// is handed the advertisement and its return value decides whether
@@ -2828,7 +2883,15 @@ impl Link {
     ) {
         self.callbacks.link_closed = callback;
     }
-    
+
+    /// Set link recovered callback (see `LinkHandle::set_link_recovered_callback`).
+    pub fn set_link_recovered_callback(
+        &mut self,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    ) {
+        self.callbacks.link_recovered = callback;
+    }
+
     /// Set packet received callback.
     /// If any DATA packets arrived before the callback was set, they are
     /// proved and dispatched now (draining the early_packets queue).
@@ -3203,6 +3266,9 @@ impl Link {
             // then returned ESTABLISHING, open_with_mode() declined to
             // re-open, and the phone's propagation sync waited forever on a
             // link that was exchanging keepalives the whole time.
+            // The reference says nothing here (Link.py:946). The actor
+            // (LinkMsg::Receive) sees this transition from the outside and
+            // fires `link_recovered`; nothing in this method changed for it.
             if self.state == STATE_STALE {
                 self.state = STATE_ACTIVE;
                 self.status = STATE_ACTIVE;
@@ -5460,6 +5526,163 @@ mod tests {
         assert_eq!(link.state, STATE_ACTIVE, "hearing from the peer revives the link");
         assert_eq!(link.status, STATE_ACTIVE, "the published status must revive with it");
         assert!(link.stale_since.is_none());
+    }
+
+    // ── link_recovered: a STALE link hears its peer again (A34) ─────────────
+
+    /// A KEEPALIVE pong (0xFE) addressed to `link`: its peer is heard from. A
+    /// ping (0xFF) would be answered with a packet of ours; this is not, so
+    /// delivering one puts nothing on the wire.
+    fn peer_is_heard(link: &Link) -> Packet {
+        let dest = link.destination.lock().unwrap().clone();
+        let mut pong = Packet::new(
+            Some(dest), vec![0xFEu8], DATA, crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST, packet::HEADER_1, None, None, false, 0,
+        );
+        pong.data = vec![0xFEu8];
+        pong
+    }
+
+    /// Hand `packet` to `link` through the actor's own message handler, on this
+    /// thread, and say whether the link handled it. Driving the handler by hand
+    /// keeps the link's state in the test's hands: only the test ticks the
+    /// watchdog, so no clock decides anything.
+    fn deliver(link: &mut Link, handle: &LinkHandle, mailbox: &mpsc::Receiver<LinkMsg>, packet: Packet) -> bool {
+        let (reply, answer) = oneshot();
+        actor_handle_message(link, mailbox, handle, LinkMsg::Receive(packet, reply));
+        answer.recv().expect("the Receive handler answers").handled
+    }
+
+    /// The watchdog's own demotion of a link whose peer has been silent for
+    /// longer than its stale time, published as the actor loop publishes it.
+    fn go_silent_until_stale(link: &mut Link, handle: &LinkHandle) {
+        let now = current_time().unwrap();
+        link.activated_at = Some(now - link.stale_time as u64 - 10);
+        link.last_inbound = now - link.stale_time as u64 - 10;
+        link.last_proof = link.last_inbound;
+        link.last_outbound = now;
+        actor_watchdog_tick(link, handle);
+        handle.status_atomic.store(link.status, Ordering::Relaxed);
+        assert_eq!(link.state, STATE_STALE, "the watchdog demotes a silent link to STALE");
+        assert_eq!(handle.status(), STATE_STALE, "and the handle publishes it");
+    }
+
+    /// `link_recovered` fires once for each STALE → ACTIVE transition and for
+    /// nothing else (PARITY-AUDIT-1.5.2.md A34; DESIGN_PRINCIPLES.md §3: a STALE
+    /// link's recovery is the propagation link coming up). Two full cycles, the
+    /// link ACTIVE with traffic before the first and after each recovery: two
+    /// events in all, each handed the link as ACTIVE.
+    #[test]
+    fn link_recovered_fires_once_per_stale_to_active_transition() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(181)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        let (tx, mailbox) = mpsc::channel();
+        let handle = LinkHandle::from_parts_for_test(tx, link.link_id.clone());
+        let (recovered_tx, recovered) = mpsc::channel::<(Vec<u8>, u8)>();
+        let recovered_tx = Mutex::new(recovered_tx);
+        link.set_link_recovered_callback(Some(Arc::new(move |on: LinkHandle| {
+            let _ = recovered_tx.lock().unwrap().send((on.link_id(), on.status()));
+        })));
+
+        // Traffic on a link that is ACTIVE already recovers nothing.
+        for _ in 0..2 {
+            let heard = peer_is_heard(&link);
+            assert!(deliver(&mut link, &handle, &mailbox, heard));
+        }
+        assert_eq!(link.state, STATE_ACTIVE);
+
+        for cycle in 1..=2 {
+            go_silent_until_stale(&mut link, &handle);
+            let heard = peer_is_heard(&link);
+            assert!(deliver(&mut link, &handle, &mailbox, heard), "cycle {cycle}: the packet is handled");
+            assert_eq!(link.state, STATE_ACTIVE, "cycle {cycle}: hearing the peer revives the link");
+            let (id, status) = recovered.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("cycle {cycle}: link_recovered fires when the STALE link hears its peer"));
+            assert_eq!(id, link.link_id, "cycle {cycle}: it is handed the link that recovered");
+            assert_eq!(status, STATE_ACTIVE, "cycle {cycle}: the published status is ACTIVE before the callback runs");
+            // The link is ACTIVE now: more of the same traffic recovers nothing.
+            for _ in 0..2 {
+                let heard = peer_is_heard(&link);
+                assert!(deliver(&mut link, &handle, &mailbox, heard));
+            }
+        }
+        assert!(recovered.recv_timeout(Duration::from_millis(300)).is_err(),
+            "two transitions, two events: ACTIVE traffic and the packets after a recovery fire nothing");
+    }
+
+    /// A packet that revives a STALE link and closes it in the same breath (a
+    /// LINKCLOSE) recovered nothing, because the link ends it closed:
+    /// `link_closed` fires and `link_recovered` does not, and a closed link
+    /// recovers no more afterwards.
+    #[test]
+    fn a_stale_link_closed_by_the_packet_that_revives_it_does_not_recover() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(191)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        let (tx, mailbox) = mpsc::channel();
+        let handle = LinkHandle::from_parts_for_test(tx, link.link_id.clone());
+        link.self_handle = Some(handle.clone());
+        let (events_tx, events) = mpsc::channel::<&'static str>();
+        let on_recovered = Mutex::new(events_tx.clone());
+        let on_closed = Mutex::new(events_tx);
+        link.set_link_recovered_callback(Some(Arc::new(move |_: LinkHandle| {
+            let _ = on_recovered.lock().unwrap().send("recovered");
+        })));
+        link.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
+            let _ = on_closed.lock().unwrap().send("closed");
+        })));
+
+        go_silent_until_stale(&mut link, &handle);
+        let link_id = link.link_id.clone();
+        let close = link_packet(&link, crate::packet::LINKCLOSE, &link_id);
+        deliver(&mut link, &handle, &mailbox, close);
+        assert_eq!(link.state, STATE_CLOSED, "a LINKCLOSE carrying our link id closes the link");
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok("closed"), "the close is what happened to the link");
+
+        let heard = peer_is_heard(&link);
+        deliver(&mut link, &handle, &mailbox, heard);
+        assert!(events.recv_timeout(Duration::from_millis(300)).is_err(),
+            "no recovery with the close, and none after it");
+    }
+
+    /// The same through a live link actor and the handle's own API:
+    /// `LinkHandle::set_link_recovered_callback` reaches the actor, and a packet
+    /// that reaches a STALE link fires it once, with that link's handle.
+    #[test]
+    fn a_live_stale_link_reports_its_recovery_through_the_handle() {
+        let (link, _registry) = live_keyed_link(193, STATE_STALE);
+        let (tx, recovered) = mpsc::channel::<(Vec<u8>, u8, bool)>();
+        let tx = Mutex::new(tx);
+        let mine = link.clone();
+        link.set_link_recovered_callback(Some(Arc::new(move |on: LinkHandle| {
+            let _ = tx.lock().unwrap().send((on.link_id(), on.status(), on.same_link(&mine)));
+        })));
+        assert_eq!(link.status(), STATE_STALE);
+
+        let heard = |link: &LinkHandle| {
+            let dest = link.clone_destination().expect("the actor answers");
+            let mut pong = Packet::new(
+                Some(dest), vec![0xFEu8], DATA, crate::packet::KEEPALIVE,
+                crate::transport::BROADCAST, packet::HEADER_1, None, None, false, 0,
+            );
+            pong.data = vec![0xFEu8];
+            pong
+        };
+        let result = link.dispatch_receive(heard(&link)).expect("the actor answers");
+        assert!(result.handled);
+        let (id, status, same) = recovered.recv_timeout(Duration::from_secs(5))
+            .expect("link_recovered fires when the STALE link hears its peer");
+        assert_eq!(id, link.link_id());
+        assert_eq!(status, STATE_ACTIVE, "the published status is ACTIVE before the callback runs");
+        assert!(same, "the callback is handed the link's own handle, which compares as the same link");
+        assert_eq!(link.status(), STATE_ACTIVE);
+
+        link.dispatch_receive(heard(&link)).expect("the actor answers");
+        assert!(recovered.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the link is ACTIVE: its next packet recovers nothing");
+        link.teardown();
     }
 
     /// RNS/Link.py handle_request(): the response generator receives the
