@@ -833,7 +833,7 @@ impl Resource {
     /// the Resource here. A sender that owes an upload uses it to tell an
     /// upload that never left the device from one that was lost
     /// (DESIGN_PRINCIPLES §3, ruling of 2026-10-06, confirmed for Resource
-    /// uploads 2026-10-10): app-links `send_on_held_link`'s `on_never_left`.
+    /// uploads 2026-10-10): app-links `send_on_held_link_owed`'s `on_never_left`.
     pub fn advertise_shared_then_reporting(
         resource_arc: Arc<Mutex<Self>>,
         on_advertised: Box<dyn FnOnce(bool) + Send + 'static>,
