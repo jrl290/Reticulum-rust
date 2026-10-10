@@ -1017,6 +1017,9 @@ pub type InterfaceUpListener = Arc<dyn Fn(&str) + Send + Sync>;
 static INTERFACE_UP_LISTENERS: Lazy<Mutex<Vec<InterfaceUpListener>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+/// `Transport::interface_up_edges`.
+static INTERFACE_UP_EDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static OUTBOUND_HANDLERS: Lazy<Mutex<HashMap<String, OutboundHandler>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -2125,10 +2128,29 @@ impl Transport {
         INTERFACE_UP_LISTENERS.lock().unwrap().push(listener);
     }
 
+    /// How many up-edges Transport has told its up-edge listeners of, or is
+    /// about to tell them of. Each is counted after the interface's online
+    /// flag is set and before any listener hears it.
+    ///
+    /// An observation for a listener's owner, read at events (no timer):
+    /// work that found no interface to carry it learns of that a moment
+    /// later, and an up-edge can fall in between, heard by the listener
+    /// before the work was recorded as waiting for one. An owner that reads
+    /// this before the send, records the work as waiting, and then reads it
+    /// again knows whether an up-edge came since: if it did, that up-edge was
+    /// the work's (DESIGN_PRINCIPLES §3, 2026-10-06; §5). Python RNS has no
+    /// up-edge listeners; this changes nothing on the wire or in Transport.
+    pub fn interface_up_edges() -> u64 {
+        INTERFACE_UP_EDGES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Run the up-edge listeners on a thread of their own: the caller is an
     /// interface's own thread, which can hold that interface's lock, and a
     /// listener may use the interface (a link attempt sends through it).
     fn notify_interface_up(name: &str) {
+        // Counted before the listeners run (`interface_up_edges`), with or
+        // without listeners: the online flag is already set.
+        INTERFACE_UP_EDGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let listeners = INTERFACE_UP_LISTENERS.lock().unwrap().clone();
         if listeners.is_empty() {
             return;
@@ -9930,6 +9952,50 @@ pub(crate) mod tests {
 
         Transport::set_interface_online(name, true);
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "each up-edge is reported");
+    }
+
+    /// Each up-edge is counted (`interface_up_edges`) once, after the
+    /// interface is online and before any listener hears it; anything that
+    /// is not an up-edge counts nothing. An owner that read the count before
+    /// its send can tell an up-edge its listener heard too early.
+    #[test]
+    fn each_up_edge_is_counted_before_its_listeners_hear_it() {
+        use std::sync::mpsc;
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+        let name = "test-up-edge-count";
+        let mut stub_config = InterfaceStubConfig::default();
+        stub_config.name = name.to_string();
+        stub_config.online = Some(false);
+        stub_config.out = true;
+        stub_config.mode = InterfaceStub::MODE_FULL;
+        let before_registered = Transport::interface_up_edges();
+        Transport::register_interface_stub_config(stub_config);
+        assert_eq!(Transport::interface_up_edges(), before_registered, "registered offline: no edge");
+
+        let (tx, rx) = mpsc::channel::<(u64, bool)>();
+        let tx = Mutex::new(tx);
+        Transport::add_interface_up_listener(Arc::new(move |up: &str| {
+            if up == name {
+                let online = Transport::get_interface_list().iter().any(|i| i.name == name && i.online);
+                let _ = tx.lock().unwrap().send((Transport::interface_up_edges(), online));
+            }
+        }));
+
+        let before = Transport::interface_up_edges();
+        Transport::set_interface_online(name, true);
+        let (heard_at, online) = rx.recv_timeout(Duration::from_secs(5)).expect("the up-edge is reported");
+        assert!(online, "the interface is online when the edge is told");
+        assert_eq!(heard_at, before + 1, "counted before its listener heard it");
+        assert_eq!(Transport::interface_up_edges(), before + 1, "once");
+
+        Transport::set_interface_online(name, true); // already online: no edge
+        Transport::set_interface_online(name, false); // a down-edge
+        assert_eq!(Transport::interface_up_edges(), before + 1, "nothing else is an up-edge");
+
+        Transport::set_interface_online(name, true);
+        let (heard_at, _) = rx.recv_timeout(Duration::from_secs(5)).expect("the next up-edge is reported");
+        assert_eq!(heard_at, before + 2);
     }
 
     #[test]
