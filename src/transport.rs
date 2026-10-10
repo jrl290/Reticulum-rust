@@ -7510,7 +7510,7 @@ fn announce_is_new_emission(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::destination::DestinationType;
     use crate::identity::Identity;
@@ -7520,7 +7520,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Serialises every test that changes the process-wide TRANSPORT,
-    /// including those in the sibling test modules below.
+    /// including those in the sibling test modules below and in link.rs
+    /// (the Resource advertisement tests that register an interface).
     pub(crate) static TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     struct ReceiptStateRestore {

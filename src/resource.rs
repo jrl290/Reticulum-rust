@@ -817,10 +817,34 @@ impl Resource {
         let _ = Resource::start_advertising_then(resource_arc, Some(on_advertised));
     }
 
+    /// `advertise_shared_then`, and the hook also hears whether the
+    /// advertisement was carried: `carried` is true when
+    /// `Transport::outbound` accepted the advertisement packet for an
+    /// interface (`Packet::send` sets `sent` only then), false when no
+    /// interface could carry it (every one down, or the link's own
+    /// interface offline). The hook runs exactly when `advertise_shared_then`'s
+    /// would, once, on the advertise thread, without this Resource's lock.
+    ///
+    /// An observation only. The Resource does exactly what it does under
+    /// `advertise_shared_then`: ADVERTISED either way, with its watchdog and
+    /// its `MAX_ADV_RETRIES` retries of the advertisement, and the wire is
+    /// the same. RNS/Resource.py `__advertise_job` makes the same
+    /// observation (`Packet.send()` returns False) and ignores it; so does
+    /// the Resource here. A sender that owes an upload uses it to tell an
+    /// upload that never left the device from one that was lost
+    /// (DESIGN_PRINCIPLES §3, ruling of 2026-10-06, confirmed for Resource
+    /// uploads 2026-10-10): app-links `send_on_held_link`'s `on_never_left`.
+    pub fn advertise_shared_then_reporting(
+        resource_arc: Arc<Mutex<Self>>,
+        on_advertised: Box<dyn FnOnce(bool) + Send + 'static>,
+    ) {
+        let _ = Resource::start_advertising_reporting(resource_arc, Some(on_advertised));
+    }
+
     /// `advertise_shared`, handing back the advertise thread so that a test
     /// can see it has ended.
     pub(crate) fn start_advertising(resource_arc: Arc<Mutex<Self>>) -> thread::JoinHandle<()> {
-        Resource::start_advertising_then(resource_arc, None)
+        Resource::start_advertising_reporting(resource_arc, None)
     }
 
     /// `advertise_shared_then`, handing back the advertise thread so that a
@@ -828,6 +852,20 @@ impl Resource {
     pub(crate) fn start_advertising_then(
         resource_arc: Arc<Mutex<Self>>,
         on_advertised: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> thread::JoinHandle<()> {
+        Resource::start_advertising_reporting(
+            resource_arc,
+            on_advertised.map(|on_advertised| -> Box<dyn FnOnce(bool) + Send + 'static> {
+                Box::new(move |_carried| on_advertised())
+            }),
+        )
+    }
+
+    /// `advertise_shared_then_reporting`, handing back the advertise thread
+    /// so that a test can see it has ended.
+    pub(crate) fn start_advertising_reporting(
+        resource_arc: Arc<Mutex<Self>>,
+        on_advertised: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
     ) -> thread::JoinHandle<()> {
         // Optionally prepare next segment in background
         let needs_next = {
@@ -846,14 +884,10 @@ impl Resource {
             });
         }
 
-        thread::spawn(move || match on_advertised {
-            None => {
-                Resource::advertise_job(resource_arc);
-            }
-            Some(on_advertised) => {
-                if Resource::advertise_job(resource_arc) {
-                    on_advertised();
-                }
+        thread::spawn(move || {
+            let advertised = Resource::advertise_job(resource_arc);
+            if let (Some(carried), Some(on_advertised)) = (advertised, on_advertised) {
+                on_advertised(carried);
             }
         })
     }
@@ -866,8 +900,14 @@ impl Resource {
     ///
     /// Every way out of here but a poisoned lock concludes the Resource:
     /// advertised (the watchdog and the link take it from there) or FAILED
-    /// with its callback run. True when the advertisement went out.
-    fn advertise_job(resource_arc: Arc<Mutex<Self>>) -> bool {
+    /// with its callback run. `Some` when the advertisement went out, holding
+    /// whether an interface carried it (`Packet::send`'s `sent`: false when
+    /// `Transport::outbound` found no interface to put it on). The Resource
+    /// is ADVERTISED either way, as RNS/Resource.py's is, which ignores
+    /// `Packet.send()` returning False here; its watchdog's retries of the
+    /// advertisement then decide it. `None` when it concluded before its
+    /// advertisement.
+    fn advertise_job(resource_arc: Arc<Mutex<Self>>) -> Option<bool> {
         // One outgoing Resource at a time per link: while another is in
         // flight this one is QUEUED and asks again every 0.25 s, as the
         // reference does. A link that closes cancels the one in flight and
@@ -879,7 +919,7 @@ impl Resource {
         loop {
             let link = match resource_arc.lock() {
                 Ok(r) => r.link.clone(),
-                Err(_) => return false,
+                Err(_) => return None,
             };
             if link.ready_for_new_resource() {
                 break;
@@ -891,14 +931,14 @@ impl Resource {
         }
 
         // Build and send advertisement
-        let send_ok = {
+        let carried = {
             let mut r = match resource_arc.lock() {
                 Ok(r) => r,
-                Err(_) => return false,
+                Err(_) => return None,
             };
             // RNS/Resource.py:544
             if !r.ensure_link() {
-                return false;
+                return None;
             }
             let adv = ResourceAdvertisement::new_from_resource(&r);
             let packed = adv.pack(0).unwrap_or_default();
@@ -923,7 +963,9 @@ impl Resource {
                     r.rtt = None;
                     r.status = ResourceStatus::Advertised;
                     r.retries_left = r.max_adv_retries;
-                    true
+                    // Whether `Transport::outbound` took it for an
+                    // interface. Observed, not acted on (see above).
+                    Some(packet.sent)
                 }
                 Err(e) => {
                     // RNS/Resource.py:553-556
@@ -932,14 +974,12 @@ impl Resource {
                         crate::LOG_ERROR, false, false,
                     );
                     r.cancel();
-                    false
+                    None
                 }
             }
         };
 
-        if !send_ok {
-            return false;
-        }
+        let carried = carried?;
 
         // Register the SAME Arc with the link (not a clone)
         if let Ok(r) = resource_arc.lock() {
@@ -948,7 +988,7 @@ impl Resource {
 
         // Start watchdog on the SAME Arc
         Resource::start_watchdog(resource_arc);
-        true
+        Some(carried)
     }
 
     /// RNS/Resource.py:529 ensure_link(): a transfer goes on only over an

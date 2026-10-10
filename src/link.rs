@@ -6703,6 +6703,178 @@ mod tests {
         link.teardown();
     }
 
+    /// An interface a test link is attached to, registered in TRANSPORT up
+    /// or down, whose writer hands every frame put on it to the receiver.
+    /// Taken out again when it drops. The test holds TEST_GUARD while it is
+    /// registered: it changes the process-wide TRANSPORT.
+    struct CarryingInterface {
+        name: String,
+    }
+
+    impl CarryingInterface {
+        fn register(name: &str, online: bool) -> (Self, mpsc::Receiver<Vec<u8>>) {
+            let mut config = crate::transport::InterfaceStubConfig::default();
+            config.name = name.to_string();
+            config.mode = crate::transport::InterfaceStub::MODE_FULL;
+            config.out = true;
+            config.online = Some(online);
+            crate::transport::Transport::register_interface_stub_config(config);
+            let (tx, rx) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            crate::transport::Transport::register_outbound_handler(
+                name,
+                Arc::new(move |raw: &[u8]| {
+                    let _ = tx.lock().unwrap().send(raw.to_vec());
+                    true
+                }),
+            );
+            (Self { name: name.to_string() }, rx)
+        }
+    }
+
+    impl Drop for CarryingInterface {
+        fn drop(&mut self) {
+            crate::transport::Transport::unregister_outbound_handler(&self.name);
+            crate::transport::Transport::deregister_interface_stub(&self.name);
+        }
+    }
+
+    /// The hook of `Resource::advertise_shared_then_reporting`: called with
+    /// whether the advertisement was carried, and what the Resource looked
+    /// like then (status, adv_sent, retries_left).
+    fn reporting_hook(
+        resource: &Arc<Mutex<Resource>>,
+    ) -> (
+        Box<dyn FnOnce(bool) + Send + 'static>,
+        mpsc::Receiver<(bool, crate::resource::ResourceStatus, f64, usize)>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let resource = Arc::clone(resource);
+        let hook: Box<dyn FnOnce(bool) + Send + 'static> = Box::new(move |carried| {
+            let seen = resource
+                .lock()
+                .map(|r| (carried, r.status, r.adv_sent, r.retries_left))
+                .expect("the hook runs without the Resource's lock held");
+            let _ = tx.send(seen);
+        });
+        (hook, rx)
+    }
+
+    /// Stage 0 of the distro sync proof (DESIGN_PRINCIPLES §3, ruling of
+    /// 2026-10-06, confirmed for Resource uploads 2026-10-10): the reporting
+    /// hook hears that an advertisement its link's interface carried was
+    /// carried. The frame is on that interface, a RESOURCE_ADV.
+    #[test]
+    fn the_reporting_hook_hears_an_advertisement_its_interface_carried() {
+        let _transport = crate::transport::tests::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (interface, frames) = CarryingInterface::register("AdvertCarriedTest", true);
+        let (link, _registry) = live_keyed_link_on(199, STATE_ACTIVE, Some("AdvertCarriedTest"));
+        let (resource, _concluded) = outgoing_resource(&link);
+        let (hook, advertised) = reporting_hook(&resource);
+
+        let advertising = Resource::start_advertising_reporting(Arc::clone(&resource), Some(hook));
+
+        let (carried, status, adv_sent, retries_left) = advertised.recv_timeout(Duration::from_secs(5))
+            .expect("the hook runs once the advertisement is sent");
+        assert!(carried, "the link's interface is up: the advertisement was carried");
+        assert_eq!(status, crate::resource::ResourceStatus::Advertised);
+        assert!(adv_sent > 0.0);
+        assert_eq!(retries_left, Resource::MAX_ADV_RETRIES);
+        // The interface is up, so a test that does not hold TEST_GUARD can
+        // put a frame of its own on it too: look for this link's.
+        let link_id = link.link_id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut on_the_wire = false;
+        while !on_the_wire {
+            let frame = frames
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("the advertisement is on the interface");
+            on_the_wire = frame.get(2..18) == Some(&link_id[..]) && frame.get(18) == Some(&packet::RESOURCE_ADV);
+        }
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(advertised.recv_timeout(Duration::from_millis(100)).is_err(), "once");
+        drop(interface);
+        link.teardown();
+    }
+
+    /// The short drop of 2026-10-06, for a Resource: the link is up, its
+    /// interface is down when the advertisement is sent. No interface
+    /// carries it, nothing reaches the wire, and the reporting hook hears
+    /// `carried = false`. The Resource itself is exactly as it is when the
+    /// advertisement was carried, as RNS/Resource.py's is (`__advertise_job`
+    /// ignores `Packet.send()` returning False): ADVERTISED, its watchdog's
+    /// retries all left, registered with its link. A parity pin: the
+    /// observation changes nothing.
+    #[test]
+    fn the_reporting_hook_hears_an_advertisement_no_interface_carried_and_the_resource_is_unchanged() {
+        let _transport = crate::transport::tests::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (interface, frames) = CarryingInterface::register("AdvertDroppedTest", false);
+        let (link, _registry) = live_keyed_link_on(211, STATE_ACTIVE, Some("AdvertDroppedTest"));
+        let (resource, concluded) = outgoing_resource(&link);
+        let (hook, advertised) = reporting_hook(&resource);
+
+        let advertising = Resource::start_advertising_reporting(Arc::clone(&resource), Some(hook));
+
+        let (carried, status, adv_sent, retries_left) = advertised.recv_timeout(Duration::from_secs(5))
+            .expect("the hook runs: the advertisement was sent, though nothing carried it");
+        assert!(!carried, "the link's interface is down: nothing carried the advertisement");
+        assert_eq!(status, crate::resource::ResourceStatus::Advertised, "ADVERTISED, as the reference");
+        assert!(adv_sent > 0.0, "its watchdog counts from the advertisement");
+        assert_eq!(retries_left, Resource::MAX_ADV_RETRIES, "every retry of the advertisement is left");
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(!link.ready_for_new_resource(), "it is registered with its link, in flight");
+        assert!(concluded.try_recv().is_err(), "it has not concluded");
+        assert!(frames.recv_timeout(Duration::from_millis(200)).is_err(), "nothing reached the wire");
+        assert!(advertised.recv_timeout(Duration::from_millis(100)).is_err(), "once");
+        drop(interface);
+        link.teardown();
+        assert_eq!(
+            concluded.recv_timeout(Duration::from_secs(5)).expect("the close concludes it").0,
+            crate::resource::ResourceStatus::Failed,
+        );
+    }
+
+    /// `advertise_shared_then` keeps what it did: its hook runs for an
+    /// advertisement nothing carried, as for one that was carried.
+    #[test]
+    fn the_advertised_hook_still_runs_for_an_advertisement_no_interface_carried() {
+        let _transport = crate::transport::tests::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (interface, frames) = CarryingInterface::register("AdvertDroppedOldHookTest", false);
+        let (link, _registry) = live_keyed_link_on(229, STATE_ACTIVE, Some("AdvertDroppedOldHookTest"));
+        let (resource, _concluded) = outgoing_resource(&link);
+        let (hook, advertised) = advertised_hook(&resource);
+
+        let advertising = Resource::start_advertising_then(Arc::clone(&resource), Some(hook));
+
+        let (status, adv_sent) = advertised.recv_timeout(Duration::from_secs(5))
+            .expect("the hook runs once the advertisement is sent, carried or not");
+        assert_eq!(status, crate::resource::ResourceStatus::Advertised);
+        assert!(adv_sent > 0.0);
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(frames.recv_timeout(Duration::from_millis(200)).is_err(), "nothing reached the wire");
+        drop(interface);
+        link.teardown();
+    }
+
+    /// A Resource that concludes before its advertisement says nothing to
+    /// the reporting hook either.
+    #[test]
+    fn the_reporting_hook_never_runs_for_a_resource_that_was_never_advertised() {
+        let (link, _registry) = live_keyed_link(233, STATE_ACTIVE);
+        let (resource, concluded) = outgoing_resource(&link);
+        let (hook, advertised) = reporting_hook(&resource);
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+
+        let advertising = Resource::start_advertising_reporting(Arc::clone(&resource), Some(hook));
+
+        let step = Duration::from_secs_f64(Resource::QUEUED_POLL_INTERVAL);
+        let (status, adv_sent) = concluded.recv_timeout(step).expect("it concludes");
+        assert_eq!((status, adv_sent), (crate::resource::ResourceStatus::Failed, 0.0));
+        assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
+        assert!(advertised.try_recv().is_err(), "no advertisement went out, so the hook did not run");
+    }
+
     /// RNS/Resource.py:432: a Resource's data is encrypted by its link, and a
     /// link that cannot encrypt it (Link.py:1166-1178 raises) gets no
     /// Resource. Until 2026-09-28 a Resource on a closed link was built on
