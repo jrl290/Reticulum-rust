@@ -6466,9 +6466,27 @@ mod tests {
     /// it out again. The test holds the registry shared (the guard returned)
     /// until it ends, so `teardown_all_runtime_links_empties_the_registry`
     /// cannot tear the link down under it.
+    ///
+    /// It is attached to an interface no test registers, so nothing it sends
+    /// is carried, as when this test runs alone. Unattached, its packets
+    /// would go out on every interface a transport test running alongside
+    /// has registered, and that test counts the frames on its interfaces.
     fn live_keyed_link(seed: u8, status: u8) -> (LinkHandle, std::sync::RwLockReadGuard<'static, ()>) {
+        live_keyed_link_on(seed, status, Some("LinkTestsNoInterface"))
+    }
+
+    /// `live_keyed_link`, attached to the interface named `attached`: its
+    /// packets go out on that interface only (RNS/Transport.py outbound, a
+    /// LINK destination), so whether that interface is up decides whether
+    /// they are carried, whatever else is registered.
+    fn live_keyed_link_on(
+        seed: u8,
+        status: u8,
+        attached: Option<&str>,
+    ) -> (LinkHandle, std::sync::RwLockReadGuard<'static, ()>) {
         let registry = runtime_links_shared();
         let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(seed)).collect());
+        link.attached_interface = attached.map(str::to_string);
         link.state = status;
         link.status = status;
         let now = current_time().unwrap_or(0);
