@@ -115,7 +115,13 @@ pub const MAX_RATE_TIMESTAMPS: usize = 16;
 /// Maximum announces per destination hash per second before dropping.
 pub const ANNOUNCE_RATE_LIMIT: usize = 10;
 pub const PERSIST_RANDOM_BLOBS: usize = 32;
+/// Random blobs remembered per destination to tell a new emission of its
+/// announce from another copy of one already heard (RNS/Transport.py
+/// MAX_RANDOM_BLOBS). See `TransportState::path_random_blobs`.
 pub const MAX_RANDOM_BLOBS: usize = 64;
+/// An announce's random blob: 5 random bytes, then its emission time as a
+/// 5-byte big-endian count of seconds.
+pub const RANDOM_BLOB_LEN: usize = 10;
 /// Max number of alternative paths stored per destination in the
 /// multi-entry path table.  N=3 gives diversity without ballooning
 /// memory (≈ 3× the old single-entry cost, offset by halving the
@@ -495,6 +501,15 @@ pub struct TransportState {
     /// Each announce carries a 10-byte random blob; we track seen blobs here
     /// to reject replays regardless of which path they arrived on.
     pub global_blobs: HashSet<Vec<u8>>,
+    /// Random blobs of the emissions this node has accepted as new, per
+    /// destination, oldest first, at most MAX_RANDOM_BLOBS each — the
+    /// `IDX_PT_RANDBLOBS` list of RNS/Transport.py's path table entry. It
+    /// decides one thing: whether an announce is a new emission and so may
+    /// be queued for rebroadcast (`announce_is_new_emission`). It is not
+    /// anti-replay (that is `global_blobs`) and it never gates path-table
+    /// admission. A destination's list lives and dies with its path-table
+    /// entry, so its size is bounded by the path table. Not persisted.
+    pub path_random_blobs: HashMap<Vec<u8>, VecDeque<[u8; RANDOM_BLOB_LEN]>>,
     pub blackholed_identities: HashMap<Vec<u8>, BlackholeEntry>,
     pub discovery_path_requests: HashMap<Vec<u8>, DiscoveryPathRequest>,
     /// FIFO queue of recently-seen path-request tags (for eviction order).
@@ -3863,7 +3878,16 @@ impl Transport {
 
             for destination_hash in stale_paths {
                 state.path_table.remove(&destination_hash);
+                state.path_random_blobs.remove(&destination_hash);
                 state.path_table_dirty = true;
+            }
+            // A destination's remembered blobs go with its path-table entry,
+            // whichever code path removed that entry: this sweep is what keeps
+            // `path_random_blobs` bounded by the path table, including for a
+            // removal site that forgets to drop them itself.
+            {
+                let TransportState { path_table, path_random_blobs, .. } = &mut *state;
+                path_random_blobs.retain(|destination_hash, _| path_table.contains_key(destination_hash));
             }
 
             for destination_hash in stale_discovery {
@@ -5252,6 +5276,7 @@ impl Transport {
     pub fn expire_path(destination_hash: &[u8]) -> bool {
         let mut state = TRANSPORT.lock().unwrap();
         let existed = state.path_table.remove(destination_hash).is_some();
+        state.path_random_blobs.remove(destination_hash);
         if existed {
             state.path_table_dirty = true;
         }
@@ -5306,6 +5331,7 @@ impl Transport {
         }
         if is_empty {
             state.path_table.remove(destination_hash);
+            state.path_random_blobs.remove(destination_hash);
         }
         if removed {
             state.path_table_dirty = true;
@@ -6108,10 +6134,60 @@ impl Transport {
                         // entry in place) while letting distinct routes coexist,
                         // which is the entire premise of the multi-entry model and
                         // of `select_path`'s interface.OUT gate.
+                        //
+                        // Whether this copy is a NEW EMISSION is decided first,
+                        // against the routes as they stood before it arrived. It
+                        // decides only whether the announce is queued for
+                        // rebroadcast below; every route is still admitted.
+                        let new_emission_blob: Option<[u8; RANDOM_BLOB_LEN]> = new_blob
+                            .as_deref()
+                            .and_then(|blob| <[u8; RANDOM_BLOB_LEN]>::try_from(blob).ok());
+                        let destination_was_known = state
+                            .path_table
+                            .get(destination_hash.as_slice())
+                            .map_or(false, |routes| !routes.is_empty());
+                        let is_new_emission = match new_emission_blob {
+                            Some(ref blob) => {
+                                let interfaces = &state.interfaces;
+                                let now_ts = now();
+                                announce_is_new_emission(
+                                    state.path_table.get(destination_hash.as_slice()),
+                                    state.path_random_blobs.get(destination_hash.as_slice()),
+                                    blob,
+                                    packet.hops,
+                                    |route| route_is_live(route, interfaces, now_ts),
+                                )
+                            }
+                            // Unreachable for an announce that passed signature
+                            // validation, which needs more bytes than this.
+                            None => true,
+                        };
+
                         let deque = state.path_table
                             .entry(destination_hash.clone())
                             .or_insert_with(VecDeque::new);
                         admit_route(deque, new_entry);
+
+                        // RNS/Transport.py appends the blob to the path entry's
+                        // random_blobs only when `should_add`; an unknown
+                        // destination starts a fresh list.
+                        if is_new_emission {
+                            if let Some(blob) = new_emission_blob {
+                                let blobs = state
+                                    .path_random_blobs
+                                    .entry(destination_hash.clone())
+                                    .or_insert_with(VecDeque::new);
+                                if !destination_was_known {
+                                    blobs.clear();
+                                }
+                                if !blobs.contains(&blob) {
+                                    blobs.push_back(blob);
+                                }
+                                while blobs.len() > MAX_RANDOM_BLOBS {
+                                    blobs.pop_front();
+                                }
+                            }
+                        }
 
                         state.path_table_dirty = true;
                         Transport::record_tunnel_path(
@@ -6182,14 +6258,29 @@ impl Transport {
                         // announced immediately, but only one time"; everything
                         // else waits out a random window so that neighbours do not
                         // all rebroadcast in the same instant.
+                        //
+                        // And only a NEW EMISSION is queued (RNS/Transport.py
+                        // reaches this insert only when `should_add`). One
+                        // emission reaches a transport node over every route it
+                        // has; queueing each copy overwrote the table entry once
+                        // per route, resetting its retries and retransmit
+                        // timeout each time, so the node rebroadcast the same
+                        // emission again and again, about a second apart. A copy
+                        // of an emission already queued leaves its entry alone,
+                        // which is also what lets the local-rebroadcast check
+                        // above see our own retries. Its route was still
+                        // admitted above.
                         let announce_from_local_client = packet
                             .receiving_interface
                             .as_deref()
                             .map(|name| Transport::is_local_client_interface_locked(&state, name))
                             .unwrap_or(false);
-                        if (state.transport_enabled || announce_from_local_client)
-                            && packet.context != crate::packet::PATH_RESPONSE
-                        {
+                        let rebroadcast_eligible = (state.transport_enabled || announce_from_local_client)
+                            && packet.context != crate::packet::PATH_RESPONSE;
+                        if rebroadcast_eligible && !is_new_emission {
+                            crate::announce_log::count_rebroadcast_suppressed_seen();
+                        }
+                        if rebroadcast_eligible && is_new_emission {
                             let block_rebroadcasts = false;
                             let (initial_timeout, initial_retries) = if announce_from_local_client {
                                 (now(), PATHFINDER_R)
@@ -7316,6 +7407,106 @@ fn announce_wire_fields(raw: &[u8]) -> Option<(Vec<u8>, u64)> {
     let timebase = raw.get(blob_at + 5..blob_at + 10)?;
     let emitted = timebase.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64);
     Some((raw.get(dest_at..dest_at + hash_len)?.to_vec(), emitted))
+}
+
+/// Emission time of an announce, from its random blob: bytes 5..10,
+/// big-endian seconds (RNS/Transport.py timebase_from_random_blob).
+fn random_blob_emitted(blob: &[u8; RANDOM_BLOB_LEN]) -> u64 {
+    blob[5..10].iter().fold(0u64, |acc, b| (acc << 8) | *b as u64)
+}
+
+/// Whether a route can still carry traffic at `now`: not past its expiry,
+/// nor past the shorter life of a route learned over an access-point or
+/// roaming interface — the same test the path-table cull in `jobs()`
+/// applies, so a route counts as expired here exactly when the next cull
+/// would remove it.
+fn route_is_live(route: &PathEntry, interfaces: &[InterfaceStub], now: f64) -> bool {
+    if route.is_expired(now) {
+        return false;
+    }
+    let mode = route
+        .receiving_interface
+        .as_deref()
+        .and_then(|name| interfaces.iter().find(|i| i.name == name))
+        .map(|i| i.mode);
+    match mode {
+        Some(m) if m == InterfaceStub::MODE_ACCESS_POINT => now < route.timestamp + AP_PATH_TIME,
+        Some(m) if m == InterfaceStub::MODE_ROAMING => now < route.timestamp + ROAMING_PATH_TIME,
+        _ => true,
+    }
+}
+
+/// Whether an announce is a NEW EMISSION for its destination, and so may be
+/// queued for rebroadcast. This is RNS/Transport.py 1.5.2 inbound()'s
+/// `should_add` (lines 2206-2296), evaluated against the destination's
+/// routes and remembered blobs as they stood before this copy arrived.
+///
+/// `routes` are the destination's path-table entries, `seen` the blobs of
+/// the emissions already accepted for it (`path_random_blobs`), `hops` the
+/// copy's hop count after this node's increment (what the path table
+/// records), and `is_live` says whether a route has not expired.
+///
+/// Python's conditions, and how they map onto Rust's multi-route table:
+///
+/// 1. Destination not in the path table: new. In Rust, no route at all
+///    (the blobs leave the table with the last route).
+/// 2. Every other accepting branch of Python's requires the blob to be
+///    unseen (`not random_blob in random_blobs`), so a seen blob is never
+///    new. The two that do not are left out; see below.
+/// 3. hops <= the path's hops: new iff the emission is newer than the newest
+///    remembered one (`announce_emitted > path_timebase`).
+/// 4. hops > the path's hops: new iff the path has expired
+///    (`now >= path_expires`) or the emission is newer than the newest
+///    remembered one (`announce_emitted > path_announce_emitted`).
+///
+/// Python has one path per destination, Rust up to MAX_PATHS_PER_DEST, so
+/// "the path has expired" becomes "no route is live": while any route is
+/// live the destination is still reachable, as it is over Python's
+/// unexpired path. Branches 3 and 4 then differ only when no route is live,
+/// and for that case "the path's hops" is the fewest hops among the
+/// (expired) routes — the shortest path the node had.
+///
+/// Python's scan in branch 4 stops at the first blob at least as new as this
+/// one; that cannot change the strict `>` test, so the plain maximum serves
+/// both branches.
+///
+/// Two Python clauses have no Rust counterpart:
+///
+/// * Gravity (branch 3): the same emission, arriving later over an
+///   interface of higher gravity, replaces the path. Rust interfaces carry
+///   no gravity, and every route is admitted anyway (`admit_route`).
+/// * Unresponsive (branch 4): the same emission is accepted again once the
+///   path was marked unresponsive. Rust keeps no such state:
+///   `mark_path_unresponsive` removes the routes over the failed interface,
+///   and when none is left the destination leaves the path table with its
+///   blobs, so the next copy is new by rule 1.
+fn announce_is_new_emission(
+    routes: Option<&VecDeque<PathEntry>>,
+    seen: Option<&VecDeque<[u8; RANDOM_BLOB_LEN]>>,
+    blob: &[u8; RANDOM_BLOB_LEN],
+    hops: u8,
+    is_live: impl Fn(&PathEntry) -> bool,
+) -> bool {
+    let routes = match routes {
+        Some(routes) if !routes.is_empty() => routes,
+        _ => return true,
+    };
+    if seen.map_or(false, |seen| seen.contains(blob)) {
+        return false;
+    }
+    let newest_seen = seen
+        .and_then(|seen| seen.iter().map(random_blob_emitted).max())
+        .unwrap_or(0);
+    if random_blob_emitted(blob) > newest_seen {
+        return true;
+    }
+    // Not newer: only branch 4 can still accept it, and only once the
+    // path has expired.
+    if routes.iter().any(|route| is_live(route)) {
+        return false;
+    }
+    let path_hops = routes.iter().map(|route| route.hops).min().unwrap_or(u8::MAX);
+    hops > path_hops
 }
 
 #[cfg(test)]
@@ -12163,6 +12354,344 @@ mod tests {
                 "an announce from a program attached to this instance is rebroadcast even with \
                  transport disabled: `transport_enabled() or from_local_client(packet)`"
             );
+        }
+
+        // ── Only a new emission is queued ──────────────────────────────────
+        //
+        // RNS/Transport.py 1.5.2 inbound() (lines 2206-2395) inserts into the
+        // announce table only when `should_add`: the announce's random blob is
+        // unseen for its destination and its emission is newer than any
+        // remembered, or the path has expired. One emission reaches a transport
+        // node over every route it has. On 2026-10-09 the production gateway sent
+        // the PHP node 899 announces for 304 destinations in 30 minutes, two
+        // thirds of them repeats of one emission about a second apart, because
+        // every copy re-queued it and reset its retries and timeout.
+
+        const ROUTE_A: &str = "test-emission-route-a";
+        const ROUTE_B: &str = "test-emission-route-b";
+        const RELAY_A: [u8; 16] = [0xA1; 16];
+        const RELAY_B: [u8; 16] = [0xB2; 16];
+
+        /// A transport node with two online interfaces, and a destination
+        /// whose announces reach it over both.
+        struct EmissionFixture {
+            identity: Identity,
+            destination: Destination,
+            saved_transport_enabled: bool,
+            _ifaces: InterfacesRestore,
+            _restore: ReceiptStateRestore,
+        }
+
+        impl EmissionFixture {
+            fn new() -> Self {
+                let restore = ReceiptStateRestore::new();
+                let ifaces = InterfacesRestore::new();
+                let saved_transport_enabled = {
+                    let mut state = TRANSPORT.lock().unwrap();
+                    let saved = state.transport_enabled;
+                    state.identity = Some(Identity::new(true));
+                    state.transport_enabled = true;
+                    state.is_connected_to_shared_instance = false;
+                    state.drop_announces = false;
+                    saved
+                };
+                register_test_iface(ROUTE_A, true, None);
+                register_test_iface(ROUTE_B, true, None);
+                let identity = Identity::new(true);
+                let destination = Destination::new_inbound(
+                    Some(identity.clone()),
+                    DestinationType::Single,
+                    "emission_test".to_string(),
+                    vec!["announce".to_string()],
+                )
+                .expect("announce destination");
+                Self { identity, destination, saved_transport_enabled, _ifaces: ifaces, _restore: restore }
+            }
+
+            fn dest(&self) -> Vec<u8> {
+                self.destination.hash.clone()
+            }
+
+            /// The random blob of one emission: `nonce` in the five random
+            /// bytes, `emitted` in the five-byte big-endian timebase.
+            fn blob(nonce: u8, emitted: u64) -> [u8; RANDOM_BLOB_LEN] {
+                let mut blob = [nonce; RANDOM_BLOB_LEN];
+                blob[5..].copy_from_slice(&emitted.to_be_bytes()[3..8]);
+                blob
+            }
+
+            /// The signed announce data of one emission.
+            fn emission(&self, nonce: u8, emitted: u64) -> Vec<u8> {
+                let public_key = self.identity.get_public_key().expect("pubkey");
+                let blob = Self::blob(nonce, emitted);
+                let mut signed_data = Vec::new();
+                signed_data.extend_from_slice(&self.destination.hash);
+                signed_data.extend_from_slice(&public_key);
+                signed_data.extend_from_slice(&self.destination.name_hash);
+                signed_data.extend_from_slice(&blob);
+                let signature = self.identity.sign(&signed_data);
+                let mut data = Vec::new();
+                data.extend_from_slice(&public_key);
+                data.extend_from_slice(&self.destination.name_hash);
+                data.extend_from_slice(&blob);
+                data.extend_from_slice(&signature);
+                data
+            }
+
+            /// Deliver `data` as relayed to us by `relay` over `iface`, having
+            /// travelled `hops` hops (this node then counts one more).
+            fn deliver(&self, data: &[u8], iface: &str, relay: [u8; 16], hops: u8) {
+                let flags = (crate::packet::HEADER_2 << 6)
+                    | (crate::packet::FLAG_UNSET << 5)
+                    | (MODE_TRANSPORT << 4)
+                    | ((DestinationType::Single as u8) << 2)
+                    | ANNOUNCE;
+                let mut raw = vec![flags, hops];
+                raw.extend_from_slice(&relay);
+                raw.extend_from_slice(&self.destination.hash);
+                raw.push(crate::packet::NONE);
+                raw.extend_from_slice(data);
+                assert!(Transport::inbound(raw, Some(iface.to_string())), "a valid announce is accepted");
+            }
+
+            /// This destination's announce-table entry: (retransmit timeout,
+            /// retries, received from, random blob of the queued packet).
+            fn queued(&self) -> Option<(f64, u8, Vec<u8>, Vec<u8>)> {
+                let state = TRANSPORT.lock().unwrap();
+                let entry = state.announce_table.get(&self.destination.hash)?;
+                let timeout = match entry.get(IDX_AT_RTRNS_TMO) {
+                    Some(AnnounceEntryValue::RetransmitTimeout(t)) => *t,
+                    other => panic!("retransmit timeout slot holds {:?}", other),
+                };
+                let retries = match entry.get(IDX_AT_RETRIES) {
+                    Some(AnnounceEntryValue::Retries(r)) => *r,
+                    other => panic!("retries slot holds {:?}", other),
+                };
+                let received_from = match entry.get(IDX_AT_RCVD_IF) {
+                    Some(AnnounceEntryValue::ReceivedFrom(r)) => r.clone(),
+                    other => panic!("received-from slot holds {:?}", other),
+                };
+                let blob_at = crate::identity::KEYSIZE / 8 + crate::identity::NAME_HASH_LENGTH / 8;
+                let blob = match entry.get(IDX_AT_PACKET) {
+                    Some(AnnounceEntryValue::Packet(p)) => p.data[blob_at..blob_at + RANDOM_BLOB_LEN].to_vec(),
+                    other => panic!("packet slot holds {:?}", other),
+                };
+                Some((timeout, retries, received_from, blob))
+            }
+
+            /// As jobs() leaves an entry once it has rebroadcast it: one retry
+            /// spent and the next attempt far off. Returns that timeout.
+            fn mark_rebroadcast_once(&self) -> f64 {
+                let next_attempt = now() + 1000.0;
+                let mut state = TRANSPORT.lock().unwrap();
+                let entry = state.announce_table.get_mut(&self.destination.hash).expect("queued");
+                entry[IDX_AT_RETRIES] = AnnounceEntryValue::Retries(1);
+                entry[IDX_AT_RTRNS_TMO] = AnnounceEntryValue::RetransmitTimeout(next_attempt);
+                next_attempt
+            }
+
+            /// As jobs() does once the entry's rebroadcasts are complete.
+            fn finish_rebroadcasts(&self) {
+                TRANSPORT.lock().unwrap().announce_table.remove(&self.destination.hash);
+            }
+
+            fn routes(&self) -> Vec<(Option<String>, Vec<u8>, u8)> {
+                let state = TRANSPORT.lock().unwrap();
+                state
+                    .path_table
+                    .get(&self.destination.hash)
+                    .map(|routes| {
+                        routes
+                            .iter()
+                            .map(|r| (r.receiving_interface.clone(), r.next_hop.clone(), r.hops))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+
+            fn expire_all_routes(&self) {
+                let expired = now() - 1.0;
+                let mut state = TRANSPORT.lock().unwrap();
+                for route in state.path_table.get_mut(&self.destination.hash).expect("routes") {
+                    route.expires = expired;
+                }
+            }
+        }
+
+        impl Drop for EmissionFixture {
+            fn drop(&mut self) {
+                let mut state = TRANSPORT.lock().unwrap();
+                let dest = self.destination.hash.clone();
+                state.announce_table.remove(&dest);
+                state.path_table.remove(&dest);
+                state.path_random_blobs.remove(&dest);
+                state.announce_rate_table.remove(&dest);
+                state.transport_enabled = self.saved_transport_enabled;
+            }
+        }
+
+        /// One emission, heard over route A and then over route B at the same
+        /// distance.
+        fn one_emission_over_two_routes(fx: &EmissionFixture) -> (f64, [u8; RANDOM_BLOB_LEN]) {
+            let emitted = now() as u64;
+            let data = fx.emission(0x11, emitted);
+            fx.deliver(&data, ROUTE_A, RELAY_A, 2);
+            let next_attempt = fx.mark_rebroadcast_once();
+            fx.deliver(&data, ROUTE_B, RELAY_B, 2);
+            (next_attempt, EmissionFixture::blob(0x11, emitted))
+        }
+
+        #[test]
+        fn a_second_copy_of_one_emission_does_not_requeue_it() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let (next_attempt, blob) = one_emission_over_two_routes(&fx);
+
+            let queued = {
+                let state = TRANSPORT.lock().unwrap();
+                state.announce_table.keys().filter(|k| **k == fx.dest()).count()
+            };
+            assert_eq!(queued, 1, "one emission, one announce-table entry");
+            let (timeout, retries, received_from, queued_blob) = fx.queued().expect("still queued");
+            assert_eq!(
+                (retries, timeout),
+                (1, next_attempt),
+                "the copy over the second route must not reset the entry's retries or \
+                 retransmit timeout. Regression: every copy of an emission re-queues it, and a \
+                 transport node rebroadcasts the same announce once per route it arrives over \
+                 (RNS/Transport.py queues only when `should_add`)"
+            );
+            assert_eq!(received_from, RELAY_A.to_vec(), "the entry is still the first copy's");
+            assert_eq!(queued_blob, blob.to_vec());
+        }
+
+        #[test]
+        fn a_second_copy_of_one_emission_still_records_its_route() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            one_emission_over_two_routes(&fx);
+
+            let mut routes = fx.routes();
+            routes.sort();
+            assert_eq!(
+                routes,
+                vec![
+                    (Some(ROUTE_A.to_string()), RELAY_A.to_vec(), 3),
+                    (Some(ROUTE_B.to_string()), RELAY_B.to_vec(), 3),
+                ],
+                "every route is admitted, a repeat copy over a new route included — the \
+                 rebroadcast gate must never gate the path table (admit_route)"
+            );
+        }
+
+        #[test]
+        fn a_new_emission_is_queued() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let emitted = now() as u64;
+            fx.deliver(&fx.emission(0x21, emitted), ROUTE_A, RELAY_A, 2);
+            fx.mark_rebroadcast_once();
+
+            fx.deliver(&fx.emission(0x22, emitted + 10), ROUTE_B, RELAY_B, 2);
+            let (_, retries, received_from, blob) = fx.queued().expect("the new emission is queued");
+            assert_eq!(blob, EmissionFixture::blob(0x22, emitted + 10).to_vec(), "it replaces the older one");
+            assert_eq!(retries, 0, "with a fresh rebroadcast cycle");
+            assert_eq!(received_from, RELAY_B.to_vec());
+        }
+
+        #[test]
+        fn an_older_emission_arriving_late_is_not_queued() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let emitted = now() as u64;
+            fx.deliver(&fx.emission(0x31, emitted), ROUTE_A, RELAY_A, 2);
+            fx.finish_rebroadcasts();
+
+            // Never heard before, but emitted ten minutes before the one we have.
+            fx.deliver(&fx.emission(0x32, emitted - 600), ROUTE_B, RELAY_B, 2);
+            assert!(
+                fx.queued().is_none(),
+                "an unseen blob whose emission is older than the newest heard is not a new \
+                 emission while a path is live (RNS/Transport.py: `announce_emitted > \
+                 path_timebase`)"
+            );
+            assert_eq!(fx.routes().len(), 2, "its route is still admitted");
+        }
+
+        #[test]
+        fn once_every_route_has_expired_an_unseen_blob_is_queued() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let emitted = now() as u64;
+            fx.deliver(&fx.emission(0x41, emitted), ROUTE_A, RELAY_A, 2);
+            fx.finish_rebroadcasts();
+            fx.expire_all_routes();
+
+            // Older, and from further away: queued only because the path expired.
+            fx.deliver(&fx.emission(0x42, emitted - 600), ROUTE_B, RELAY_B, 4);
+            let (_, _, _, blob) = fx.queued().expect(
+                "with every route expired, an unseen blob is queued (RNS/Transport.py: \
+                 `now >= path_expires` and `not random_blob in random_blobs`)",
+            );
+            assert_eq!(blob, EmissionFixture::blob(0x42, emitted - 600).to_vec());
+        }
+
+        #[test]
+        fn culling_a_destination_forgets_its_emissions() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let data = fx.emission(0x51, now() as u64);
+            fx.deliver(&data, ROUTE_A, RELAY_A, 2);
+            fx.finish_rebroadcasts();
+            assert!(TRANSPORT.lock().unwrap().path_random_blobs.contains_key(&fx.dest()));
+
+            fx.expire_all_routes();
+            TRANSPORT.lock().unwrap().tables_last_culled = 0.0;
+            Transport::jobs();
+            {
+                let state = TRANSPORT.lock().unwrap();
+                assert!(!state.path_table.contains_key(&fx.dest()), "the cull removed the destination");
+                assert!(
+                    !state.path_random_blobs.contains_key(&fx.dest()),
+                    "and its remembered blobs with it, so they stay bounded by the path table"
+                );
+            }
+
+            fx.deliver(&data, ROUTE_A, RELAY_A, 2);
+            assert!(
+                fx.queued().is_some(),
+                "an unknown destination's announce is new (RNS/Transport.py: `not \
+                 announced_destination_known`)"
+            );
+        }
+
+        /// RNS/Transport.py accepts an older unseen emission over an expired
+        /// path only from further away (its `packet.hops > path hops`
+        /// branch); from as near or nearer it still wants a newer emission.
+        #[test]
+        fn an_expired_path_admits_an_older_emission_only_over_more_hops() {
+            let route = PathEntry {
+                timestamp: 0.0,
+                next_hop: RELAY_A.to_vec(),
+                hops: 3,
+                expires: 0.0,
+                receiving_interface: Some(ROUTE_A.to_string()),
+                packet_hash: Vec::new(),
+            };
+            let routes: VecDeque<PathEntry> = vec![route].into();
+            let seen: VecDeque<[u8; RANDOM_BLOB_LEN]> = vec![EmissionFixture::blob(1, 1000)].into();
+            let older = EmissionFixture::blob(2, 900);
+            let expired = |_: &PathEntry| false;
+            let live = |_: &PathEntry| true;
+
+            assert!(!announce_is_new_emission(Some(&routes), Some(&seen), &older, 3, expired));
+            assert!(announce_is_new_emission(Some(&routes), Some(&seen), &older, 4, expired));
+            assert!(!announce_is_new_emission(Some(&routes), Some(&seen), &older, 4, live));
+            assert!(
+                !announce_is_new_emission(Some(&routes), Some(&seen), &seen[0], 9, expired),
+                "a seen blob is never new while the destination is known"
+            );
+            assert!(announce_is_new_emission(None, Some(&seen), &seen[0], 3, live), "unknown destination");
         }
     }
 

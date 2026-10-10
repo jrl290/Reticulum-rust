@@ -45,6 +45,7 @@ static ANNOUNCES_VALID: AtomicU64 = AtomicU64::new(0);
 static ANNOUNCES_INVALID: AtomicU64 = AtomicU64::new(0);
 static ANNOUNCES_DEDUP_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PATHS_ADDED: AtomicU64 = AtomicU64::new(0);
+static REBROADCAST_SUPPRESSED_SEEN: AtomicU64 = AtomicU64::new(0);
 static LAST_FLUSH_SECS: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_WATCH_HEX: Lazy<Mutex<HashMap<String, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -124,6 +125,13 @@ pub fn count_path_added() {
     PATHS_ADDED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Increment when an announce that this node would rebroadcast is not queued
+/// because its emission was already seen — another copy of an emission that
+/// reached us over a different route, or an older emission arriving late.
+pub fn count_rebroadcast_suppressed_seen() {
+    REBROADCAST_SUPPRESSED_SEEN.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Emit a single summary log line if `FLUSH_INTERVAL_SECS` has elapsed since
 /// the last summary. Cheap when not due (one atomic load + comparison).
 pub fn flush_if_due() {
@@ -150,8 +158,9 @@ pub fn flush_if_due() {
     let invalid = ANNOUNCES_INVALID.swap(0, Ordering::Relaxed);
     let dedup = ANNOUNCES_DEDUP_SKIPPED.swap(0, Ordering::Relaxed);
     let paths = PATHS_ADDED.swap(0, Ordering::Relaxed);
+    let suppressed_seen = REBROADCAST_SUPPRESSED_SEEN.swap(0, Ordering::Relaxed);
 
-    if inbound == 0 && valid == 0 && invalid == 0 && paths == 0 && dedup == 0 {
+    if inbound == 0 && valid == 0 && invalid == 0 && paths == 0 && dedup == 0 && suppressed_seen == 0 {
         return;
     }
 
@@ -165,17 +174,21 @@ pub fn flush_if_due() {
     //   dedup_skipped ⊆ valid  (fast-path verify-skips counted here AND in valid)
     //   paths_added ≤ valid    (only fires when path table was actually mutated;
     //                           drops own-destination echoes and no-improvement updates)
+    //   rebroadcast_suppressed_seen ≤ valid  (announces a transport node, or a
+    //                           local client's relay, did not queue for
+    //                           rebroadcast because the emission was already seen)
     // So `inbound - (valid + invalid)` represents announces dropped before
     // signature check (e.g. data shorter than a public key).
     crate::log(
         format!(
-            "[ANNOUNCE-SUMMARY] window={}s inbound={} valid={} invalid={} dedup_skipped={} paths_added={} ({:.1}/s)",
+            "[ANNOUNCE-SUMMARY] window={}s inbound={} valid={} invalid={} dedup_skipped={} paths_added={} rebroadcast_suppressed_seen={} ({:.1}/s)",
             interval,
             inbound,
             valid,
             invalid,
             dedup,
             paths,
+            suppressed_seen,
             inbound as f64 / interval.max(1) as f64,
         ),
         crate::LOG_NOTICE,
