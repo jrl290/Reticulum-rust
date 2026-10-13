@@ -3,12 +3,19 @@
 # stack and the Python reference. Both ends connect over loopback TCP to a
 # Python reference transport node, so each exchange crosses a transport hop.
 #
-#   tests/interop/run.sh                             all three size classes
+#   tests/interop/run.sh                             all four size classes
 #   tests/interop/run.sh <request_len> <response_len>   one of your choosing
 #
 # The size classes are each a different code path: one packet each way
 # (which is also the regression test for LRRTT reaching the wire before the
-# established callback can send a request), one Resource window, and many.
+# established callback can send a request), one Resource window, many, and
+# Resources over MAX_EFFICIENT_SIZE (1 MiB), which go in segments: the
+# request, both responses and the plain Resource.
+#
+# Each client also requests /proven, which a Rust server answers from a
+# proven handler: the response goes as a Resource at any size, and the server
+# must print `PROVEN delivered=true` exactly once (the client's stack proved
+# it). A Python server answers /proven as /echo.
 #
 # Needs the workspace venv (../.venv with `rns` at the reference version,
 # 1.5.2 since 2026-09-22). Exit 0 only if all pass.
@@ -85,7 +92,7 @@ if [ $# -eq 0 ]; then
   fi
   status=0; child=""
   trap '[ -n "$child" ] && { kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; }; release_ports; exit 143' INT TERM HUP
-  for sizes in "100 200" "3000 5000" "60000 250000"; do
+  for sizes in "100 200" "3000 5000" "60000 250000" "1500000 2500000"; do
     "$0" $sizes & child=$!
     wait "$child" || status=1
     child=""
@@ -226,7 +233,7 @@ show_logs() { # <dir> <name>
   done
 }
 
-CLIENT_CEILING=260   # the client's own ceilings: 40 s path + 120 s response + 60 s resource
+CLIENT_CEILING=400   # the client's own ceilings: 40 s path + 120 s response + 120 s /proven + 60 s resource
 FAILED=0
 pair() { # <server kind> <client kind> [hub|rusthub|direct]
   local s="$1" c="$2" topo="${3:-hub}"
@@ -313,6 +320,12 @@ $snapshot"
     local concluded; concluded="$(grep -c '^RESOURCE' "$sdir/out")"
     case "$result" in PASS*) [ "$concluded" -eq 1 ] || result="FAIL the server's resource-concluded callback fired $concluded times for one Resource [end result: $result]";; esac
     grep -q '^RESOURCE .*intact=\(False\|false\)' "$sdir/out" && result="FAIL plain resource arrived corrupted"
+    # A proven response's `concluded` fires once, and here with the proof.
+    if [ "$s" = rust ]; then
+      local proven unproven
+      proven="$(grep -c '^PROVEN delivered=true' "$sdir/out")"; unproven="$(grep -c '^PROVEN delivered=false' "$sdir/out")"
+      case "$result" in PASS*) [ "$proven" -eq 1 ] && [ "$unproven" -eq 0 ] || result="FAIL the proven response concluded proved $proven time(s), not proved $unproven time(s) [end result: $result]";; esac
+    fi
   fi
   case "$result" in
     PASS*) echo "PASS  $label: $result ($(grep -c '^REQUEST' "$sdir/out") request(s) seen by server, 0 oversize frames) [port $port; $timing]";;

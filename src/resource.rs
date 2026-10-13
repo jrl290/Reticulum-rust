@@ -124,6 +124,11 @@ pub struct Resource {
     pub storagepath: Option<PathBuf>,
     pub meta_storagepath: Option<PathBuf>,
     pub input_file: Option<File>,
+    /// The whole of a split Resource's data when it came as bytes: each
+    /// segment copies only its own part, and hands the rest to the next
+    /// (`prepare_next_segment`). RNS/Resource.py writes such data to a
+    /// temporary file and reads the segments from it (`input_file`).
+    input_bytes: Option<Arc<Vec<u8>>>,
     pub assembly_lock: bool,
     pub receive_lock: Arc<Mutex<()>>,
 }
@@ -421,6 +426,7 @@ impl Resource {
             storagepath: None,
             meta_storagepath: None,
             input_file: None,
+            input_bytes: None,
             assembly_lock: false,
             receive_lock: Arc::new(Mutex::new(())),
         };
@@ -532,7 +538,7 @@ impl Resource {
                 self.split = true;
 
                 let seek_index = self.segment_index - 1;
-                let first_read_size = Resource::MAX_EFFICIENT_SIZE - self.metadata_size;
+                let first_read_size = Resource::MAX_EFFICIENT_SIZE.saturating_sub(self.metadata_size);
                 let (seek_position, segment_read_size) = if self.segment_index == 1 {
                     (0u64, first_read_size)
                 } else {
@@ -548,19 +554,39 @@ impl Resource {
                 self.input_file = Some(file);
             }
         } else if let Some(ResourceData::Bytes(bytes)) = data {
-            // KNOWN GAP (round 3, 2026-10-01): RNS/Resource.py splits data
-            // over MAX_EFFICIENT_SIZE into segments; this branch never does.
-            // Whoever fixes it must also carry the sender's advertisement
-            // hook (`advertise_shared_then`) to each later segment, where
-            // `validate_proof`'s next-segment branch advertises it: app-links reports
-            // each advertisement to LXMF's §1 watch (DESIGN_PRINCIPLES §1,
-            // bulk transfers), and without it the gap from one segment's last
-            // request to the next one's first is counted as silence.
+            // RNS/Resource.py:272-279, 316: bytes over MAX_EFFICIENT_SIZE
+            // (metadata included) are split into segments, as a file is.
+            // Until 2026-10-12 they went as one segment of any size, which
+            // RNS and the web refuse over 3 × MAX_EFFICIENT_SIZE.
+            //
+            // A split Resource's later segments are advertised by
+            // `validate_proof` without the hook `advertise_shared_then` and
+            // `advertise_shared_then_reporting` take: it runs once, for the
+            // first segment. LXMF-rust and app-links watch their sends by it
+            // (DESIGN_PRINCIPLES §1, bulk transfers), and a gap from one
+            // segment's last request to the next one's first then counts as
+            // silence there. Retichat's messages stay under LXMF's delivery
+            // limit (1,000,000 B), so they never split; a sender that can go
+            // over MAX_EFFICIENT_SIZE needs a hook that runs for every segment.
             self.total_size = bytes.len() + self.metadata_size;
-            self.total_segments = 1;
-            self.segment_index = 1;
-            self.split = false;
-            resource_data = Some(bytes);
+            if self.total_size <= Resource::MAX_EFFICIENT_SIZE {
+                self.total_segments = 1;
+                self.segment_index = 1;
+                self.split = false;
+                resource_data = Some(bytes);
+            } else {
+                resource_data = Some(self.take_segment(Arc::new(bytes)));
+            }
+        } else if let Some(ResourceData::Shared(bytes)) = data {
+            self.total_size = bytes.len() + self.metadata_size;
+            if self.total_size <= Resource::MAX_EFFICIENT_SIZE {
+                self.total_segments = 1;
+                self.segment_index = 1;
+                self.split = false;
+                resource_data = Some(bytes.as_ref().clone());
+            } else {
+                resource_data = Some(self.take_segment(bytes));
+            }
         } else if data.is_none() {
             // Receiving resource
         } else {
@@ -579,7 +605,14 @@ impl Resource {
         if let Some(data) = &self.data {
             self.initiator = true;
             self.uncompressed_size = data.len();
-            self.total_size = data.len();
+            // A split Resource keeps the whole data's size: RNS/Resource.py
+            // advertises it as `d` (`total_size`) with every segment, and the
+            // receivers check a segment count against it (the web refuses a
+            // split Resource whose `l` does not match). Until 2026-10-12 each
+            // segment of a file advertised its own size here.
+            if !self.split {
+                self.total_size = data.len();
+            }
 
             let uncompressed_payload = data.clone();
             let mut payload = uncompressed_payload.clone();
@@ -637,6 +670,29 @@ impl Resource {
         }
 
         Ok(None)
+    }
+
+    /// This Resource's segment of `bytes`, data that is split
+    /// (RNS/Resource.py:296-311, as the file branch above): the first segment
+    /// holds MAX_EFFICIENT_SIZE less the metadata, every later one
+    /// MAX_EFFICIENT_SIZE. The bytes stay here for the next segment, if any.
+    fn take_segment(&mut self, bytes: Arc<Vec<u8>>) -> Vec<u8> {
+        self.total_segments = (self.total_size - 1) / Resource::MAX_EFFICIENT_SIZE + 1;
+        self.segment_index = self.segment_index.max(1);
+        self.split = true;
+        let first_read_size = Resource::MAX_EFFICIENT_SIZE.saturating_sub(self.metadata_size);
+        let (start, len) = if self.segment_index == 1 {
+            (0, first_read_size)
+        } else {
+            (first_read_size + (self.segment_index - 2) * Resource::MAX_EFFICIENT_SIZE, Resource::MAX_EFFICIENT_SIZE)
+        };
+        let start = start.min(bytes.len());
+        let end = start.saturating_add(len).min(bytes.len());
+        let segment = bytes[start..end].to_vec();
+        if self.segment_index < self.total_segments {
+            self.input_bytes = Some(bytes);
+        }
+        segment
     }
 
     /// RNS/Resource.py:447 `get_random_hash()[:RANDOM_HASH_SIZE]`.
@@ -2092,16 +2148,28 @@ impl Resource {
                         if !self.preparing_next_segment {
                             self.prepare_next_segment();
                         }
-                        while self.next_segment.is_none() {
-                            thread::sleep(Duration::from_millis(50));
-                        }
-                        if let Some(next) = &self.next_segment {
+                        // The next segment is prepared under this Resource's
+                        // lock, which this holds too: by now it was made or it
+                        // could not be. Until 2026-10-12 this waited for it in
+                        // a loop, forever when it could not be made (its link
+                        // gone, so its data could not be encrypted).
+                        match self.next_segment.clone() {
                             // No advertisement hook reaches a later segment
-                            // (`advertise_shared_then`). Only file-backed data
-                            // is segmented today, and no AppLinks or LXMF
-                            // send is; see the KNOWN GAP note in `prepare_data`
-                            // before segmenting bytes.
-                            Resource::advertise_shared(next.clone());
+                            // (`advertise_shared_then`): see `prepare_data`.
+                            Some(next) => Resource::advertise_shared(next),
+                            None => {
+                                crate::log(
+                                    &format!(
+                                        "[RESOURCE] {}: segment {}/{} could not be prepared; the transfer failed",
+                                        self.short_hash(), self.segment_index + 1, self.total_segments,
+                                    ),
+                                    crate::LOG_ERROR, false, false,
+                                );
+                                self.status = ResourceStatus::Failed;
+                                if let Some(cb) = &self.callback {
+                                    cb(Arc::new(Mutex::new(self.clone())));
+                                }
+                            }
                         }
                     }
                 } else {
@@ -2306,10 +2374,34 @@ impl Resource {
         self.compressed
     }
 
-    fn prepare_next_segment(&mut self) {
+    /// RNS/Resource.py `__prepare_next_segment`. Started in the background
+    /// when this segment is advertised, or by `validate_proof` when that has
+    /// not begun; whichever comes second finds the segment made and leaves
+    /// it. With no data to make it from (a copy of this Resource, which holds
+    /// no file), no segment is made. Until 2026-10-12 one was made all the
+    /// same, empty, as a Resource that receives, and the second call put such
+    /// a one in place of the segment the first had made.
+    pub(crate) fn prepare_next_segment(&mut self) {
+        if self.next_segment.is_some() || self.segment_index >= self.total_segments {
+            return;
+        }
         self.preparing_next_segment = true;
+        let input = match (self.input_file.take(), self.input_bytes.take()) {
+            (Some(file), _) => ResourceData::File(file),
+            (None, Some(bytes)) => ResourceData::Shared(bytes),
+            (None, None) => {
+                crate::log(
+                    &format!(
+                        "[RESOURCE] {}: no data for segment {}/{}",
+                        self.short_hash(), self.segment_index + 1, self.total_segments,
+                    ),
+                    crate::LOG_WARNING, false, false,
+                );
+                return;
+            }
+        };
         let next = Resource::new_internal(
-            self.input_file.take().map(ResourceData::File),
+            Some(input),
             self.link.clone(),
             None,
             false,
@@ -2324,8 +2416,15 @@ impl Resource {
             self.metadata_size,
             None,
         );
-        if let Ok(next) = next {
-            self.next_segment = Some(Arc::new(Mutex::new(next)));
+        match next {
+            Ok(next) => self.next_segment = Some(Arc::new(Mutex::new(next))),
+            Err(e) => crate::log(
+                &format!(
+                    "[RESOURCE] {}: segment {}/{} could not be made: {}",
+                    self.short_hash(), self.segment_index + 1, self.total_segments, e,
+                ),
+                crate::LOG_WARNING, false, false,
+            ),
         }
     }
 
@@ -2437,6 +2536,7 @@ impl Clone for Resource {
             storagepath: self.storagepath.clone(),
             meta_storagepath: self.meta_storagepath.clone(),
             input_file: None,
+            input_bytes: self.input_bytes.clone(),
             assembly_lock: self.assembly_lock,
             receive_lock: self.receive_lock.clone(),
         }
@@ -2446,6 +2546,9 @@ impl Clone for Resource {
 pub enum ResourceData {
     Bytes(Vec<u8>),
     File(File),
+    /// Bytes held elsewhere too: a split Resource's later segments take
+    /// their part of the data from these without copying the rest.
+    Shared(Arc<Vec<u8>>),
 }
 
 pub struct ResourceAdvertisement {

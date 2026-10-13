@@ -147,6 +147,32 @@ pub type LinkEstablishedCallback = Box<dyn Fn(&crate::link::Link) + Send>;
 pub type ProofRequestedCallback = Box<dyn Fn(&Packet) -> bool + Send>;
 pub type RequestHandlerCallback = Arc<dyn Fn(&str, &[u8], &[u8], Option<&Identity>, Option<&crate::link::LinkHandle>, f64) -> Vec<u8> + Send + Sync>;
 
+/// What a proven request handler answers (`register_proven_request_handler`).
+pub enum ProvenAnswer {
+	/// No response at all, as RNS/Link.py sends none when the generator
+	/// returns None.
+	None,
+	/// An ordinary response: one RESPONSE packet when it fits the link MDU,
+	/// a Resource otherwise (RNS/Link.py handle_request).
+	Plain(Vec<u8>),
+	/// A response that goes as a Resource whatever its size, so that the
+	/// requester's proof of it is seen, compressed only when the handler was
+	/// registered with `auto_compress` (as RNS/Link.py handle_request does
+	/// for a response Resource). `concluded` fires exactly once: `true`
+	/// when the requester proved the whole response, `false` when the
+	/// transfer failed or could not start. On the wire it is the form
+	/// RNS/Link.py already uses for a response over the MDU, which every
+	/// receiver takes at any size; Python RNS gives a handler no such hook,
+	/// so this adds to the reference without departing from it
+	/// (PULL-PROOF-DESIGN.md: rfed keeps a pulled page until it is proven).
+	Proven {
+		data: Vec<u8>,
+		concluded: Arc<dyn Fn(bool) + Send + Sync>,
+	},
+}
+
+pub type ProvenRequestHandlerCallback = Arc<dyn Fn(&str, &[u8], &[u8], Option<&Identity>, Option<&crate::link::LinkHandle>, f64) -> ProvenAnswer + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RequestHandler {
 	pub path: String,
@@ -154,6 +180,8 @@ pub struct RequestHandler {
 	pub allowed_list: Option<Vec<Vec<u8>>>,
 	pub auto_compress: bool,
 	pub callback: Option<RequestHandlerCallback>,
+	/// Set instead of `callback` by `register_proven_request_handler`.
+	pub proven_callback: Option<ProvenRequestHandlerCallback>,
 }
 
 #[derive(Clone, Default)]
@@ -684,11 +712,42 @@ impl Destination {
 			allowed_list,
 			auto_compress,
 			callback,
+			proven_callback: None,
 		});
 		
 		Ok(())
 	}
 	
+	/// Register a request handler whose answer can be a `ProvenAnswer::Proven`:
+	/// a response sent as a Resource whatever its size, whose `concluded`
+	/// says whether the requester proved it. Allow policy as
+	/// `register_request_handler`.
+	pub fn register_proven_request_handler(
+		&mut self,
+		path: String,
+		callback: ProvenRequestHandlerCallback,
+		allow: u8,
+		allowed_list: Option<Vec<Vec<u8>>>,
+		auto_compress: bool,
+	) -> Result<(), String> {
+		match allow {
+			ALLOW_NONE | ALLOW_ALL | ALLOW_LIST => {}
+			_ => return Err(format!("Invalid allow policy: {}", allow)),
+		}
+
+		let path_hash = truncated_hash(path.as_bytes());
+		self.request_handlers.insert(path_hash, RequestHandler {
+			path,
+			allow_policy: allow,
+			allowed_list,
+			auto_compress,
+			callback: None,
+			proven_callback: Some(callback),
+		});
+
+		Ok(())
+	}
+
 	/// Deregister a request handler for a path
 	/// RNS/Destination.py set_max_request_size(). `None` removes the limit.
 	pub fn set_max_request_size(&mut self, max_request_size: Option<usize>) {

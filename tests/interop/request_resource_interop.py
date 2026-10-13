@@ -20,6 +20,9 @@ import time
 import RNS
 
 APP_NAME, ASPECT, PATH = "interop", "request", "/echo"
+# A Rust server answers /proven from a proven handler (see the Rust end); the
+# reference has no such hook and answers it as /echo.
+PROVEN_PATH = "/proven"
 REQUEST_SEED, RESPONSE_SEED, RESOURCE_SEED = 0x1234, 0x4321, 0x5678
 
 
@@ -83,6 +86,7 @@ def server(config_dir):
 
     destination.set_link_established_callback(link_established)
     destination.register_request_handler(PATH, response_generator=echo, allow=RNS.Destination.ALLOW_ALL)
+    destination.register_request_handler(PROVEN_PATH, response_generator=echo, allow=RNS.Destination.ALLOW_ALL)
     emit(f"DEST {destination.hash.hex()}")
     while True:
         destination.announce()
@@ -125,7 +129,24 @@ def client(config_dir, dest_hex, request_len, response_len):
     response, reason = outcome["result"]
     if response is None:
         fail(reason)
-    if response == pattern(response_len, RESPONSE_SEED):
+    if response != pattern(response_len, RESPONSE_SEED):
+        fail(f"response mismatch: got {len(response)} bytes, wanted {response_len}")
+
+    # The same request to /proven.
+    outcome.clear()
+    done.clear()
+    link.request(
+        PROVEN_PATH,
+        data=[response_len, pattern(request_len, REQUEST_SEED)],
+        response_callback=lambda receipt: finish(receipt.response),
+        failed_callback=lambda receipt: finish(None, "proven request failed"),
+    )
+    if not done.wait(120):
+        fail("no proven response within the test ceiling")
+    proven_response, reason = outcome["result"]
+    if proven_response is None:
+        fail(reason)
+    if proven_response == pattern(response_len, RESPONSE_SEED):
         # One plain Resource (not a request): the server's concluded callback
         # must fire exactly once for it. The runner counts.
         proven = threading.Event()
@@ -135,7 +156,7 @@ def client(config_dir, dest_hex, request_len, response_len):
         time.sleep(0.5)
         emit(f"PASS request={request_len} response={len(response)}")
         os._exit(0)
-    fail(f"response mismatch: got {len(response)} bytes, wanted {response_len}")
+    fail(f"proven response mismatch: got {len(proven_response)} bytes, wanted {response_len}")
 
 
 def fail(reason):

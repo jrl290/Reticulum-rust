@@ -223,6 +223,15 @@ enum LinkMsg {
         request_id: Vec<u8>,
         response: Vec<u8>,
     },
+    /// Fire-and-forget: send a proven handler's response as a Resource
+    /// whatever its size; `concluded` fires once with whether the requester
+    /// proved it (destination::ProvenAnswer::Proven).
+    SendProvenResponse {
+        request_id: Vec<u8>,
+        response: Vec<u8>,
+        auto_compress: bool,
+        concluded: Arc<dyn Fn(bool) + Send + Sync>,
+    },
     /// Fire-and-forget: dispatch an assembled REQUEST resource into the
     /// link's request handler. Sent by the resource_concluded callback for
     /// inbound multi-segment requests (Python parity:
@@ -657,6 +666,19 @@ impl LinkHandle {
         let _ = self.tx.send(LinkMsg::SendResponse { request_id, response });
     }
 
+    /// Send a proven handler's response as a Resource whatever its size
+    /// (destination::ProvenAnswer::Proven), compressed only if the handler
+    /// was registered with `auto_compress`. `concluded` fires exactly once
+    /// with whether the requester proved it: false here at once when the
+    /// link's actor is already gone.
+    pub fn send_proven_response(&self, request_id: Vec<u8>, response: Vec<u8>, auto_compress: bool, concluded: Arc<dyn Fn(bool) + Send + Sync>) {
+        if let Err(unsent) = self.tx.send(LinkMsg::SendProvenResponse { request_id, response, auto_compress, concluded }) {
+            if let LinkMsg::SendProvenResponse { concluded, .. } = unsent.0 {
+                concluded(false);
+            }
+        }
+    }
+
     /// Report that a request sent as a Resource finished uploading, or failed.
     fn request_resource_concluded(&self, request_id: Vec<u8>, delivered: bool) {
         let _ = self.tx.send(LinkMsg::RequestResourceConcluded { request_id, delivered });
@@ -836,6 +858,36 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
     }
 }
 
+/// A response's wire form, `[bin request_id, <response value>]`
+/// (RNS/Link.py handle_request: `umsgpack.packb([request_id, response])`).
+/// The handler's bytes are already one msgpack value and go in as they are,
+/// never wrapped in a bin.
+fn pack_response(request_id: &[u8], response: &[u8]) -> Result<Vec<u8>, String> {
+    let mut packed = Vec::with_capacity(response.len() + request_id.len() + 4);
+    rmp::encode::write_array_len(&mut packed, 2).map_err(|e| e.to_string())?;
+    rmp::encode::write_bin(&mut packed, request_id).map_err(|e| e.to_string())?;
+    packed.extend_from_slice(response);
+    Ok(packed)
+}
+
+/// The Resource callback `send_request_resource` gives its Resource:
+/// `concluded` with whether the peer proved it, and only the first time. A
+/// split Resource's segments share the callback, and a cancel reaches the
+/// next segment, made but not yet advertised, as well as the one in flight.
+fn conclude_once(concluded: Arc<dyn Fn(bool) + Send + Sync>) -> Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> {
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    Arc::new(move |resource: Arc<Mutex<Resource>>| {
+        if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let delivered = resource
+            .lock()
+            .map(|r| r.status == crate::resource::ResourceStatus::Complete)
+            .unwrap_or(false);
+        concluded(delivered);
+    })
+}
+
 /// Request timeout checks — replaces the old request_timeout_watchdog thread.
 /// Send `data` over `link` as a Resource tied to `request_id` — the over-MDU
 /// form of a request (`is_response == false`) or of a response.
@@ -856,25 +908,18 @@ fn send_request_resource(
     request_id: Vec<u8>,
     is_response: bool,
     timeout: Option<f64>,
+    auto_compress: crate::resource::AutoCompressOption,
     concluded: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 ) {
     thread::spawn(move || {
-        let resource_callback = concluded.clone().map(|concluded| {
-            Arc::new(move |resource: Arc<Mutex<Resource>>| {
-                let delivered = resource
-                    .lock()
-                    .map(|r| r.status == crate::resource::ResourceStatus::Complete)
-                    .unwrap_or(false);
-                concluded(delivered);
-            }) as Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>
-        });
+        let resource_callback = concluded.clone().map(conclude_once);
 
         match Resource::new_internal(
             Some(crate::resource::ResourceData::Bytes(data)),
             link,
             None,
             false,
-            crate::resource::AutoCompressOption::Enabled,
+            auto_compress,
             resource_callback,
             None,
             timeout,
@@ -1247,6 +1292,9 @@ fn actor_handle_message(link: &mut Link, rx: &mpsc::Receiver<LinkMsg>, self_hand
             } else {
                 let _ = link.send_request_response(&request_id, &response);
             }
+        }
+        LinkMsg::SendProvenResponse { request_id, response, auto_compress, concluded } => {
+            link.send_proven_request_response(&request_id, &response, auto_compress, concluded);
         }
 
         // Dispatch an assembled REQUEST resource — sent by the
@@ -4199,6 +4247,42 @@ impl Link {
                 // response packet. Mirror that: client times out cleanly.
                 crate::log(&format!("[REQ] request denied for path '{}' (not allowed) — no response sent (matches Python)", handler.path), crate::LOG_NOTICE, false, false);
                 return Ok(());
+            } else if let Some(proven) = handler.proven_callback {
+                // A proven handler, on its own thread for the same reason as
+                // the plain one below; its answer decides how the response
+                // goes (destination::ProvenAnswer).
+                let link_handle = self.self_handle.as_ref().unwrap().clone();
+                let handler_path = handler.path.clone();
+                let auto_compress = handler.auto_compress;
+                let request_id_c = request_id.clone();
+                let request_data_c = request_data.clone();
+                let remote_identity_owned: Option<crate::identity::Identity> =
+                    remote_identity_ref.cloned();
+                std::thread::spawn(move || {
+                    let answer = proven(
+                        &handler_path,
+                        &request_data_c,
+                        &request_id_c,
+                        remote_identity_owned.as_ref(),
+                        Some(&link_handle),
+                        timestamp,
+                    );
+                    let request = crate::hexrep(&request_id_c, false);
+                    match answer {
+                        crate::destination::ProvenAnswer::None => {
+                            crate::log(&format!("[REQ] callback completed path='{}' request_id={} — no response", handler_path, request), crate::LOG_NOTICE, false, false);
+                        }
+                        crate::destination::ProvenAnswer::Plain(response) => {
+                            crate::log(&format!("[REQ] callback completed path='{}' request_id={} response_len={}", handler_path, request, response.len()), crate::LOG_NOTICE, false, false);
+                            link_handle.send_response(request_id_c, response);
+                        }
+                        crate::destination::ProvenAnswer::Proven { data, concluded } => {
+                            crate::log(&format!("[REQ] callback completed path='{}' request_id={} response_len={} (proven)", handler_path, request, data.len()), crate::LOG_NOTICE, false, false);
+                            link_handle.send_proven_response(request_id_c, data, auto_compress, concluded);
+                        }
+                    }
+                });
+                return Ok(());
             } else if let Some(callback) = handler.callback {
                 // Spawn callback on a background thread so it can freely call
                 // LinkHandle methods (snapshot, send_packet, request, etc.) without
@@ -4278,13 +4362,6 @@ impl Link {
             false,
             false,
         );
-        let mut response_data = Vec::new();
-        // 2-element array header
-        rmp::encode::write_array_len(&mut response_data, 2).map_err(|e| e.to_string())?;
-        // First element: request_id as Binary
-        rmp::encode::write_bin(&mut response_data, &request_id).map_err(|e| e.to_string())?;
-        // Second element: raw msgpack response value (already encoded by handler).
-        //
         // Callers MUST NOT invoke this with an empty `response`. Python RNS
         // (RNS/Link.py:handle_request) emits NO response packet at all when
         // the handler returns None, the request is denied, or no handler is
@@ -4293,7 +4370,7 @@ impl Link {
         // nothing in element 2 produces a malformed 19-byte plaintext that
         // the peer fails to decode ("failed to fill whole buffer").
         debug_assert!(!response.is_empty(), "send_request_response called with empty payload — callers must skip the send instead (matches Python RNS)");
-        response_data.extend_from_slice(&response);
+        let response_data = pack_response(request_id, response)?;
         crate::log(&format!("[REQ] response_data (msgpack) {} bytes: {:02x?}", response_data.len(), &response_data[..response_data.len().min(64)]), crate::LOG_NOTICE, false, false);
 
         // RNS/Link.py handle_request(): `if len(packed_response) <= self.mdu`
@@ -4314,7 +4391,7 @@ impl Link {
                 ),
                 crate::LOG_DEBUG, false, false,
             );
-            send_request_resource(link_handle, response_data, request_id.to_vec(), true, None, None);
+            send_request_resource(link_handle, response_data, request_id.to_vec(), true, None, crate::resource::AutoCompressOption::Enabled, None);
             return Ok(());
         }
 
@@ -4376,6 +4453,52 @@ impl Link {
 
         self.had_outbound(false);
         Ok(())
+    }
+
+    /// Send a proven handler's response (destination::ProvenAnswer::Proven):
+    /// the packed `[request_id, response]` goes as a Resource flagged as the
+    /// response whatever its size, the form RNS/Link.py handle_request uses
+    /// over the MDU, so the requester's proof of it is seen. `concluded`
+    /// fires exactly once with whether the requester proved it. An empty
+    /// response is no response, as for `SendResponse`, so nothing is proved.
+    /// RNS/Link.py handle_request compresses a response Resource only when
+    /// the handler was registered with `auto_compress`; the web client
+    /// refuses a compressed Resource.
+    fn send_proven_request_response(&mut self, request_id: &[u8], response: &[u8], auto_compress: bool, concluded: Arc<dyn Fn(bool) + Send + Sync>) {
+        if response.is_empty() {
+            crate::log("[REQ] proven handler returned 0 bytes — no response sent", crate::LOG_NOTICE, false, false);
+            concluded(false);
+            return;
+        }
+        let response_data = match pack_response(request_id, response) {
+            Ok(data) => data,
+            Err(e) => {
+                crate::log(&format!("[REQ] could not pack the proven response to {}: {}", crate::hexrep(request_id, false), e), crate::LOG_ERROR, false, false);
+                concluded(false);
+                return;
+            }
+        };
+        let link_handle = match self.self_handle.clone() {
+            Some(handle) => handle,
+            None => {
+                crate::log("[REQ] no actor handle — cannot send the proven response", crate::LOG_ERROR, false, false);
+                concluded(false);
+                return;
+            }
+        };
+        crate::log(
+            &format!(
+                "[REQ] sending proven response to {} as resource: {} bytes (link MDU {})",
+                crate::hexrep(request_id, false), response_data.len(), self.mdu,
+            ),
+            crate::LOG_DEBUG, false, false,
+        );
+        let compress = if auto_compress {
+            crate::resource::AutoCompressOption::Enabled
+        } else {
+            crate::resource::AutoCompressOption::Disabled
+        };
+        send_request_resource(link_handle, response_data, request_id.to_vec(), true, None, compress, Some(concluded));
     }
 
     fn handle_response_packet(&mut self, plaintext: &[u8]) -> Result<(), String> {
@@ -4626,6 +4749,7 @@ impl Link {
             request_id.clone(),
             false,
             Some(timeout),
+            crate::resource::AutoCompressOption::Enabled,
             Some(Arc::new(move |delivered: bool| {
                 concluded_handle.request_resource_concluded(concluded_id.clone(), delivered);
             })),
@@ -6701,6 +6825,134 @@ mod tests {
         assert!(adv_sent > 0.0);
         assert!(wait_until(5, || advertising.is_finished()), "the advertise thread ends");
         link.teardown();
+    }
+
+    // ── Split byte Resources and proven responses (PULL-PROOF-DESIGN.md) ──
+
+    /// Three segments' worth of bytes: 2 × MAX_EFFICIENT_SIZE + 1000.
+    fn split_payload() -> Vec<u8> {
+        (0..2 * Resource::MAX_EFFICIENT_SIZE + 1000).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// RNS/Resource.py:272-316: bytes over MAX_EFFICIENT_SIZE go in
+    /// segments, as a file does, each hashed over its own part and tied to
+    /// the first by `original_hash`. Every segment advertises the whole size
+    /// as `d`, which the web checks the segment count against. Until
+    /// 2026-10-12 such bytes went as one Resource of any size, which RNS and
+    /// the web refuse over 3 × MAX_EFFICIENT_SIZE.
+    #[test]
+    fn bytes_over_max_efficient_size_go_in_segments() {
+        let (link, _registry) = live_keyed_link(223, STATE_ACTIVE);
+        let max = Resource::MAX_EFFICIENT_SIZE;
+        let payload = split_payload();
+        let mut segment = build_outgoing(&link, payload.clone(), None).expect("first segment");
+        let first_hash = segment.hash.clone();
+        for index in 1..=3usize {
+            assert_eq!((segment.segment_index, segment.total_segments, segment.split), (index, 3, true));
+            let (start, end) = ((index - 1) * max, (index * max).min(payload.len()));
+            assert_eq!(
+                segment.hash,
+                identity::full_hash(&[&payload[start..end], segment.random_hash.as_slice()].concat()),
+                "segment {index} carries bytes {start}..{end}",
+            );
+            assert_eq!(segment.original_hash, first_hash, "segment {index} names the first");
+            let adv = crate::resource::ResourceAdvertisement::new_from_resource(&segment);
+            assert_eq!((adv.i, adv.l, adv.d), (index as u64, 3, payload.len() as u64));
+            assert_eq!(adv.l, (adv.d - 1) / max as u64 + 1, "the count the web checks against d");
+            assert!(adv.t as usize <= 3 * max, "a segment RNS and the web take");
+            segment.prepare_next_segment();
+            match segment.next_segment.take() {
+                Some(next) => segment = Arc::try_unwrap(next).ok().expect("held once").into_inner().unwrap(),
+                None => assert_eq!(index, 3, "segment {} is made", index + 1),
+            }
+        }
+        link.teardown();
+    }
+
+    /// `send_request_resource`'s callback answers once: a cancel reaches the
+    /// next segment, already made, as well as the one in flight, and both run
+    /// the callback they share.
+    #[test]
+    fn a_cancelled_split_resource_concludes_once() {
+        let (link, _registry) = live_keyed_link(227, STATE_ACTIVE);
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let callback = conclude_once(Arc::new(move |proved: bool| {
+            let _ = tx.lock().unwrap().send(proved);
+        }));
+        let mut first = build_outgoing(&link, split_payload(), Some(callback)).expect("first segment");
+        first.prepare_next_segment();
+        assert!(first.next_segment.is_some(), "the next segment is made, with the same callback");
+
+        first.cancel();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once");
+        link.teardown();
+    }
+
+    /// A segment proved when the next one cannot be made (its link has
+    /// closed, so its data cannot be encrypted) fails the transfer. Until
+    /// 2026-10-12 `validate_proof` waited for that segment in a loop, for
+    /// ever, with the Resource's lock held on the thread that took the proof.
+    #[test]
+    fn a_next_segment_that_cannot_be_made_fails_the_transfer() {
+        let (link, _registry) = live_keyed_link(239, STATE_ACTIVE);
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let callback: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource: Arc<Mutex<Resource>>| {
+            let _ = tx.lock().unwrap().send(resource.lock().unwrap().status);
+        });
+        let first = build_outgoing(&link, split_payload(), Some(callback)).expect("first segment");
+        let proof = [first.hash.clone(), first.expected_proof.clone()].concat();
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+
+        let first = Arc::new(Mutex::new(first));
+        let proving = Arc::clone(&first);
+        let worker = thread::spawn(move || proving.lock().unwrap().validate_proof(&proof));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("the transfer concludes"),
+            crate::resource::ResourceStatus::Failed,
+        );
+        assert!(wait_until(5, || worker.is_finished()), "and the proof's thread is free again");
+        assert!(first.lock().unwrap().next_segment.is_none());
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once");
+    }
+
+    /// A proven response goes as a Resource even when it would fit one
+    /// packet, so that its proof is seen, and `concluded` says false when its
+    /// link closes first (rfed then keeps the page for the next pull).
+    #[test]
+    fn a_proven_response_goes_as_a_resource_and_concludes_false_when_its_link_closes() {
+        let (link, _registry) = live_keyed_link(241, STATE_ACTIVE);
+        assert!(link.ready_for_new_resource(), "nothing in flight yet");
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        link.send_proven_response(vec![0x42; 16], vec![0xc3], false, Arc::new(move |proved: bool| {
+            let _ = tx.lock().unwrap().send(proved);
+        }));
+        assert!(wait_until(5, || !link.ready_for_new_resource()),
+            "a one-byte response is in flight as a Resource");
+        assert!(rx.try_recv().is_err(), "not concluded before it is proved or fails");
+
+        link.teardown();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once");
+    }
+
+    /// A proven response on a link that has closed never starts, and says so.
+    #[test]
+    fn a_proven_response_on_a_closed_link_concludes_false() {
+        let (link, _registry) = live_keyed_link(243, STATE_ACTIVE);
+        link.teardown();
+        assert!(wait_until(5, || link.status() == STATE_CLOSED), "the link closes");
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        link.send_proven_response(vec![0x43; 16], vec![0xc3], false, Arc::new(move |proved: bool| {
+            let _ = tx.lock().unwrap().send(proved);
+        }));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once");
     }
 
     /// An interface a test link is attached to, registered in TRANSPORT up
