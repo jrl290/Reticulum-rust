@@ -4674,7 +4674,10 @@ impl Link {
         // We must compute this BEFORE send() since send() doesn't change the hash
         let request_id = packet.get_truncated_hash();
 
-        let sent_at = current_time().unwrap_or(0) as f64;
+        // RNS/Link.py RequestReceipt: `sent_at = time.time()`, and the
+        // response timeout counts from it. Until 2026-10-13 this was the whole
+        // second before the send, so a request timed out up to a second early.
+        let sent_at = now_seconds();
         let pending_request = PendingRequest::new(
             request_id.clone(), sent_at, timeout, max_response_size, Some(sent_at),
             response_callback, failed_callback, progress_callback,
@@ -4743,7 +4746,7 @@ impl Link {
             .lock()
             .map_err(|_| "Pending request lock poisoned")?
             .push(PendingRequest::new(
-                request_id.clone(), current_time().unwrap_or(0) as f64, timeout, max_response_size, None,
+                request_id.clone(), now_seconds(), timeout, max_response_size, None,
                 response_callback, failed_callback, progress_callback,
             ));
 
@@ -5946,6 +5949,27 @@ mod tests {
             "a response that has started arriving as a Resource concludes through the \
              Resource, never through the response timer");
         assert!(rx.try_recv().is_err());
+    }
+
+    /// RNS/Link.py RequestReceipt: `sent_at = time.time()`, and the response
+    /// timeout counts from it. A clock stamped with the whole second before
+    /// the send ran out up to a second early: an unanswered request through
+    /// ffi::link_request failed 4.1 s after it was asked, with a 5 s timeout
+    /// (interop, 2026-10-13).
+    #[test]
+    fn a_requests_response_clock_starts_when_it_is_sent() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(53)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        install_session_key(&mut link);
+        let before = now_seconds();
+        link.request("/x".to_string(), vec![1], None, None, None, Some(5.0), None).expect("request sent");
+        let after = now_seconds();
+
+        let pending = link.pending_requests.lock().unwrap();
+        let started = pending[0].response_clock_started.expect("a packet request's clock starts at once");
+        assert!(before <= started && started <= after, "the clock started at {started}, not between {before} and {after}");
+        assert_eq!(pending[0].sent_at, started);
     }
 
     #[test]
