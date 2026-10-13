@@ -1663,6 +1663,12 @@ pub const KEEPALIVE_MIN: f64 = 5.0;
 pub const KEEPALIVE: f64 = KEEPALIVE_MAX;
 pub const STALE_FACTOR: f64 = 2.0;
 pub const STALE_TIME: f64 = STALE_FACTOR * KEEPALIVE;
+
+/// The keepalive interval of a link whose round-trip time is `rtt`
+/// (RNS/Link.py __update_keepalive). Its stale time is this × `STALE_FACTOR`.
+pub fn keepalive_for_rtt(rtt: f64) -> f64 {
+    (rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT)).min(KEEPALIVE_MAX).max(KEEPALIVE_MIN)
+}
 pub const WATCHDOG_MAX_SLEEP: f64 = 5.0;
 pub const REQUEST_TIMEOUT_CHECK_INTERVAL: f64 = 0.5;
 
@@ -5091,7 +5097,7 @@ impl Link {
     /// Update keepalive interval based on measured RTT (matches Python __update_keepalive)
     pub fn update_keepalive(&mut self) {
         if let Some(rtt) = self.rtt {
-            self.keepalive = (rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT)).min(KEEPALIVE_MAX).max(KEEPALIVE_MIN);
+            self.keepalive = keepalive_for_rtt(rtt);
             self.stale_time = self.keepalive * STALE_FACTOR;
         }
     }
@@ -6092,6 +6098,22 @@ mod tests {
         link.last_outbound = current_time().unwrap() - link.keepalive as u64 - 1;
         link.handle_data_packet(&ping).unwrap();
         assert!(link.last_keepalive > 0, "pong once the last outbound is older than the keepalive period");
+    }
+
+    /// RNS/Link.py __update_keepalive (1.5.2): rtt × 360/1.75, kept within
+    /// 5..=360 s, and stale at twice that. ffi::link_request bounds a split
+    /// response's silence by this stale time.
+    #[test]
+    fn keepalive_and_stale_time_follow_the_rtt_as_rns_sets_them() {
+        assert_eq!(keepalive_for_rtt(0.01), KEEPALIVE_MIN);
+        assert!((keepalive_for_rtt(0.5) - 0.5 * 360.0 / 1.75).abs() < 1e-9);
+        assert_eq!(keepalive_for_rtt(2.0), KEEPALIVE_MAX);
+
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(73)).collect());
+        link.rtt = Some(0.5);
+        link.update_keepalive();
+        assert_eq!(link.keepalive, keepalive_for_rtt(0.5));
+        assert_eq!(link.stale_time, keepalive_for_rtt(0.5) * STALE_FACTOR);
     }
 
     /// A12: RNS/Link.py:749 (1.5.2) - the watchdog also wakes when the

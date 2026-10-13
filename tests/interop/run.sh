@@ -17,6 +17,14 @@
 # must print `PROVEN delivered=true` exactly once (the client's stack proved
 # it). A Python server answers /proven as /echo.
 #
+# The phone cells ask the way the apps do: ffi::link_request, one link per
+# request, with the 5 s the apps pass. On a Rust server /proven is rfed's
+# pull, so the page must be proved. In the largest class the response is
+# split and needs longer than 5 s; the phone client fails the cell as
+# inconclusive if it does not, and a call capped at half that time (as the
+# iOS Notification Service Extension caps its pulls) must end at its cap. A
+# request nobody answers must still fail by that 5 s.
+#
 # Needs the workspace venv (../.venv with `rns` at the reference version,
 # 1.5.2 since 2026-09-22). Exit 0 only if all pass.
 #
@@ -220,8 +228,8 @@ CFG
 # The command line of one end. Set into CMD and then run as a plain command,
 # never through a function: `f args &` forks a subshell whose pid is what $!
 # reports, and killing it leaves the real process running.
-end_cmd() { # <rust|python>
-  if [ "$1" = rust ]; then CMD=("$RUST"); else CMD=("$PY" "$SCRIPT"); fi
+end_cmd() { # <rust|phone|python>
+  if [ "$1" = python ]; then CMD=("$PY" "$SCRIPT"); else CMD=("$RUST"); fi
 }
 
 show_logs() { # <dir> <name>
@@ -234,6 +242,7 @@ show_logs() { # <dir> <name>
 }
 
 CLIENT_CEILING=400   # the client's own ceilings: 40 s path + 120 s response + 120 s /proven + 60 s resource
+                     # (a phone client has none while its responses move: this one decides)
 FAILED=0
 pair() { # <server kind> <client kind> [hub|rusthub|direct]
   local s="$1" c="$2" topo="${3:-hub}"
@@ -286,8 +295,9 @@ pair() { # <server kind> <client kind> [hub|rusthub|direct]
   fi
 
   if [ -z "$setup" ]; then
+    local mode=client; [ "$c" = phone ] && mode=phone
     end_cmd "$c"; t="$(now)"
-    "${CMD[@]}" client "$cdir" "$dest" "$REQ" "$RESP" > "$cdir/out" 2> "$cdir/err" &
+    "${CMD[@]}" "$mode" "$cdir" "$dest" "$REQ" "$RESP" > "$cdir/out" 2> "$cdir/err" &
     cpid=$!; LIVE+=("$cpid")
     # While it runs, keep a snapshot (every ~2 s) of who is connected to the
     # cell's port: evidence for a FAIL (were both ends attached at all?).
@@ -316,9 +326,10 @@ $snapshot"
     [ "$oversize" -gt 0 ] && result="FAIL $oversize frame(s) over the medium MTU: $(grep -m1 '^OVERSIZE' "$hdir/out") [end result: ${result:-none}]"
     # A Resource concludes once. The server prints one RESOURCE line per
     # concluded-callback invocation; two means every inbound Resource is being
-    # handed to the application twice.
-    local concluded; concluded="$(grep -c '^RESOURCE' "$sdir/out")"
-    case "$result" in PASS*) [ "$concluded" -eq 1 ] || result="FAIL the server's resource-concluded callback fired $concluded times for one Resource [end result: $result]";; esac
+    # handed to the application twice. A phone client sends none.
+    local concluded sent=1; concluded="$(grep -c '^RESOURCE' "$sdir/out")"
+    [ "$c" = phone ] && sent=0
+    case "$result" in PASS*) [ "$concluded" -eq "$sent" ] || result="FAIL the server's resource-concluded callback fired $concluded times for $sent Resource(s) [end result: $result]";; esac
     grep -q '^RESOURCE .*intact=\(False\|false\)' "$sdir/out" && result="FAIL plain resource arrived corrupted"
     # A proven response's `concluded` fires once, and here with the proof.
     if [ "$s" = rust ]; then
@@ -343,6 +354,14 @@ pair python python   # control: proves the harness itself
 pair python rust     # Rust sends an over-MDU request; receives an over-MDU response
 pair rust python     # Rust receives an over-MDU request; sends an over-MDU response
 pair rust rust
+pair python phone    # the apps' ffi::link_request against the reference
+# ... and against rfed's kind of server, where /proven must be proved. Not in
+# the largest class: this debug build needs about 9 s to begin a response of a
+# 1 MiB segment (2026-10-13; the release rfed in staging begins a 3.3 MB page
+# within about a second), and the apps give a response 5 s to begin. There
+# that window decides before anything moves. The phones' big pages against a
+# release rfed are test-harnesses' stage_android_pull_backlog.mjs.
+[ "$RESP" -le 1048575 ] && pair rust phone
 if [ "$REQ" -le 431 ]; then   # topology, not payload size, is what these two add
   pair rust python direct    # a Rust listener must announce to its own TCP peers
   pair rust rust direct

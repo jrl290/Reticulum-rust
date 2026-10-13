@@ -811,7 +811,10 @@ pub fn destination_destroy(dest_handle: u64) -> bool {
 /// * `identity_handle` — handle to the local identity (used to authorise the link with the server, if needed).
 /// * `path`       — request path, e.g. `"/rfed/notify/register"`.
 /// * `payload`    — request payload bytes.
-/// * `timeout_secs` — seconds to wait for establishment and for the response.
+/// * `timeout_secs` — seconds to wait for establishment, and the request's
+///   own timeout (RNS/Link.py `request(timeout=)`): how long its response may
+///   take to begin. A response that arrives as a Resource is then waited for
+///   while it moves, however long it takes ([`ResponseWait`]).
 ///
 /// Returns the raw response bytes, or an error string.
 pub fn link_request(
@@ -823,10 +826,31 @@ pub fn link_request(
     payload: &[u8],
     timeout_secs: f64,
 ) -> Result<Vec<u8>, String> {
+    link_request_within(dest_hash, app_name, aspects, identity_handle, path, payload, timeout_secs, None)
+}
+
+/// [`link_request`] with a ceiling on the whole call: `ceiling_secs` after it
+/// starts, the call ends whatever is still arriving. For a caller that lives
+/// under a time budget it does not set, such as an iOS Notification Service
+/// Extension, which the system ends after about 30 s. A hard ceiling on a
+/// wait that events decide (DESIGN_PRINCIPLES §4), not a measure of the
+/// transfer: a response that needs longer is left to a caller without one
+/// (rfed keeps a pull page until it is proved).
+pub fn link_request_within(
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: Vec<String>,
+    identity_handle: u64,
+    path: &str,
+    payload: &[u8],
+    timeout_secs: f64,
+    ceiling_secs: Option<f64>,
+) -> Result<Vec<u8>, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    let call_started = Instant::now();
     let our_identity: Identity =
         get_handle(identity_handle).ok_or_else(|| "invalid identity handle".to_string())?;
 
@@ -839,6 +863,7 @@ pub fn link_request(
 
     let established = Arc::new(AtomicBool::new(false));
     let est_failed = Arc::new(AtomicBool::new(false));
+    let wait = Arc::new(ResponseWait::new());
 
     // Set callbacks and initiate the link handshake.
     {
@@ -848,9 +873,14 @@ pub fn link_request(
             est.store(true, Ordering::SeqCst);
         })));
 
+        // The link closing ends the wait for a response as well. The close
+        // fails a pending request through its failed callback anyway
+        // (Link::link_closed); this covers a close before the request is out.
         let fail = Arc::clone(&est_failed);
+        let closed_wait = Arc::clone(&wait);
         link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
             fail.store(true, Ordering::SeqCst);
+            closed_wait.conclude(Err("the link closed before the response".to_string()));
         })));
 
         link_handle.initiate()?;
@@ -862,8 +892,10 @@ pub fn link_request(
     // produced spurious "(replaced existing entry)" log lines on every
     // outbound link. The actor's registration is sufficient.
 
-    // Wait for link establishment, bounded by the caller's timeout.
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+    // Wait for link establishment, bounded by the caller's timeout (and its
+    // ceiling, if that comes first).
+    let establish_for = ceiling_secs.map_or(timeout_secs, |ceiling| ceiling.min(timeout_secs));
+    let deadline = call_started + Duration::from_secs_f64(establish_for.max(0.0));
     loop {
         if established.load(Ordering::SeqCst) {
             break;
@@ -892,57 +924,241 @@ pub fn link_request(
         return Err(format!("identify failed: {:?}", e));
     }
 
-    // Send the request and wait for the response.
-    let response_data: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let request_done = Arc::new(AtomicBool::new(false));
-
-    let resp_ok = Arc::clone(&response_data);
-    let done_ok = Arc::clone(&request_done);
-    let response_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> =
+    // Send the request with the caller's timeout as its own (RNS/Link.py
+    // `request(timeout=)`). The link fails the request if no response has
+    // begun within it, and stops applying it once the response arrives as a
+    // Resource (RECEIVING, `actor_check_request_timeouts`). From then on the
+    // transfer's own events decide: its response, the Resource failing, the
+    // link closing (DESIGN_PRINCIPLES §1, bulk transfers). Until 2026-10-13
+    // this waited `timeout_secs` from the request whatever was still
+    // arriving, then tore the link down: a phone never took a /rfed/pull
+    // page that needs more than 5 s, and rfed sent it again on every pull
+    // (PULL-PROOF-DESIGN.md, the Android emulator run).
+    let started = Instant::now();
+    // The caller's ceiling on the wait's clock, which starts here.
+    let ceiling = ceiling_secs.map(|ceiling| ceiling - started.duration_since(call_started).as_secs_f64());
+    let response_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> = {
+        let wait = Arc::clone(&wait);
         Arc::new(move |receipt: crate::link::RequestReceipt| {
-            if let Some(ref data) = receipt.response {
-                if let Ok(mut r) = resp_ok.lock() {
-                    *r = Some(data.clone());
-                }
-            }
-            done_ok.store(true, Ordering::SeqCst);
-        });
-
-    let done_fail = Arc::clone(&request_done);
-    let failed_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> =
+            wait.conclude(receipt.response.ok_or_else(|| "Request failed or timed out".to_string()));
+        })
+    };
+    let failed_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> = {
+        let wait = Arc::clone(&wait);
         Arc::new(move |_receipt| {
-            done_fail.store(true, Ordering::SeqCst);
-        });
+            wait.conclude(Err("Request failed or timed out".to_string()));
+        })
+    };
+    // The response Resource's advertisement and every part received.
+    let progress_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> = {
+        let wait = Arc::clone(&wait);
+        let what = path.to_string();
+        Arc::new(move |_receipt| {
+            wait.moved(started.elapsed().as_secs_f64(), &what);
+        })
+    };
 
-    link_handle.request(
+    // The link's own stale time, from its round-trip time (Link::update_keepalive).
+    let stale_after = link_handle
+        .snapshot()
+        .ok()
+        .and_then(|snapshot| snapshot.rtt)
+        .map(|rtt| crate::link::keepalive_for_rtt(rtt) * crate::link::STALE_FACTOR)
+        .unwrap_or(crate::link::STALE_TIME);
+
+    link_handle.request_with_options(
         path.to_string(),
         payload.to_vec(),
         Some(response_cb),
         Some(failed_cb),
+        Some(progress_cb),
+        Some(timeout_secs),
         None,
     )?;
 
-    // Wait for request response.
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
-    loop {
-        if request_done.load(Ordering::SeqCst) {
-            break;
+    let outcome = loop {
+        match wait.step(started.elapsed().as_secs_f64(), stale_after, ceiling, path) {
+            ResponseWaitStep::Done(outcome) => break outcome,
+            ResponseWaitStep::Ceiling => {
+                let ceiling_secs = ceiling_secs.unwrap_or_default();
+                crate::log(
+                    &format!(
+                        "[REQ] '{}' reached the caller's ceiling of {:.1}s before its response was in: tearing the link down",
+                        path, ceiling_secs,
+                    ),
+                    crate::LOG_NOTICE, false, false,
+                );
+                wait.conclude(Err(format!("the caller's ceiling of {:.1}s came before the response", ceiling_secs)));
+                link_handle.teardown();
+            }
+            ResponseWaitStep::Stale(silence) => {
+                crate::log(
+                    &format!(
+                        "[REQ] the response to '{}' has been silent for {:.1}s, longer than the link's stale time ({:.1}s): tearing the link down",
+                        path, silence, stale_after,
+                    ),
+                    crate::LOG_ERROR, false, false,
+                );
+                // Concluded first, so this reason stands over the link closing.
+                wait.conclude(Err(format!("the response went silent for {:.1}s", silence)));
+                link_handle.teardown();
+            }
+            ResponseWaitStep::Waiting => wait.park(Duration::from_millis(100)),
         }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    };
 
     // Teardown the link.
     link_handle.teardown();
 
-    // Return the response.
-    let result = response_data
-        .lock()
-        .map_err(|_| "response lock poisoned")?
-        .take();
-    result.ok_or_else(|| "Request failed or timed out".to_string())
+    // DESIGN_PRINCIPLES §1 ("Panic at the end", James, 2026-10-10): each
+    // silence was logged when it was seen; a debug build panics now that the
+    // request is over and its link torn down.
+    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    #[cfg(debug_assertions)]
+    {
+        let violations = wait.violations();
+        if !violations.is_empty() {
+            panic!("{}", violations.join(" | "));
+        }
+    }
+
+    outcome
+}
+
+/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): a response that
+/// arrives as a Resource must show progress at least this often.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+const RESPONSE_SILENCE_LIMIT_SECS: f64 = crate::send_assertion::SEND_LATENCY_LIMIT_SECS;
+
+/// What [`link_request`] waits on once its request is out: the request's own
+/// outcome (its response, its failure, the link closing), never a clock of
+/// its own (DESIGN_PRINCIPLES §1, bulk transfers; RNS/Link.py RequestReceipt).
+///
+/// While the response arrives as a Resource, its progress is watched. A
+/// silence over the §1 limit is asserted when it is seen: logged in every
+/// build, and kept for the panic at the end in a debug build. It never fails
+/// the request.
+///
+/// Between the segments of a split response no Resource is transferring, so
+/// no Resource can fail if the next segment never comes. RNS waits there
+/// with no end. That happens when the sender gave up between segments: its
+/// cancel names a segment the receiver has already finished, so the
+/// receiver ignores it, and the link stays up. There, a silence longer than
+/// the link's own stale time ends the wait. A phone's pulls queue behind
+/// this call (RfedDistroClient's pull lock), so a wait with no end would stop
+/// every later pull.
+struct ResponseWait {
+    state: Mutex<ResponseWaitState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ResponseWaitState {
+    /// The request's outcome: its response, or why there is none. The first
+    /// conclusion stands.
+    outcome: Option<Result<Vec<u8>, String>>,
+    /// When the response last moved (its advertisement, a part received), on
+    /// the wait's clock. `None` until the response arrives as a Resource.
+    moved_at: Option<f64>,
+    /// The silence now running has been asserted.
+    silence_asserted: bool,
+    /// Each §1 silence asserted, as it was logged.
+    violations: Vec<String>,
+}
+
+/// What one look at a [`ResponseWait`] found.
+#[derive(Debug, PartialEq)]
+enum ResponseWaitStep {
+    /// The request concluded.
+    Done(Result<Vec<u8>, String>),
+    /// The response has been silent longer than the link's stale time, for
+    /// this many seconds.
+    Stale(f64),
+    /// The caller's ceiling came ([`link_request_within`]).
+    Ceiling,
+    Waiting,
+}
+
+impl ResponseWait {
+    fn new() -> Self {
+        ResponseWait { state: Mutex::new(ResponseWaitState::default()), changed: std::sync::Condvar::new() }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResponseWaitState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The request concluded with `outcome`. A later conclusion changes nothing.
+    fn conclude(&self, outcome: Result<Vec<u8>, String>) {
+        let mut state = self.lock();
+        if state.outcome.is_none() {
+            state.outcome = Some(outcome);
+        }
+        self.changed.notify_all();
+    }
+
+    /// The response to `what` moved at `now`. A silence over the limit that
+    /// ended here, and was not asserted while it ran, is asserted now.
+    fn moved(&self, now: f64, what: &str) {
+        let mut state = self.lock();
+        if let Some(at) = state.moved_at {
+            if now - at > RESPONSE_SILENCE_LIMIT_SECS && !state.silence_asserted {
+                state.assert_silence(what, now - at, false);
+            }
+        }
+        state.moved_at = Some(now);
+        state.silence_asserted = false;
+    }
+
+    /// One look at `now`: the outcome if the request concluded; otherwise a
+    /// running silence over the limit is asserted (once), one longer than
+    /// `stale_after` is reported, and so is reaching the caller's `ceiling`.
+    fn step(&self, now: f64, stale_after: f64, ceiling: Option<f64>, what: &str) -> ResponseWaitStep {
+        let mut state = self.lock();
+        if let Some(outcome) = state.outcome.clone() {
+            return ResponseWaitStep::Done(outcome);
+        }
+        if let Some(at) = state.moved_at {
+            let silence = now - at;
+            if silence > RESPONSE_SILENCE_LIMIT_SECS && !state.silence_asserted {
+                state.assert_silence(what, silence, true);
+                state.silence_asserted = true;
+            }
+            if silence > stale_after {
+                return ResponseWaitStep::Stale(silence);
+            }
+        }
+        if ceiling.map_or(false, |ceiling| now >= ceiling) {
+            return ResponseWaitStep::Ceiling;
+        }
+        ResponseWaitStep::Waiting
+    }
+
+    /// Blocks until the wait changes, or for `at_most`.
+    fn park(&self, at_most: std::time::Duration) {
+        let state = self.lock();
+        if state.outcome.is_none() {
+            let _ = self.changed.wait_timeout(state, at_most);
+        }
+    }
+
+    fn violations(&self) -> Vec<String> {
+        self.lock().violations.clone()
+    }
+}
+
+impl ResponseWaitState {
+    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    fn assert_silence(&mut self, what: &str, secs: f64, running: bool) {
+        let msg = format!(
+            "DESIGN_PRINCIPLES §1 VIOLATION: the response to '{}' {} silent for {:.2}s while it arrived \
+             (limit {:.1}s). A moving transfer must show progress at least that often.",
+            what, if running { "has been" } else { "was" }, secs, RESPONSE_SILENCE_LIMIT_SECS,
+        );
+        eprintln!("[SEND-ASSERT] {}", msg);
+        crate::log(&msg, crate::LOG_ERROR, false, false);
+        self.violations.push(msg);
+    }
 }
 
 #[cfg(test)]
@@ -957,5 +1173,121 @@ mod tests {
         assert_eq!(with_handle_mut(id, |_: &mut String| ()), None, "another type is not found");
         destroy_handle(id);
         assert_eq!(with_handle_mut(id, |_: &mut u32| ()), None, "a destroyed handle is not found");
+    }
+
+    // ── link_request's wait for its response (ResponseWait) ──────────────
+
+    /// A link's stale time at a LAN round-trip time (KEEPALIVE_MIN × STALE_FACTOR).
+    const STALE: f64 = 10.0;
+
+    #[test]
+    fn a_response_that_keeps_moving_is_waited_for_past_5_s() {
+        let wait = ResponseWait::new();
+        let mut t = 4.5;   // the advertisement, inside the request's own timeout
+        while t < 30.0 {
+            wait.moved(t, "/rfed/pull");
+            assert_eq!(wait.step(t + 0.9, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting, "still arriving at {} s", t + 0.9);
+            t += 1.0;
+        }
+        wait.conclude(Ok(vec![1, 2, 3]));
+        assert_eq!(wait.step(t, STALE, None, "/rfed/pull"), ResponseWaitStep::Done(Ok(vec![1, 2, 3])));
+        assert!(wait.violations().is_empty(), "it never went silent: {:?}", wait.violations());
+    }
+
+    #[test]
+    fn a_silence_over_the_limit_is_asserted_once_and_never_fails_the_request() {
+        let wait = ResponseWait::new();
+        wait.moved(1.0, "/rfed/pull");
+        assert_eq!(wait.step(6.5, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting, "a silence is not a failure");
+        assert_eq!(wait.step(7.0, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting);
+        assert_eq!(wait.violations().len(), 1, "asserted once while it runs: {:?}", wait.violations());
+        assert!(wait.violations()[0].contains("'/rfed/pull' has been silent for 5.50s"), "{:?}", wait.violations());
+        wait.moved(8.0, "/rfed/pull");
+        assert_eq!(wait.violations().len(), 1, "its end is not a second violation");
+        wait.moved(14.5, "/rfed/pull");
+        assert_eq!(wait.violations().len(), 2, "a later silence is asserted in its turn");
+        wait.conclude(Ok(vec![9]));
+        assert_eq!(wait.step(15.0, STALE, None, "/rfed/pull"), ResponseWaitStep::Done(Ok(vec![9])));
+    }
+
+    #[test]
+    fn a_silence_that_ended_between_looks_is_asserted_too() {
+        let wait = ResponseWait::new();
+        wait.moved(1.0, "/rfed/pull");
+        assert_eq!(wait.step(5.9, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting);
+        wait.moved(6.25, "/rfed/pull");   // 5.25 s since the last move, and no look saw it over the limit
+        assert_eq!(wait.violations().len(), 1, "{:?}", wait.violations());
+        assert!(wait.violations()[0].contains("was silent for 5.25s"), "{:?}", wait.violations());
+    }
+
+    #[test]
+    fn a_silence_longer_than_the_links_stale_time_ends_the_wait() {
+        let wait = ResponseWait::new();
+        wait.moved(1.0, "/rfed/pull");
+        assert_eq!(wait.step(10.75, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting);
+        assert_eq!(wait.step(11.5, STALE, None, "/rfed/pull"), ResponseWaitStep::Stale(10.5));
+    }
+
+    #[test]
+    fn before_the_response_begins_nothing_here_decides() {
+        // The request's own timeout decides that phase (the link fails the
+        // request), so no silence is counted before the response moves.
+        let wait = ResponseWait::new();
+        assert_eq!(wait.step(100.0, STALE, None, "/rfed/pull"), ResponseWaitStep::Waiting);
+        assert!(wait.violations().is_empty());
+    }
+
+    #[test]
+    fn the_first_conclusion_stands() {
+        let wait = ResponseWait::new();
+        wait.conclude(Err("Request failed or timed out".to_string()));
+        wait.conclude(Ok(vec![1]));
+        assert_eq!(wait.step(0.0, STALE, None, "/rfed/pull"), ResponseWaitStep::Done(Err("Request failed or timed out".to_string())));
+    }
+
+    #[test]
+    fn park_returns_when_the_request_concludes() {
+        let wait = Arc::new(ResponseWait::new());
+        let concluder = {
+            let wait = Arc::clone(&wait);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                wait.conclude(Ok(vec![7]));
+            })
+        };
+        let start = std::time::Instant::now();
+        while !matches!(wait.step(0.0, STALE, None, "/rfed/pull"), ResponseWaitStep::Done(_)) {
+            wait.park(std::time::Duration::from_secs(10));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "woken by the conclusion, not by its bound");
+        concluder.join().unwrap();
+    }
+
+    #[test]
+    fn the_callers_ceiling_ends_the_wait_even_while_the_response_moves() {
+        let wait = ResponseWait::new();
+        let mut t = 1.0;
+        while t < 20.0 {
+            wait.moved(t, "/rfed/pull");
+            assert_eq!(wait.step(t + 0.5, STALE, Some(20.0), "/rfed/pull"), ResponseWaitStep::Waiting, "at {} s", t + 0.5);
+            t += 1.0;
+        }
+        wait.moved(20.0, "/rfed/pull");
+        assert_eq!(wait.step(20.0, STALE, Some(20.0), "/rfed/pull"), ResponseWaitStep::Ceiling);
+        assert!(wait.violations().is_empty(), "a ceiling is not a silence: {:?}", wait.violations());
+    }
+
+    #[test]
+    fn the_callers_ceiling_bounds_the_wait_before_the_response_begins_too() {
+        let wait = ResponseWait::new();
+        assert_eq!(wait.step(7.9, STALE, Some(8.0), "/rfed/pull"), ResponseWaitStep::Waiting);
+        assert_eq!(wait.step(8.0, STALE, Some(8.0), "/rfed/pull"), ResponseWaitStep::Ceiling);
+    }
+
+    #[test]
+    fn a_concluded_request_is_done_whatever_the_ceiling() {
+        let wait = ResponseWait::new();
+        wait.conclude(Ok(vec![5]));
+        assert_eq!(wait.step(30.0, STALE, Some(20.0), "/rfed/pull"), ResponseWaitStep::Done(Ok(vec![5])));
     }
 }

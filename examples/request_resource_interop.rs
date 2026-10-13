@@ -10,10 +10,24 @@
 //!   request_resource_interop hub    <config_dir>
 //!   request_resource_interop server <config_dir>
 //!   request_resource_interop client <config_dir> <dest_hex> <request_len> <response_len>
+//!   request_resource_interop phone  <config_dir> <dest_hex> <request_len> <response_len>
 //!
 //! `hub` is a bare transport node — this stack in the role the gateway plays:
 //! everything the two ends learn about each other has to be rebroadcast and
 //! routed by it.
+//!
+//! `phone` asks the way the apps do: `ffi::link_request`, one link per
+//! request, with the 5 s the apps pass (Android `appLinkSend`, iOS
+//! `oneShotRfedRequest`). It asks `/echo` and then `/proven`; on a Rust server
+//! `/proven` is rfed's pull, a proven handler that keeps its page until the
+//! phone's stack proves the response. A response that needs longer than 5 s to
+//! arrive must still be taken whole. Until 2026-10-13 the link was torn down
+//! 5 s after the request, mid-Resource, and a phone never took a pull page
+//! over about 1 MB. When the response is split it then asks `/echo` again
+//! through `ffi::link_request_within`, capped at half the time the first took,
+//! as iOS's Notification Service Extension caps its pulls: that call must end
+//! at its cap. Last it asks `/unanswered`, which no server here serves: that
+//! request must still fail by its own 5 s timeout.
 //!
 //! After the request is answered the client sends the same request to
 //! `/proven`. A Rust server answers it from a proven handler
@@ -38,6 +52,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reticulum_rust::destination::{Destination, DestinationType, ProvenAnswer, ALLOW_ALL};
+use reticulum_rust::ffi;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, ACCEPT_ALL as ACCEPT_ALL_RESOURCES, MODE_AES256_CBC};
 use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
@@ -49,6 +64,8 @@ const APP_NAME: &str = "interop";
 const ASPECT: &str = "request";
 const PATH: &str = "/echo";
 const PROVEN_PATH: &str = "/proven";
+/// A path no server here serves (the phone client's unanswered request).
+const UNANSWERED_PATH: &str = "/unanswered";
 
 /// Deterministic and close to incompressible, so an over-MDU payload is still
 /// a multi-part transfer after the Resource layer has tried to compress it.
@@ -77,8 +94,14 @@ fn main() {
             args[4].parse().expect("request_len"),
             args[5].parse().expect("response_len"),
         ),
+        Some("phone") if args.len() == 6 => phone(
+            PathBuf::from(&args[2]),
+            &args[3],
+            args[4].parse().expect("request_len"),
+            args[5].parse().expect("response_len"),
+        ),
         _ => {
-            eprintln!("usage: hub <config_dir> | server <config_dir> | client <config_dir> <dest_hex> <request_len> <response_len>");
+            eprintln!("usage: hub <config_dir> | server <config_dir> | client|phone <config_dir> <dest_hex> <request_len> <response_len>");
             std::process::exit(2);
         }
     }
@@ -281,6 +304,114 @@ fn client(config_dir: PathBuf, dest_hex: &str, request_len: usize, response_len:
 
     send_plain_resource(&link, request_len.max(2000));
     println!("PASS request={} response={}", request_len, received);
+    std::process::exit(0);
+}
+
+/// The timeout the apps pass to `ffi::link_request` (Android
+/// `ConnectionStateManager.appLinkSend`, iOS `oneShotRfedRequest`).
+const PHONE_TIMEOUT_SECS: f64 = 5.0;
+
+/// Ask `/echo` and then `/proven` the way the apps do (see the module comment).
+fn phone(config_dir: PathBuf, dest_hex: &str, request_len: usize, response_len: usize) {
+    Reticulum::init(Some(config_dir), None, None, None, false, None).expect("Reticulum init");
+    let dest_hash = reticulum_rust::decode_hex(dest_hex).expect("dest hex");
+
+    // The server announces every 3 s; the announce is the readiness event.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !Transport::has_path(&dest_hash) {
+        if Instant::now() > deadline {
+            fail("no announce from the server");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let identity = ffi::identity_create().unwrap_or_else(|e| fail(&e));
+    let mut took = Vec::new();
+    for path in [PATH, PROVEN_PATH] {
+        let asked = Instant::now();
+        let response = ffi::link_request(
+            &dest_hash,
+            APP_NAME,
+            vec![ASPECT.to_string()],
+            identity,
+            path,
+            &request_data(request_len, response_len),
+            PHONE_TIMEOUT_SECS,
+        )
+        .unwrap_or_else(|e| fail(&format!("{path} after {:.1} s: {e}", asked.elapsed().as_secs_f64())));
+        check_response(path, &response, response_len);
+        took.push((path, asked.elapsed().as_secs_f64()));
+    }
+
+    // A split response (over MAX_EFFICIENT_SIZE) is the kind the apps never
+    // took. If it arrived within their 5 s, this run says nothing about a
+    // response that needs longer, which is what the cell is for.
+    let slowest = took.iter().map(|(_, secs)| *secs).fold(0.0, f64::max);
+    if response_len > Resource::MAX_EFFICIENT_SIZE && slowest <= PHONE_TIMEOUT_SECS {
+        fail(&format!(
+            "inconclusive: a {response_len}-byte response arrived within {PHONE_TIMEOUT_SECS} s, so this run shows nothing about one that needs longer"
+        ));
+    }
+
+    // A caller under a time budget it does not set (iOS's Notification
+    // Service Extension, which the system ends after about 30 s) caps the
+    // whole call. Capped at half of what /echo took, the same request must
+    // end at the cap.
+    let mut capped = String::new();
+    if response_len > Resource::MAX_EFFICIENT_SIZE {
+        let (_, echo_took) = took[0];
+        let cap = echo_took / 2.0;
+        let asked = Instant::now();
+        let outcome = ffi::link_request_within(
+            &dest_hash,
+            APP_NAME,
+            vec![ASPECT.to_string()],
+            identity,
+            PATH,
+            &request_data(request_len, response_len),
+            PHONE_TIMEOUT_SECS,
+            Some(cap),
+        );
+        let secs = asked.elapsed().as_secs_f64();
+        match outcome {
+            Ok(_) => fail(&format!("{PATH} capped at {cap:.1} s arrived whole in {secs:.1} s (uncapped it took {echo_took:.1} s)")),
+            Err(e) if secs < cap || secs > cap + 1.0 => fail(&format!("{PATH} capped at {cap:.1} s ended after {secs:.1} s: {e}")),
+            Err(_) => capped = format!("; {PATH} capped at {cap:.1} s ended in {secs:.1} s"),
+        }
+    }
+
+    // A request nobody answers still ends by its own timeout, the apps' 5 s:
+    // a response that never begins is the request's to give up on. Both
+    // stacks ignore a request for a path they have no handler for.
+    let (tx, rx) = mpsc::channel();
+    let asked = Instant::now();
+    thread::spawn(move || {
+        let _ = tx.send(ffi::link_request(
+            &dest_hash,
+            APP_NAME,
+            vec![ASPECT.to_string()],
+            identity,
+            UNANSWERED_PATH,
+            &request_data(16, 16),
+            PHONE_TIMEOUT_SECS,
+        ));
+    });
+    // Test-failure ceiling only (DESIGN_PRINCIPLES §7).
+    let unanswered = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Err(_)) if asked.elapsed().as_secs_f64() >= PHONE_TIMEOUT_SECS => asked.elapsed().as_secs_f64(),
+        Ok(Err(e)) => fail(&format!(
+            "{UNANSWERED_PATH} failed after {:.1} s, before its own {PHONE_TIMEOUT_SECS} s timeout: {e}",
+            asked.elapsed().as_secs_f64()
+        )),
+        Ok(Ok(_)) => fail(&format!("{UNANSWERED_PATH}: answered by a server with no handler for it")),
+        Err(_) => fail(&format!("{UNANSWERED_PATH}: still waiting after 30 s; its own {PHONE_TIMEOUT_SECS} s timeout never ended it")),
+    };
+
+    let took: Vec<String> = took.iter().map(|(path, secs)| format!("{path} in {secs:.1} s")).collect();
+    println!(
+        "PASS request={} response={} ({}{capped}; {UNANSWERED_PATH} failed in {unanswered:.1} s)",
+        request_len, response_len, took.join(", ")
+    );
     std::process::exit(0);
 }
 
