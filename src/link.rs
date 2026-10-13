@@ -5848,6 +5848,46 @@ mod tests {
             "the handler must be told which path it is serving, as the reference does");
     }
 
+    /// A proven handler's answer reaches the actor with the handler's own
+    /// `auto_compress`, which decides whether the response Resource may be
+    /// compressed (RNS/Link.py handle_request). rfed registers its pull
+    /// handlers without it: the web refuses a compressed Resource.
+    #[test]
+    fn a_proven_answer_goes_with_its_handlers_auto_compress() {
+        for (seed, auto_compress) in [(61u8, false), (67u8, true)] {
+            let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(seed)).collect());
+            link.state = STATE_ACTIVE;
+            link.status = STATE_ACTIVE;
+            link.destination.lock().unwrap().register_proven_request_handler(
+                "/proven".to_string(),
+                Arc::new(|_p: &str, _d: &[u8], _r: &[u8], _i: Option<&Identity>, _l: Option<&LinkHandle>, _t: f64| {
+                    crate::destination::ProvenAnswer::Proven { data: vec![0xc3], concluded: Arc::new(|_: bool| {}) }
+                }),
+                crate::destination::ALLOW_ALL, None, auto_compress,
+            ).unwrap();
+            let mut plaintext = Vec::new();
+            rmpv_write_value(&mut plaintext, &rmpv::Value::Array(vec![
+                rmpv::Value::F64(0.0), rmpv::Value::Binary(identity::truncated_hash(b"/proven")), rmpv::Value::Nil,
+            ])).unwrap();
+            let (tx, rx) = mpsc::channel();
+            link.self_handle = Some(LinkHandle::from_parts_for_test(tx, link.link_id.clone()));
+            link.handle_request_packet(vec![seed; 16], &plaintext).unwrap();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let asked = loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(LinkMsg::SendProvenResponse { request_id, response, auto_compress, .. }) => {
+                        assert_eq!((request_id, response), (vec![seed; 16], vec![0xc3]));
+                        break auto_compress;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => panic!("the proven answer reaches the actor as a proven response"),
+                }
+            };
+            assert_eq!(asked, auto_compress, "the handler's auto_compress");
+        }
+    }
+
     // ── Requests sent or answered as a Resource: the response clock ─────────
     //
     // RNS/Link.py runs the response timeout only while a request is DELIVERED:
@@ -6953,6 +6993,36 @@ mod tests {
         }));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once");
+    }
+
+    /// A proven response is compressed only when its handler was registered
+    /// with `auto_compress`, as RNS/Link.py handle_request builds a response
+    /// Resource. rfed registers its pull handlers without it: the web refuses
+    /// a compressed Resource, so a compressed page would come back unproved
+    /// on every pull.
+    #[test]
+    fn a_proven_response_is_compressed_only_when_its_handler_asks() {
+        let _transport = crate::transport::tests::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (interface, frames) = CarryingInterface::register("ProvenCompressTest", true);
+        for (seed, auto_compress) in [(247u8, false), (251u8, true)] {
+            let (link, _registry) = live_keyed_link_on(seed, STATE_ACTIVE, Some("ProvenCompressTest"));
+            link.send_proven_response(vec![seed; 16], vec![0x41; 4096], auto_compress, Arc::new(|_: bool| {}));
+            let link_id = link.link_id();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let advertisement = loop {
+                let frame = frames
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .expect("the advertisement is on the interface");
+                if frame.get(2..18) == Some(&link_id[..]) && frame.get(18) == Some(&packet::RESOURCE_ADV) {
+                    let plaintext = link.decrypt(&frame[19..]).expect("the test link decrypts");
+                    break crate::resource::ResourceAdvertisement::unpack(&plaintext).expect("an advertisement");
+                }
+            };
+            assert!(advertisement.p, "advertised as the response to the request");
+            assert_eq!(advertisement.c, auto_compress, "compressed only when the handler asks (auto_compress {auto_compress})");
+            link.teardown();
+        }
+        drop(interface);
     }
 
     /// An interface a test link is attached to, registered in TRANSPORT up
