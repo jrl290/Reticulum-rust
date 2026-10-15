@@ -3307,7 +3307,11 @@ impl Link {
         self.watchdog_lock = true;
         
         if !self.is_closed() {
-            self.had_inbound(packet.packet_type == DATA);
+            // RNS/Link.py __receive: every packet but a keepalive is data
+            // (`last_data`, what no_data_for() measures). Keepalives counted
+            // too until 2026-10-15, so a link its peer merely held open was
+            // never idle and LXMRouter.clean_links never closed one.
+            self.had_inbound(packet.context != crate::packet::KEEPALIVE);
             self.rx += 1;
             self.rxbytes += packet.data.len() as u64;
             
@@ -5624,6 +5628,42 @@ mod tests {
              and silently dropped the ping — the exact regression we are guarding \
              against"
         );
+    }
+
+    /// RNS/Link.py __receive: every inbound packet but a keepalive refreshes
+    /// `last_data`, the clock `no_data_for()` reads and LXMRouter.clean_links
+    /// closes idle links by. Until 2026-10-15 keepalives refreshed it too, so
+    /// a link its peer merely held open never went idle: an LXMF peer that a
+    /// propagation node answered "throttled" waits for its sync link to be
+    /// closed that way, and against rfed it waited for good.
+    #[test]
+    fn keepalives_are_not_data_and_every_other_packet_is() {
+        let mut link = make_incoming_link((0u8..16).map(|i| i.wrapping_mul(53)).collect());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        link.last_inbound = 0;
+        link.last_data = 0;
+        let dest = link.destination.lock().unwrap().clone();
+        let packet = |packet_type: u8, context: u8, data: Vec<u8>| {
+            let mut p = Packet::new(
+                Some(dest.clone()), data.clone(), packet_type, context,
+                crate::transport::BROADCAST, packet::HEADER_1, None, None, false, 0,
+            );
+            p.data = data;
+            p
+        };
+
+        let _ = link.receive(&packet(DATA, crate::packet::KEEPALIVE, vec![0xFF]));
+        assert!(link.last_inbound > 0, "a keepalive is inbound activity");
+        assert_eq!(link.last_data, 0, "a keepalive is not data");
+        assert!(link.no_data_for() > 180, "a link that was only kept alive is idle");
+
+        let _ = link.receive(&packet(DATA, crate::packet::NONE, vec![0x42; 48]));
+        assert!(link.last_data > 0, "a data packet is data");
+
+        link.last_data = 0;
+        let _ = link.receive(&packet(PROOF, crate::packet::RESOURCE_PRF, vec![0x42; 48]));
+        assert!(link.last_data > 0, "a proof is data too: only a keepalive is not");
     }
 
     /// RNS/Link.py receive(): a link the watchdog marked STALE is ACTIVE again
