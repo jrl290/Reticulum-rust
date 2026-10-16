@@ -671,7 +671,7 @@ impl TcpClientInterface {
                 }
                 Err(e) => {
                     #[cfg(unix)]
-                    crate::log(&format!("TCP write failed on fd={}, marking offline: {}", write_fd, e), crate::LOG_ERROR, false, false);
+                    crate::log(&format!("TCP write failed on fd={}, marking offline: {}{}", write_fd, e, Self::defunct_note(write_fd)), crate::LOG_ERROR, false, false);
                     #[cfg(not(unix))]
                     crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
                     self.base.online = false;
@@ -926,6 +926,45 @@ impl TcpClientInterface {
         true // Unknown platform — let other mechanisms detect failure.
     }
 
+    /// " — the OS made the socket defunct" if Apple's kernel has, else "".
+    /// XNU makes a connected socket defunct when a NECP policy stops
+    /// allowing it (on 2026-10-13 15:40:22 the Local Network policy being
+    /// reinstalled did it to rfed's backbone socket) and when it suspends an
+    /// iOS app. Writes then fail EPIPE and a read already waiting fails
+    /// EBADF, while the descriptor stays open. That day not even the FIN
+    /// reached the peer, which noticed only by its own timeout 25 s later.
+    /// SO_ISDEFUNCT is XNU's private getsockopt (bsd/sys/socket_private.h)
+    /// and needs no privileges.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn defunct_note(fd: std::os::unix::io::RawFd) -> &'static str {
+        const SO_ISDEFUNCT: libc::c_int = 0x1101;
+        let mut defunct: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_ISDEFUNCT,
+                &mut defunct as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 && defunct != 0 { " — the OS made the socket defunct" } else { "" }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    fn defunct_note(_fd: std::os::unix::io::RawFd) -> &'static str {
+        ""
+    }
+
+    /// Whether the read loop's clone still refers to the connection it was
+    /// cloned from: its descriptor open and bound to the same local address.
+    /// A descriptor something else closed fails getsockname(), or names
+    /// another socket once its number is handed out again.
+    fn clone_still_ours(socket: &TcpStream, local: Option<std::net::SocketAddr>) -> bool {
+        local.is_some() && socket.local_addr().ok() == local
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     fn read_watchdog_enforced() -> bool {
         false
@@ -1023,10 +1062,12 @@ impl TcpClientInterface {
                 } else {
 
                 let (raw_socket, interface_name, kiss_framing, hw_mtu, ifac_size, is_initiator, force_read_exit) = socket_result.unwrap();
-                // Wrap in ManuallyDrop so we control when close() is called.
-                // If the OS reclaims our fd (e.g., iOS background), Rust's
-                // automatic Drop would call close() on a potentially-reused fd
-                // number, corrupting an unrelated socket.
+                // What identifies the clone as this connection's if a read
+                // fails EBADF.
+                let clone_local = raw_socket.local_addr().ok();
+                // Wrap in ManuallyDrop so we control when close() is called:
+                // after EBADF the clone is closed only if its descriptor still
+                // refers to this connection (see where the read loop exits).
                 let mut socket = std::mem::ManuallyDrop::new(raw_socket);
                 let mut ebadf = false;
 
@@ -1255,7 +1296,7 @@ impl TcpClientInterface {
                                 let fd = socket.as_raw_fd();
                                 if e.raw_os_error() == Some(9) { // EBADF
                                     ebadf = true;
-                                    crate::log(&format!("TCP read loop: EBADF on fd={} — fd was reclaimed by OS", fd), crate::LOG_ERROR, false, false);
+                                    crate::log(&format!("TCP read loop: EBADF on fd={}{}", fd, Self::defunct_note(fd)), crate::LOG_ERROR, false, false);
                                 } else {
                                     crate::log(&format!("TCP read loop: socket error on fd={}: {}", fd, e), crate::LOG_ERROR, false, false);
                                 }
@@ -1268,16 +1309,24 @@ impl TcpClientInterface {
                 } // 'reading
 
                 // ── Read loop exited ──────────────────────────────────────────
-                // Handle the cloned socket carefully.  If EBADF occurred the fd
-                // was already closed/reclaimed by the OS (common on iOS during
-                // background transitions).  Calling close() on that fd number
-                // would corrupt whatever new socket inherited it.
-                if ebadf {
-                    // Intentionally leak — the fd is already gone.
-                    crate::log("TCP: leaking dead socket fd (EBADF — already reclaimed by OS)", crate::LOG_WARNING, false, false);
-                    // ManuallyDrop prevents close(); nothing else needed.
+                // EBADF from read() does not mean the descriptor is gone. On
+                // macOS and iOS a read waiting on a socket the kernel has made
+                // defunct (a NECP policy change, an app suspension) or drained
+                // fails EBADF while the descriptor stays open and ours. Until
+                // 2026-10-13 this leaked it as "reclaimed by OS": rfed's dead
+                // backbone socket stayed open on fd 4 from 15:40:22 on. Close
+                // the clone unless its descriptor no longer refers to this
+                // connection: only something else in the process closing it
+                // does that, and then its number may belong to someone else.
+                if ebadf && !Self::clone_still_ours(&socket, clone_local) {
+                    crate::log(
+                        &format!(
+                            "TCP read loop: after EBADF the clone's descriptor is not this connection's (local address {:?}, was {:?}) — leaving it open rather than close a number that may belong to someone else",
+                            socket.local_addr().ok(), clone_local,
+                        ),
+                        crate::LOG_ERROR, false, false,
+                    );
                 } else {
-                    // Normal exit (EOF, timeout, connection reset) — close the clone.
                     unsafe { std::mem::ManuallyDrop::drop(&mut socket); }
                 }
 
@@ -2327,9 +2376,11 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
     // Test 5: ManuallyDrop EBADF guard prevents double-close
     //
-    // Simulates the iOS scenario where the OS reclaims an fd, then Rust's
-    // Drop would close() the same fd number — now belonging to a
-    // different socket.  Verifies that ManuallyDrop prevents this.
+    // Simulates something else in the process closing our fd, after which
+    // Rust's Drop would close() the same fd number — now belonging to a
+    // different socket.  Verifies that ManuallyDrop prevents this.  (The OS
+    // never closes our fd behind our back: a socket it makes defunct keeps
+    // its fd — see Test 9.)
     // ────────────────────────────────────────────────────────────────────
     #[test]
     #[cfg(unix)]
@@ -2349,8 +2400,7 @@ mod tests {
         let clone_fd = clone.as_raw_fd();
         let _server_stream = server.join().unwrap();
 
-        // Simulate the OS reclaiming our fd (iOS background transition)
-        // by forcibly closing it.  This is what happens in the wild.
+        // Simulate something else closing our fd.
         unsafe { libc::close(clone_fd); }
 
         // Now wrap in ManuallyDrop (as our real code does)
@@ -2413,9 +2463,10 @@ mod tests {
     //   18:06:06  EBADF on fd=8
     //   18:06:11  Reconnect, new clone fd=7→10
     //
-    // We can't force the OS to reclaim an fd, but we CAN verify that the
-    // infrastructure handles it correctly:  ManuallyDrop prevents cascade
-    // corruption, and reconnect produces a working new connection.
+    // This closes the clone's fd to get EBADF, which covers something else
+    // in the process closing it (the OS does not: see Test 9), and verifies
+    // that ManuallyDrop prevents cascade corruption and reconnect produces
+    // a working new connection.
     // ────────────────────────────────────────────────────────────────────
     #[test]
     #[cfg(unix)]
@@ -2456,9 +2507,7 @@ mod tests {
             assert!(iface.process_outgoing(payload.into_bytes()).is_ok(), "write {} failed", i);
         }
 
-        // --- Phase 4: Simulate EBADF (OS reclaims clone's fd) ---
-        // This is the equivalent of what happens at 18:06:06 in the log.
-        // On iOS, the OS closes the fd during a background transition.
+        // --- Phase 4: Simulate EBADF (something else closes clone's fd) ---
         unsafe { libc::close(clone_fd); }
 
         // Verify clone is now EBADF
@@ -2669,6 +2718,140 @@ mod tests {
                 "HDLC round-trip failed for payload {:?}", payload,
             );
         }
+    }
+
+    /// Descriptors of this process whose socket is bound to `local`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn descriptors_bound_to(local: std::net::SocketAddr) -> Vec<libc::c_int> {
+        let max = unsafe { libc::getdtablesize() }.min(65536);
+        (0..max)
+            .filter(|&fd| {
+                let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+                if rc != 0 || ss.ss_family as libc::c_int != libc::AF_INET {
+                    return false;
+                }
+                let sin = unsafe { &*(&ss as *const _ as *const libc::sockaddr_in) };
+                let addr = std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+                    u16::from_be(sin.sin_port),
+                ));
+                addr == local
+            })
+            .collect()
+    }
+
+    /// Whether `cond` holds within `within`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn holds_within(cond: impl Fn() -> bool, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while !cond() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 9: a read fails EBADF on a descriptor that is still open
+    //
+    // 2026-10-13 15:40:22, the staging rfed on macOS: while nesessionmanager
+    // reinstalled the Local Network policy, NECP marked the backbone socket
+    // defunct. The writer's send() failed EPIPE and the read loop's read()
+    // on its clone failed EBADF, and the loop leaked the clone as "reclaimed
+    // by OS". Nothing had reclaimed it: lsof showed the dead socket still
+    // open on rfed's fd 4 hours later. Apple's kernel does not close a
+    // process's descriptors; a read on a socket it has made unusable fails
+    // EBADF and the descriptor stays ours to close.
+    //
+    // Only the OS can make a socket defunct, so this drains it instead:
+    // once a descriptor of a socket is closed under a thread blocked in a
+    // call on it, XNU fails every read that waits on that socket with
+    // EBADF, through any of its descriptors, and leaves the others open.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn read_loop_closes_its_clone_when_a_read_fails_ebadf_on_an_open_descriptor() {
+        use std::os::unix::io::IntoRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(2)).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let local = client.local_addr().unwrap();
+        // Our own descriptor of the socket, to dup the doomed ones from.
+        let spare = client.try_clone().unwrap();
+        // An accepted connection's interface: no reconnect, so the loop ends
+        // once its read fails.
+        let iface_arc = Arc::new(Mutex::new(TcpClientInterface::from_socket(
+            "ebadf-on-an-open-descriptor".to_string(),
+            client,
+        )));
+        TcpClientInterface::start_read_loop(Arc::clone(&iface_arc));
+        // The interface's socket, the spare and the read loop's clone.
+        assert!(
+            holds_within(|| descriptors_bound_to(local).len() == 3, Duration::from_secs(10)),
+            "the read loop never cloned its socket",
+        );
+
+        // Close a descriptor of the socket under a thread blocked in recv()
+        // on it. The thread may not have reached recv() when its descriptor
+        // is closed, and then nothing is drained: try again until the read
+        // loop ends. (No read timeout here: SO_RCVTIMEO belongs to the
+        // socket, and a short one ends the blocked recv() before the close.)
+        let mut ended = false;
+        for _ in 0..5 {
+            let doomed = spare.try_clone().unwrap().into_raw_fd();
+            let blocked = thread::spawn(move || {
+                let mut b = [0u8; 1];
+                unsafe { libc::recv(doomed, b.as_mut_ptr() as *mut libc::c_void, 1, 0) }
+            });
+            thread::sleep(Duration::from_millis(200));
+            unsafe { libc::close(doomed); }
+            blocked.join().unwrap();
+            if holds_within(|| !iface_arc.lock().unwrap().reconnecting, Duration::from_secs(3)) {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "the read loop never failed EBADF: the socket was not drained");
+        drop(spare);
+
+        let left = descriptors_bound_to(local);
+        assert!(
+            left.is_empty(),
+            "the read loop left fd {:?} open on its dead connection {} after EBADF",
+            left, local,
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 10: a clone whose fd something else closed is not ours to close
+    //
+    // The other half of Test 9. When a read fails EBADF because something
+    // else in the process closed the clone's fd, that number may already
+    // belong to another file, and the read loop must leave it alone.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn a_clone_whose_fd_something_else_closed_is_not_ours() {
+        use std::os::unix::io::AsRawFd;
+
+        let (iface_arc, _server) = make_connected_pair();
+        let clone = iface_arc.lock().unwrap().socket.as_ref().unwrap().try_clone().unwrap();
+        let local = clone.local_addr().ok();
+        assert!(TcpClientInterface::clone_still_ours(&clone, local));
+
+        let clone = std::mem::ManuallyDrop::new(clone);
+        unsafe { libc::close(clone.as_raw_fd()); }
+        // The next file opened may take the number.
+        let _decoy = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            !TcpClientInterface::clone_still_ours(&clone, local),
+            "a closed fd, or another file's, was taken for the clone",
+        );
     }
 }
 
