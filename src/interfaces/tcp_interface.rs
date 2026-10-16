@@ -96,6 +96,31 @@ impl Kiss {
     }
 }
 
+/// How `TcpClientInterface::verify_keepalive` judges the value getsockopt
+/// reads back for an option it set.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum Readback {
+    /// An on/off option: only zero against nonzero means anything. Linux
+    /// reads an enabled SO_KEEPALIVE back as 1, but macOS, like the BSDs,
+    /// reads back the option's own bit (SO_KEEPALIVE = 0x8).
+    Flag,
+    /// A number (seconds, milliseconds, a probe count): must read back
+    /// exactly as set, so a kernel that clamps it is caught.
+    Exact,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl Readback {
+    /// Whether `got`, as getsockopt read it back, honours setting `want`.
+    fn honoured(self, want: i32, got: i32) -> bool {
+        match self {
+            Readback::Flag => (want != 0) == (got != 0),
+            Readback::Exact => got == want,
+        }
+    }
+}
+
 /// TCP Client Interface
 /// 
 /// Connects to a remote TCP server for Reticulum communication.
@@ -375,11 +400,12 @@ impl TcpClientInterface {
     /// Called by both initiator (`connect`) and server-accepted
     /// (`from_socket`) construction paths so EVERY TCP socket the process
     /// owns will be RST'd by the kernel within ~30 s when the peer goes
-    /// silent (rather than blocking `read()` forever).
+    /// silent (rather than blocking `read()` forever). Returns whether the
+    /// kernel honoured every option (see `verify_keepalive`).
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 and
     /// /memories/repo/rfed-tcp-watchdog-failure.md.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
+    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) -> bool {
         use std::os::unix::io::AsRawFd;
         use libc::{SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
 
@@ -406,17 +432,17 @@ impl TcpClientInterface {
         Self::verify_keepalive(
             fd,
             &[
-                (IPPROTO_TCP, TCP_USER_TIMEOUT, user_timeout_ms, "TCP_USER_TIMEOUT(ms)"),
-                (SOL_SOCKET,  SO_KEEPALIVE,     keepalive,        "SO_KEEPALIVE"),
-                (IPPROTO_TCP, TCP_KEEPIDLE,     keepidle_i,       "TCP_KEEPIDLE(s)"),
-                (IPPROTO_TCP, TCP_KEEPINTVL,    keepintvl_i,      "TCP_KEEPINTVL(s)"),
-                (IPPROTO_TCP, TCP_KEEPCNT,      keepcnt_i,        "TCP_KEEPCNT"),
+                (IPPROTO_TCP, TCP_USER_TIMEOUT, Readback::Exact, user_timeout_ms, "TCP_USER_TIMEOUT(ms)"),
+                (SOL_SOCKET,  SO_KEEPALIVE,     Readback::Flag,  keepalive,       "SO_KEEPALIVE"),
+                (IPPROTO_TCP, TCP_KEEPIDLE,     Readback::Exact, keepidle_i,      "TCP_KEEPIDLE(s)"),
+                (IPPROTO_TCP, TCP_KEEPINTVL,    Readback::Exact, keepintvl_i,     "TCP_KEEPINTVL(s)"),
+                (IPPROTO_TCP, TCP_KEEPCNT,      Readback::Exact, keepcnt_i,       "TCP_KEEPCNT"),
             ],
-        );
+        )
     }
 
     #[cfg(target_os = "macos")]
-    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) {
+    fn apply_keepalive(stream: &TcpStream, i2p_tunneled: bool) -> bool {
         use std::os::unix::io::AsRawFd;
         use libc::{SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
 
@@ -451,17 +477,18 @@ impl TcpClientInterface {
         Self::verify_keepalive(
             fd,
             &[
-                (SOL_SOCKET,  SO_KEEPALIVE,  keepalive, "SO_KEEPALIVE"),
-                (IPPROTO_TCP, TCP_KEEPALIVE, keepidle,  "TCP_KEEPALIVE(s)"),
-                (IPPROTO_TCP, TCP_KEEPINTVL, keepintvl, "TCP_KEEPINTVL(s)"),
-                (IPPROTO_TCP, TCP_KEEPCNT,   keepcnt,   "TCP_KEEPCNT"),
+                (SOL_SOCKET,  SO_KEEPALIVE,  Readback::Flag,  keepalive, "SO_KEEPALIVE"),
+                (IPPROTO_TCP, TCP_KEEPALIVE, Readback::Exact, keepidle,  "TCP_KEEPALIVE(s)"),
+                (IPPROTO_TCP, TCP_KEEPINTVL, Readback::Exact, keepintvl, "TCP_KEEPINTVL(s)"),
+                (IPPROTO_TCP, TCP_KEEPCNT,   Readback::Exact, keepcnt,   "TCP_KEEPCNT"),
             ],
-        );
+        )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) {
+    fn apply_keepalive(_stream: &TcpStream, _i2p_tunneled: bool) -> bool {
         // No platform-specific keepalive support compiled in.
+        false
     }
 
     /// setsockopt(SOL_*, opt, &i32) with error logging. Used by
@@ -493,15 +520,17 @@ impl TcpClientInterface {
     /// Re-read each keepalive option via getsockopt and warn if the kernel
     /// stored a value different from what we asked for. This surfaces both
     /// outright failures (which `set_sockopt_i32` already logs) AND silent
-    /// clamping (e.g. some kernels round TCP_KEEPCNT to a minimum). One
+    /// clamping (e.g. some kernels round TCP_KEEPCNT to a minimum). An on/off
+    /// option only has to read back on or off as asked (see `Readback`). One
     /// `[KEEPALIVE]` line is logged per fresh socket on success so we can
-    /// confirm in production logs that keepalive really is active.
+    /// confirm in production logs that keepalive really is active. Returns
+    /// whether every option was honoured.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    fn verify_keepalive(fd: libc::c_int, expected: &[(libc::c_int, libc::c_int, i32, &str)]) {
+    fn verify_keepalive(fd: libc::c_int, expected: &[(libc::c_int, libc::c_int, Readback, i32, &str)]) -> bool {
         let mut summary = String::new();
         let mut all_ok = true;
-        for (level, opt, want, name) in expected {
+        for (level, opt, readback, want, name) in expected {
             let mut got: i32 = 0;
             let mut len: libc::socklen_t = std::mem::size_of::<i32>() as libc::socklen_t;
             let rc = unsafe {
@@ -522,7 +551,7 @@ impl TcpClientInterface {
                 all_ok = false;
                 continue;
             }
-            if got != *want {
+            if !readback.honoured(*want, got) {
                 crate::log(
                     &format!("TCP keepalive {} fd={} requested={} actual={} — kernel did not honor request", name, fd, want, got),
                     crate::LOG_WARNING, false, false,
@@ -538,6 +567,7 @@ impl TcpClientInterface {
                 crate::LOG_NOTICE, false, false,
             );
         }
+        all_ok
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
@@ -2918,5 +2948,45 @@ mod bind_retry_tests {
             .expect_err("port never freed");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(holder);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
+mod keepalive_readback_tests {
+    use super::{Readback, TcpClientInterface};
+    use std::net::{TcpListener, TcpStream};
+
+    /// macOS reads an enabled SO_KEEPALIVE back as its own bit, 0x8, where
+    /// Linux reads 1. Until 2026-10-13 the readback was compared exactly, so
+    /// every macOS connect warned "SO_KEEPALIVE requested=1 actual=8 — kernel
+    /// did not honor request" and never logged `[KEEPALIVE] active`.
+    #[test]
+    fn a_flag_read_back_as_its_own_bit_is_honoured() {
+        assert!(Readback::Flag.honoured(1, 8), "macOS reads an enabled SO_KEEPALIVE back as 0x8");
+        assert!(Readback::Flag.honoured(1, 1), "Linux reads it back as 1");
+        assert!(!Readback::Flag.honoured(1, 0), "keepalive left off must still warn");
+    }
+
+    #[test]
+    fn a_number_read_back_changed_is_not_honoured() {
+        assert!(Readback::Exact.honoured(5, 5));
+        assert!(!Readback::Exact.honoured(5, 8), "a kernel that changed the value must still warn");
+    }
+
+    /// Every option `apply_keepalive` sets on a real socket reads back as
+    /// honoured on this platform, for plain TCP and for I2P tunnels, so the
+    /// `[KEEPALIVE] active` line is logged. This also checks which options
+    /// the tables mark as on/off.
+    #[test]
+    fn keepalive_is_honoured_on_a_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        for i2p_tunneled in [false, true] {
+            assert!(
+                TcpClientInterface::apply_keepalive(&stream, i2p_tunneled),
+                "an option read back as not honoured (i2p_tunneled={}): see the warning logged above",
+                i2p_tunneled
+            );
+        }
     }
 }
