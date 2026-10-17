@@ -3,7 +3,10 @@
 //! Implements the HTTP exchange protocol used by Reticulum-post PHP nodes:
 //!
 //! 1. **Registration**: POST to `/v1/interfaces/register` with name, bitrate,
-//!    MTU, and metadata. Receives an `interface_id` and `session_token`.
+//!    MTU, and metadata, signed with the transport identity over a challenge
+//!    from `/v1/interfaces/challenge` (Reticulum-post REGISTRATION-STAGE1.md,
+//!    the same proof a browser gives). Receives an `interface_id` and the
+//!    session token sealed to that identity.
 //!
 //! 2. **Exchange**: POST to `/v1/interfaces/exchange` with:
 //!    - Base64-encoded outbound packets (raw RNS binary)
@@ -20,6 +23,10 @@
 //!   ../Reticulum-post/php/src/index.php (TcpBridgeHttpClient)
 
 use super::interface::Interface;
+use super::post_registration::{
+    decrypt_session_token, from_lower_hex, registration_signed_bytes, to_hex, CHALLENGE_LEN,
+};
+use crate::identity::Identity;
 use crate::log;
 use crate::transport::Transport as RnsTransport;
 use base64::Engine;
@@ -61,7 +68,10 @@ struct RegisterMetadata {
 struct RegisterResponse {
     status: String,
     interface_id: String,
-    session_token: String,
+    #[serde(default)]
+    identity_hash: Option<String>,
+    #[serde(default)]
+    session_token_encrypted: Option<String>,
     #[serde(default)]
     idle_exchange_interval_ms: Option<u64>,
     #[serde(default)]
@@ -266,7 +276,20 @@ impl PostInterface {
     /// Before the node has told us its `idle_exchange_interval_ms`.
     pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+    /// Register at the PHP node, signed with the transport identity
+    /// (Reticulum-post REGISTRATION-STAGE1.md): today's body plus the
+    /// `registration` proof a browser gives, in wake and poll mode alike.
+    /// Never unsigned: both PHP nodes serve the challenge, and a gateway
+    /// without its identity is an ordering error, not a reason to fall back.
     pub fn register_with_remote(&mut self) -> Result<(), String> {
+        let identity = RnsTransport::transport_identity().ok_or(
+            "no transport identity to sign the registration with (Transport::start loads it before interfaces are built)",
+        )?;
+        self.register_signed(&identity)
+    }
+
+    /// [`Self::register_with_remote`] with the identity given.
+    pub(crate) fn register_signed(&mut self, identity: &Identity) -> Result<(), String> {
         let register_url = format!("{}/v1/interfaces/register", self.node_url);
 
         let metadata = if let Some(ref wake_url) = self.wake_url {
@@ -307,51 +330,72 @@ impl PostInterface {
             metadata,
         };
 
-        let body = serde_json::to_string(&request)
+        let mut body = serde_json::to_value(&request)
             .map_err(|e| format!("Failed to serialize register request: {}", e))?;
+        let public_key = identity.get_public_key()?;
+        let public_key_hex = to_hex(&public_key);
+        let own_hash = identity.hash.as_deref().map(to_hex).unwrap_or_default();
 
         log(
             &format!(
-                "PostInterface registering at {} (name={}, bitrate={}, mtu={})",
-                register_url, request.name, request.bitrate, request.mtu,
+                "PostInterface registering at {} (name={}, bitrate={}, mtu={}, signed by identity {})",
+                register_url, request.name, request.bitrate, request.mtu, own_hash,
             ),
             crate::LOG_NOTICE,
             false,
             false,
         );
 
-        let response = self
-            .client
-            .post(&register_url)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .map_err(|e| format!("Registration HTTP request failed: {}", e))?;
+        // A 409 stale_challenge earns one new challenge and one more
+        // registration, and only one (REGISTRATION-STAGE1.md §4.3).
+        let mut stale_round_taken = false;
+        let response_text = loop {
+            let challenge = self.fetch_challenge(&public_key_hex, &own_hash)?;
+            let signed = registration_signed_bytes(&challenge, &public_key, &body)?;
+            body["registration"] = serde_json::json!({
+                "version": 1,
+                "public_key": public_key_hex,
+                "challenge": to_hex(&challenge),
+                "signature": to_hex(&identity.sign(&signed)),
+            });
 
-        let status = response.status();
-        let response_text = response
-            .text()
-            .map_err(|e| format!("Failed to read registration response: {}", e))?;
+            let response = self
+                .client
+                .post(&register_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .map_err(|e| format!("Registration HTTP request failed: {}", e))?;
 
-        if !status.is_success() {
-            return Err(format!(
-                "Registration failed (HTTP {}): {}",
-                status.as_u16(),
-                response_text,
-            ));
-        }
+            let status = response.status();
+            let response_text = response
+                .text()
+                .map_err(|e| format!("Failed to read registration response: {}", e))?;
+
+            let error_code = serde_json::from_str::<serde_json::Value>(&response_text)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string));
+            if status == reqwest::StatusCode::CONFLICT && error_code.as_deref() == Some("stale_challenge") && !stale_round_taken {
+                stale_round_taken = true;
+                log(
+                    "PostInterface registration answered 409 stale_challenge: asking for one new challenge and registering once more",
+                    crate::LOG_NOTICE, false, false,
+                );
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(format!(
+                    "Registration failed (HTTP {}): {}",
+                    status.as_u16(),
+                    response_text,
+                ));
+            }
+            break response_text;
+        };
 
         let register_response: RegisterResponse = serde_json::from_str(&response_text)
             .map_err(|e| format!("Failed to parse registration response: {} (body: {})", e, response_text))?;
-
-        log(
-            &format!(
-                "PostInterface registration response: iface={} token={}...",
-                &register_response.interface_id[..8.min(register_response.interface_id.len())],
-                &register_response.session_token[..8.min(register_response.session_token.len())],
-            ),
-            crate::LOG_NOTICE, false, false,
-        );
 
         if register_response.status != "registered" {
             return Err(format!(
@@ -359,9 +403,30 @@ impl PostInterface {
                 register_response.status
             ));
         }
+        if register_response.identity_hash.as_deref() != Some(own_hash.as_str()) {
+            return Err(format!(
+                "Registration answer names identity_hash {:?}, not this gateway's {}",
+                register_response.identity_hash, own_hash,
+            ));
+        }
+        // The token is sealed to this identity; there is no plaintext one to fall back to.
+        let sealed = register_response
+            .session_token_encrypted
+            .as_deref()
+            .ok_or("Registration answer has no session_token_encrypted")?;
+        let session_token = decrypt_session_token(sealed, identity)?;
+
+        log(
+            &format!(
+                "PostInterface registration response: iface={} token={}...",
+                &register_response.interface_id[..8.min(register_response.interface_id.len())],
+                &session_token[..8],
+            ),
+            crate::LOG_NOTICE, false, false,
+        );
 
         self.interface_id = Some(register_response.interface_id.clone());
-        self.session_token = Some(register_response.session_token.clone());
+        self.session_token = Some(session_token);
         self.max_batch_packets = register_response.max_batch_packets.unwrap_or(Self::DEFAULT_MAX_BATCH_PACKETS);
         self.max_packet_bytes = register_response.max_packet_bytes.unwrap_or(Self::DEFAULT_MAX_PACKET_BYTES);
         if let Some(ms) = register_response.idle_exchange_interval_ms.filter(|ms| *ms > 0) {
@@ -390,6 +455,43 @@ impl PostInterface {
         );
 
         Ok(())
+    }
+
+    /// REGISTRATION-STAGE1.md §3: a challenge for this identity, as the PHP
+    /// node gave it. Any other answer is an error, as a refused registration is.
+    fn fetch_challenge(&self, public_key_hex: &str, own_hash: &str) -> Result<Vec<u8>, String> {
+        let challenge_url = format!("{}/v1/interfaces/challenge", self.node_url);
+        let response = self
+            .client
+            .post(&challenge_url)
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "public_key": public_key_hex }).to_string())
+            .send()
+            .map_err(|e| format!("Challenge HTTP request failed: {}", e))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .map_err(|e| format!("Failed to read challenge response: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("Challenge failed (HTTP {}): {}", status.as_u16(), response_text));
+        }
+        let answer: serde_json::Value = serde_json::from_str(&response_text).unwrap_or_default();
+        match answer["challenge"].as_str().and_then(from_lower_hex) {
+            Some(challenge)
+                if challenge.len() == CHALLENGE_LEN
+                    && answer["status"] == "challenge"
+                    && answer["version"] == 1
+                    && answer["identity_hash"] == own_hash =>
+            {
+                Ok(challenge)
+            }
+            _ => Err(format!(
+                "The PHP node's answer is not a challenge for {}: {}",
+                own_hash, response_text
+            )),
+        }
     }
 
     fn exchange(&mut self) -> Result<ExchangeResult, String> {
@@ -1020,6 +1122,168 @@ mod tests {
     fn wake_mode_does_not_poll() {
         let p = PostInterface::new(&cfg(&[("wake_url", "http://127.0.0.1:1/v1/wake")])).unwrap();
         assert!(p.is_wake_mode, "wake mode is event-driven only, as in the Python PostInterface");
+    }
+
+    // ── Signed registration (REGISTRATION-STAGE1.md), against a fake PHP node ──
+
+    use super::super::post_registration::vectors;
+    use serde_json::{json, Value};
+
+    type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A PHP node on 127.0.0.1 that answers each request, one per
+    /// connection, with the next scripted (status, JSON) and records its
+    /// path and JSON body. Past the script it accepts nothing more.
+    fn fake_php_node(answers: Vec<(u16, Value)>) -> (String, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            for (status, answer) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let request = read_wake_request(&mut stream).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = request.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                log.lock().unwrap().push((path, serde_json::from_str(body).unwrap_or(Value::Null)));
+                let text = answer.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status, text.len(), text
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    /// The gateway the `gateway-wake` / `gateway-poll` vectors describe,
+    /// pointed at `node_url`, with the vector's peer credentials.
+    fn vector_gateway(node_url: &str, vector: &Value) -> PostInterface {
+        let md = &vector["request_body"]["metadata"];
+        let mut pairs = vec![("node_url", node_url), ("bitrate", "10000000"), ("mtu", "500"), ("mode", "gateway")];
+        let wake = md["peer_url"].as_str().map(|u| format!("{u}/v1/wake"));
+        if let Some(w) = wake.as_deref() {
+            pairs.push(("wake_url", w));
+        }
+        let mut c = cfg(&pairs);
+        c.insert("name".into(), "Retichat Bridge".into());
+        let mut p = PostInterface::new(&c).unwrap();
+        if p.is_wake_mode {
+            p.peer_interface_id = md["peer_interface_id"].as_str().map(String::from);
+            p.peer_session_token = md["peer_session_token"].as_str().map(String::from);
+        }
+        p
+    }
+
+    fn refusal(code: &str) -> Value {
+        json!({"error": code, "message": code})
+    }
+
+    /// Both modes: the challenge request, the registration body (today's
+    /// fields plus `registration`) and the token read back are the vector's,
+    /// byte for byte, signed with the identity given.
+    #[test]
+    fn the_gateway_registers_signed_as_the_gateway_vectors_say_in_both_modes() {
+        let doc = vectors::doc();
+        let gateway = vectors::identity(&doc, "gateway");
+        for id in ["gateway-wake", "gateway-poll"] {
+            let v = vectors::registration(&doc, id);
+            let c = vectors::challenge(&doc, v["challenge_id"].as_str().unwrap());
+            let (url, seen) = fake_php_node(vec![(200, c["challenge_response"].clone()), (200, v["response_example"].clone())]);
+            let mut p = vector_gateway(&url, v);
+            assert_eq!(p.is_wake_mode, id == "gateway-wake");
+            p.register_signed(&gateway).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![
+                    ("/v1/interfaces/challenge".to_string(), v["challenge_request"].clone()),
+                    ("/v1/interfaces/register".to_string(), v["request_body"].clone()),
+                ],
+                "{id}"
+            );
+            assert_eq!(p.session_token.as_deref(), v["encrypted_token"]["plaintext_utf8"].as_str(), "{id}");
+            assert_eq!(p.interface_id.as_deref(), v["response_example"]["interface_id"].as_str(), "{id}");
+            assert!(p.base.online, "{id}");
+        }
+    }
+
+    /// One 409 stale_challenge earns one new challenge and one more
+    /// registration; a second stops it. Nothing more is sent either way.
+    #[test]
+    fn a_stale_challenge_earns_exactly_one_more_round() {
+        let doc = vectors::doc();
+        let gateway = vectors::identity(&doc, "gateway");
+        let v = vectors::registration(&doc, "gateway-wake");
+        let fresh = vectors::challenge(&doc, v["challenge_id"].as_str().unwrap())["challenge_response"].clone();
+        let old = vectors::challenge(&doc, vectors::registration(&doc, "gateway-poll")["challenge_id"].as_str().unwrap())["challenge_response"].clone();
+
+        let (url, seen) = fake_php_node(vec![
+            (200, old.clone()),
+            (409, refusal("stale_challenge")),
+            (200, fresh.clone()),
+            (200, v["response_example"].clone()),
+        ]);
+        let mut p = vector_gateway(&url, v);
+        p.register_signed(&gateway).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[1].1["registration"]["challenge"], old["challenge"]);
+        assert_eq!(seen[3].1, v["request_body"], "the second round signs the new challenge");
+        assert_eq!(p.session_token.as_deref(), v["encrypted_token"]["plaintext_utf8"].as_str());
+
+        let (url, seen) = fake_php_node(vec![
+            (200, old.clone()),
+            (409, refusal("stale_challenge")),
+            (200, fresh),
+            (409, refusal("stale_challenge")),
+        ]);
+        let mut p = vector_gateway(&url, v);
+        let err = p.register_signed(&gateway).unwrap_err();
+        assert!(err.contains("HTTP 409") && err.contains("stale_challenge"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 4, "no third round");
+        assert!(p.session_token.is_none() && p.interface_id.is_none());
+    }
+
+    /// No fallback to unsigned: a challenge refused is an error and no
+    /// registration goes out; any other refusal is today's error, one round
+    /// only; an answer for another identity, or a token that does not
+    /// decrypt, sets no session.
+    #[test]
+    fn every_other_answer_is_an_error_and_nothing_unsigned_is_sent() {
+        let doc = vectors::doc();
+        let gateway = vectors::identity(&doc, "gateway");
+        let v = vectors::registration(&doc, "gateway-wake");
+        let challenge = vectors::challenge(&doc, v["challenge_id"].as_str().unwrap())["challenge_response"].clone();
+        let browser_answer = vectors::registration(&doc, "browser-first")["response_example"].clone();
+        let mut bad_token = v["response_example"].clone();
+        bad_token["session_token_encrypted"] = Value::from(bad_token["session_token_encrypted"].as_str().unwrap().replacen('0', "1", 1));
+        let mut plaintext_only = v["response_example"].clone();
+        plaintext_only.as_object_mut().unwrap().remove("session_token_encrypted");
+        plaintext_only["session_token"] = v["encrypted_token"]["plaintext_utf8"].clone();
+        let mut other_identity_challenge = challenge.clone();
+        other_identity_challenge["identity_hash"] = Value::from("00000000000000000000000000000000");
+
+        let cases: Vec<(&str, Vec<(u16, Value)>, usize, &str)> = vec![
+            ("challenge 404", vec![(404, json!({"error": "not found"}))], 1, "HTTP 404"),
+            ("challenge for another identity", vec![(200, other_identity_challenge)], 1, "not a challenge for"),
+            ("register 400", vec![(200, challenge.clone()), (400, refusal("unknown_client"))], 2, "unknown_client"),
+            ("register 403", vec![(200, challenge.clone()), (403, refusal("bad_registration_signature"))], 2, "HTTP 403"),
+            ("answer for another identity", vec![(200, challenge.clone()), (200, browser_answer)], 2, "identity_hash"),
+            ("token does not decrypt", vec![(200, challenge.clone()), (200, bad_token)], 2, "session_token_encrypted"),
+            ("plaintext token only", vec![(200, challenge.clone()), (200, plaintext_only)], 2, "session_token_encrypted"),
+        ];
+        for (what, answers, requests, needle) in cases {
+            let (url, seen) = fake_php_node(answers);
+            let mut p = vector_gateway(&url, v);
+            let err = p.register_signed(&gateway).unwrap_err();
+            assert!(err.contains(needle), "{what}: {err}");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), requests, "{what}");
+            assert!(seen.iter().all(|(path, body)| path != "/v1/interfaces/register" || body.get("registration").is_some()), "{what}: never unsigned");
+            assert!(p.session_token.is_none() && p.interface_id.is_none() && !p.base.online, "{what}");
+        }
     }
 }
 

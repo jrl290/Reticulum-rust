@@ -2173,6 +2173,14 @@ impl Transport {
         state.identity.as_ref().and_then(|id| id.hash.as_ref().cloned())
     }
 
+    /// A copy of the persistent transport identity, which `start` loads or
+    /// creates before any interface is built. The PostInterface gateway signs
+    /// its registration at a PHP node with it. `None` before `start`.
+    pub fn transport_identity() -> Option<Identity> {
+        let state = TRANSPORT.lock().unwrap();
+        state.identity.clone()
+    }
+
     pub fn transport_enabled() -> bool {
         let state = TRANSPORT.lock().unwrap();
         state.transport_enabled
