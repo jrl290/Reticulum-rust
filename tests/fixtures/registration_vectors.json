@@ -1,0 +1,2320 @@
+{
+  "spec": "Reticulum-post/REGISTRATION.md",
+  "format_version": 6,
+  "generator": "Reticulum-post/tools/registration_vectors.py (RNS 1.5.2)",
+  "note": "Every byte below is derived from fixed labels; regenerate with the generator, never by hand. Hex is lower-case throughout.",
+  "constants": {
+    "register_domain": "reticulum-post/register/v1",
+    "register_domain_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+    "challenge_domain": "reticulum-post/challenge/v1",
+    "challenge_domain_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f7631",
+    "challenge_length": 48,
+    "challenge_layout": "nonce(16) || HMAC-SHA256(relay_secret, challenge_domain || identity_hash(16) || u64be(registration_seq) || nonce(16))",
+    "signed_field_order": [
+      "domain",
+      "challenge",
+      "public_key",
+      "name",
+      "bitrate",
+      "mtu",
+      "client",
+      "mode",
+      "transport",
+      "peer_url",
+      "peer_interface_id",
+      "peer_session_token"
+    ],
+    "lp": "u16be(len(x)) || x"
+  },
+  "lp_examples": [
+    {
+      "input_hex": "",
+      "output_hex": "0000"
+    },
+    {
+      "input_utf8": "rns-js",
+      "output_hex": "0006726e732d6a73"
+    },
+    {
+      "input_utf8": "reticulum-post/register/v1",
+      "output_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+    }
+  ],
+  "relays": {
+    "A": {
+      "relay_secret_hex": "13cbff96ba649cb659c3701c60186ee0d7a8a3b435f0bbdd97f714d905c59169",
+      "description": "the relay every vector is presented to"
+    },
+    "B": {
+      "relay_secret_hex": "daa4afbf9885e60926c506969073478ffbff46ccf094ddc79a21ad9704571ad5",
+      "description": "another relay; its challenges must be refused at A"
+    }
+  },
+  "identities": {
+    "browser": {
+      "private_key_hex": "1d466aacd6ebec4489fb7a4f2fbf4a71566e4afb033518c66cb871a81881ed8e9674bb94879d39ebec2026c2ed322338615fd9a1da637bae283717b34e8f5bac",
+      "x25519_private_hex": "1d466aacd6ebec4489fb7a4f2fbf4a71566e4afb033518c66cb871a81881ed8e",
+      "ed25519_private_seed_hex": "9674bb94879d39ebec2026c2ed322338615fd9a1da637bae283717b34e8f5bac",
+      "public_key_hex": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+      "x25519_public_hex": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf252",
+      "ed25519_public_hex": "30a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8"
+    },
+    "gateway": {
+      "private_key_hex": "a59c56f88dc5f2ec0e70db4be00b3ebe313b603886c2ad2fac2f477d3e25c1d9d8b80ce36112f26c0c52b9c3456609af43626a1cba4934563a2242e5c011e2bc",
+      "x25519_private_hex": "a59c56f88dc5f2ec0e70db4be00b3ebe313b603886c2ad2fac2f477d3e25c1d9",
+      "ed25519_private_seed_hex": "d8b80ce36112f26c0c52b9c3456609af43626a1cba4934563a2242e5c011e2bc",
+      "public_key_hex": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+      "x25519_public_hex": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b",
+      "ed25519_public_hex": "511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b"
+    },
+    "other": {
+      "private_key_hex": "3ed489abbb7e312ed2af8a4d2fbe37d285bb611d9731fc2ba85bf5c86a0adcfc8f8a01d3870abf8baa1dec54a9e56629ed1cbf989350fb31a389cc2997305cc0",
+      "x25519_private_hex": "3ed489abbb7e312ed2af8a4d2fbe37d285bb611d9731fc2ba85bf5c86a0adcfc",
+      "ed25519_private_seed_hex": "8f8a01d3870abf8baa1dec54a9e56629ed1cbf989350fb31a389cc2997305cc0",
+      "public_key_hex": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
+      "x25519_public_hex": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b55",
+      "ed25519_public_hex": "8427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
+      "identity_hash_hex": "3720edf2045f09b4343f3a5f2f473877"
+    },
+    "relay_b": {
+      "private_key_hex": "c338de5da146fb07d14e183e3b3bc0027ca2684289920b0616fca2e56185028cc76cbb5a93176a779d00ccdc4c9a2219756fc56ec3d951a35a87cc412c21bd4a",
+      "x25519_private_hex": "c338de5da146fb07d14e183e3b3bc0027ca2684289920b0616fca2e56185028c",
+      "ed25519_private_seed_hex": "c76cbb5a93176a779d00ccdc4c9a2219756fc56ec3d951a35a87cc412c21bd4a",
+      "public_key_hex": "5f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef",
+      "x25519_public_hex": "5f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155",
+      "ed25519_public_hex": "f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef",
+      "identity_hash_hex": "6dc1140ebf2306f750df931da80bb5be"
+    },
+    "lowx": {
+      "private_key_hex": null,
+      "x25519_private_hex": null,
+      "ed25519_private_seed_hex": "c5c597db2aac2b24c3e1b89c1988192d2cda1fce275e7f4d94c7d3bf76dc990c",
+      "public_key_hex": "00000000000000000000000000000000000000000000000000000000000000004abe202cea8f51835a678afe3509c46df531c568d0abf0633ad633116067cc7a",
+      "x25519_public_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "ed25519_public_hex": "4abe202cea8f51835a678afe3509c46df531c568d0abf0633ad633116067cc7a",
+      "identity_hash_hex": "c66649ee30d57652a0a25d486827d29c",
+      "note": "X25519 half is the all-zero (low-order) point: the Ed25519 signature verifies, but no session token can be encrypted to it."
+    }
+  },
+  "challenges": [
+    {
+      "id": "A/browser/seq0",
+      "minted_by_relay": "A",
+      "for_identity": "browser",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+      "registration_seq_bound": 0,
+      "nonce_hex": "5ab138262aa3ff7e40d3e0d18156b5b9",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba800000000000000005ab138262aa3ff7e40d3e0d18156b5b9",
+      "mac_hex": "6bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+      "challenge_hex": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a"
+      }
+    },
+    {
+      "id": "A/browser/seq1",
+      "minted_by_relay": "A",
+      "for_identity": "browser",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+      "registration_seq_bound": 1,
+      "nonce_hex": "3af6b90ea45d255af6865d210b9c3c5a",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba800000000000000013af6b90ea45d255af6865d210b9c3c5a",
+      "mac_hex": "c7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
+      "challenge_hex": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "challenge": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9"
+      }
+    },
+    {
+      "id": "A/gateway/seq5",
+      "minted_by_relay": "A",
+      "for_identity": "gateway",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+      "registration_seq_bound": 5,
+      "nonce_hex": "fee31215af1b72d45defe75e11bfbe31",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763103f43750ef2ba1ad2d3c67c5f358349b0000000000000005fee31215af1b72d45defe75e11bfbe31",
+      "mac_hex": "466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+      "challenge_hex": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a"
+      }
+    },
+    {
+      "id": "A/gateway/seq0",
+      "minted_by_relay": "A",
+      "for_identity": "gateway",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+      "registration_seq_bound": 0,
+      "nonce_hex": "20e518b5a9c617d668c944973bee6ff1",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763103f43750ef2ba1ad2d3c67c5f358349b000000000000000020e518b5a9c617d668c944973bee6ff1",
+      "mac_hex": "abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
+      "challenge_hex": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "challenge": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a"
+      }
+    },
+    {
+      "id": "A/relay_b/seq0",
+      "minted_by_relay": "A",
+      "for_identity": "relay_b",
+      "identity_hash_hex": "6dc1140ebf2306f750df931da80bb5be",
+      "registration_seq_bound": 0,
+      "nonce_hex": "48f2b43d0eeb22f1c72e9f8506318059",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f76316dc1140ebf2306f750df931da80bb5be000000000000000048f2b43d0eeb22f1c72e9f8506318059",
+      "mac_hex": "f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2",
+      "challenge_hex": "48f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+        "challenge": "48f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2"
+      }
+    },
+    {
+      "id": "A/gateway/seq4",
+      "minted_by_relay": "A",
+      "for_identity": "gateway",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+      "registration_seq_bound": 4,
+      "nonce_hex": "1c4f5bb95ae980b7b4ee086555d27da5",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763103f43750ef2ba1ad2d3c67c5f358349b00000000000000041c4f5bb95ae980b7b4ee086555d27da5",
+      "mac_hex": "6b95c2975e7fd9ac39eb9e4e8f91f5459eeb277a4f5cd9f2426655d8b8d28b04",
+      "challenge_hex": "1c4f5bb95ae980b7b4ee086555d27da56b95c2975e7fd9ac39eb9e4e8f91f5459eeb277a4f5cd9f2426655d8b8d28b04",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "challenge": "1c4f5bb95ae980b7b4ee086555d27da56b95c2975e7fd9ac39eb9e4e8f91f5459eeb277a4f5cd9f2426655d8b8d28b04"
+      }
+    },
+    {
+      "id": "B/browser/seq0",
+      "minted_by_relay": "B",
+      "for_identity": "browser",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+      "registration_seq_bound": 0,
+      "nonce_hex": "d42a8c8a9bd3a52194348ba49f550dbf",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba80000000000000000d42a8c8a9bd3a52194348ba49f550dbf",
+      "mac_hex": "bfccc5ef73896cd76bd36f3547750e17d21de8aaba5c462da8b413da2f792492",
+      "challenge_hex": "d42a8c8a9bd3a52194348ba49f550dbfbfccc5ef73896cd76bd36f3547750e17d21de8aaba5c462da8b413da2f792492",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "challenge": "d42a8c8a9bd3a52194348ba49f550dbfbfccc5ef73896cd76bd36f3547750e17d21de8aaba5c462da8b413da2f792492"
+      }
+    },
+    {
+      "id": "A/other/seq0",
+      "minted_by_relay": "A",
+      "for_identity": "other",
+      "identity_hash_hex": "3720edf2045f09b4343f3a5f2f473877",
+      "registration_seq_bound": 0,
+      "nonce_hex": "6198cec6b10e8c94b73b371ae393d8a3",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f76313720edf2045f09b4343f3a5f2f47387700000000000000006198cec6b10e8c94b73b371ae393d8a3",
+      "mac_hex": "0a917e4bb6f9a25d5b09a3b0f7d64fda97eaedc88ab3193a8bed516e05e041d6",
+      "challenge_hex": "6198cec6b10e8c94b73b371ae393d8a30a917e4bb6f9a25d5b09a3b0f7d64fda97eaedc88ab3193a8bed516e05e041d6",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "3720edf2045f09b4343f3a5f2f473877",
+        "challenge": "6198cec6b10e8c94b73b371ae393d8a30a917e4bb6f9a25d5b09a3b0f7d64fda97eaedc88ab3193a8bed516e05e041d6"
+      }
+    },
+    {
+      "id": "A/browser/seq0/mode6",
+      "minted_by_relay": "A",
+      "for_identity": "browser",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+      "registration_seq_bound": 0,
+      "nonce_hex": "134279e040618187e75c5cb2efe83f6f",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba80000000000000000134279e040618187e75c5cb2efe83f6f",
+      "mac_hex": "c5863de85a69b094ba0b392673d3c81a905b1e62ddabaeb333d0125a649f6e10",
+      "challenge_hex": "134279e040618187e75c5cb2efe83f6fc5863de85a69b094ba0b392673d3c81a905b1e62ddabaeb333d0125a649f6e10",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "challenge": "134279e040618187e75c5cb2efe83f6fc5863de85a69b094ba0b392673d3c81a905b1e62ddabaeb333d0125a649f6e10"
+      }
+    },
+    {
+      "id": "A/browser/seq0/peer-url",
+      "minted_by_relay": "A",
+      "for_identity": "browser",
+      "identity_hash_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+      "registration_seq_bound": 0,
+      "nonce_hex": "55008110922cfbdc945224109b1f2fd5",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763120bc2200ebcd73a552b6e6a7ff2a0ba8000000000000000055008110922cfbdc945224109b1f2fd5",
+      "mac_hex": "85e55657bf4df3491d6d7bf1f741c06f7b63d13f0b3ce355181e0952fbf3d2ac",
+      "challenge_hex": "55008110922cfbdc945224109b1f2fd585e55657bf4df3491d6d7bf1f741c06f7b63d13f0b3ce355181e0952fbf3d2ac",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "challenge": "55008110922cfbdc945224109b1f2fd585e55657bf4df3491d6d7bf1f741c06f7b63d13f0b3ce355181e0952fbf3d2ac"
+      }
+    },
+    {
+      "id": "A/other/seq0/unknown-client",
+      "minted_by_relay": "A",
+      "for_identity": "other",
+      "identity_hash_hex": "3720edf2045f09b4343f3a5f2f473877",
+      "registration_seq_bound": 0,
+      "nonce_hex": "a9b1e38c7adb609ee0ae9575267c0ff8",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f76313720edf2045f09b4343f3a5f2f4738770000000000000000a9b1e38c7adb609ee0ae9575267c0ff8",
+      "mac_hex": "a70192de151b37b8e7213b9c08eab6eae18ad41102ec5c5344c007f0789f795a",
+      "challenge_hex": "a9b1e38c7adb609ee0ae9575267c0ff8a70192de151b37b8e7213b9c08eab6eae18ad41102ec5c5344c007f0789f795a",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "3720edf2045f09b4343f3a5f2f473877",
+        "challenge": "a9b1e38c7adb609ee0ae9575267c0ff8a70192de151b37b8e7213b9c08eab6eae18ad41102ec5c5344c007f0789f795a"
+      }
+    },
+    {
+      "id": "A/gateway/seq5/no-peer-fields",
+      "minted_by_relay": "A",
+      "for_identity": "gateway",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+      "registration_seq_bound": 5,
+      "nonce_hex": "54b3c8b80e573988b3ad64345a29825a",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763103f43750ef2ba1ad2d3c67c5f358349b000000000000000554b3c8b80e573988b3ad64345a29825a",
+      "mac_hex": "aa2a69bd76e46d002218a0ed936c035b3e83da2bad98443226918f330328129e",
+      "challenge_hex": "54b3c8b80e573988b3ad64345a29825aaa2a69bd76e46d002218a0ed936c035b3e83da2bad98443226918f330328129e",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "challenge": "54b3c8b80e573988b3ad64345a29825aaa2a69bd76e46d002218a0ed936c035b3e83da2bad98443226918f330328129e"
+      }
+    },
+    {
+      "id": "A/gateway/seq5/poll-peer-url",
+      "minted_by_relay": "A",
+      "for_identity": "gateway",
+      "identity_hash_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+      "registration_seq_bound": 5,
+      "nonce_hex": "2df8570b517ea7fb7ccb57d81450a763",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f763103f43750ef2ba1ad2d3c67c5f358349b00000000000000052df8570b517ea7fb7ccb57d81450a763",
+      "mac_hex": "6ba2658b4f15ab7fe102671567175985edc8e664ce945bfa3836ba2af6ef114e",
+      "challenge_hex": "2df8570b517ea7fb7ccb57d81450a7636ba2658b4f15ab7fe102671567175985edc8e664ce945bfa3836ba2af6ef114e",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "challenge": "2df8570b517ea7fb7ccb57d81450a7636ba2658b4f15ab7fe102671567175985edc8e664ce945bfa3836ba2af6ef114e"
+      }
+    },
+    {
+      "id": "A/other/seq0/capacity",
+      "minted_by_relay": "A",
+      "for_identity": "other",
+      "identity_hash_hex": "3720edf2045f09b4343f3a5f2f473877",
+      "registration_seq_bound": 0,
+      "nonce_hex": "d627509aee07f2c39b64944d7f9d091e",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f76313720edf2045f09b4343f3a5f2f4738770000000000000000d627509aee07f2c39b64944d7f9d091e",
+      "mac_hex": "e0b7d5c9adfbd2736325076c5ef0a564c14fcba5c5cee801464bb704753a9103",
+      "challenge_hex": "d627509aee07f2c39b64944d7f9d091ee0b7d5c9adfbd2736325076c5ef0a564c14fcba5c5cee801464bb704753a9103",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "3720edf2045f09b4343f3a5f2f473877",
+        "challenge": "d627509aee07f2c39b64944d7f9d091ee0b7d5c9adfbd2736325076c5ef0a564c14fcba5c5cee801464bb704753a9103"
+      }
+    },
+    {
+      "id": "A/lowx/seq0",
+      "minted_by_relay": "A",
+      "for_identity": "lowx",
+      "identity_hash_hex": "c66649ee30d57652a0a25d486827d29c",
+      "registration_seq_bound": 0,
+      "nonce_hex": "4f4bb20133e73657b033a42adeee9704",
+      "mac_input_hex": "7265746963756c756d2d706f73742f6368616c6c656e67652f7631c66649ee30d57652a0a25d486827d29c00000000000000004f4bb20133e73657b033a42adeee9704",
+      "mac_hex": "3f00b4b5cee659b6d022c15ede057d7fe383b855a0ca4601a6bc59870e84d96c",
+      "challenge_hex": "4f4bb20133e73657b033a42adeee97043f00b4b5cee659b6d022c15ede057d7fe383b855a0ca4601a6bc59870e84d96c",
+      "challenge_response": {
+        "status": "challenge",
+        "version": 1,
+        "identity_hash": "c66649ee30d57652a0a25d486827d29c",
+        "challenge": "4f4bb20133e73657b033a42adeee97043f00b4b5cee659b6d022c15ede057d7fe383b855a0ca4601a6bc59870e84d96c"
+      }
+    }
+  ],
+  "registrations": [
+    {
+      "id": "browser-first",
+      "description": "Retichat-js browser, first signed registration at relay A: no signed row exists for the identity, so the challenge's MAC binds seq 0 and the relay INSERTs.",
+      "relay": "A",
+      "identity": "browser",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "challenge_id": "A/browser/seq0",
+      "challenge_request": {
+        "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596"
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+          "lp_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+        },
+        {
+          "name": "challenge",
+          "value_hex": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "lp_hex": "00305ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a"
+        },
+        {
+          "name": "public_key",
+          "value_hex": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "lp_hex": "0040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596"
+        },
+        {
+          "name": "name",
+          "value_hex": "526574696368617420576562",
+          "lp_hex": "000c526574696368617420576562"
+        },
+        {
+          "name": "bitrate",
+          "value_hex": "00000000000f4240",
+          "lp_hex": "000800000000000f4240"
+        },
+        {
+          "name": "mtu",
+          "value_hex": "000001f4",
+          "lp_hex": "0004000001f4"
+        },
+        {
+          "name": "client",
+          "value_hex": "726e732d6a73",
+          "lp_hex": "0006726e732d6a73"
+        },
+        {
+          "name": "mode",
+          "value_hex": "01",
+          "lp_hex": "000101"
+        },
+        {
+          "name": "transport",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_interface_id",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_session_token",
+          "value_hex": "",
+          "lp_hex": "0000"
+        }
+      ],
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100305ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a0040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596000c526574696368617420576562000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
+      "signature_hex": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804",
+      "expected": {
+        "status": 200,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "relay_state_after": {
+          "row_registration_seq": 1
+        }
+      },
+      "response_example": {
+        "status": "registered",
+        "interface_id": "4986b5a711b91e17d65c759edeaea8f5",
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "session_token_encrypted": "c5fb8ea0192ab27fa4cd2909dd2c27fca5ad5a7e59ed74820a6efe4a14e4524b626e50869fb6008149ec34d25ec351384ee8e42bcbf131d964da496214636480df6db807c477fcd2101c40c93f5cee9731fadcce0da9172f65a3011f2cba68ff0b579e6b554a6600014a69a1db3e83c01645b2dd3db84deb08e7067afbca76dbe46458a47b166c5cd33ff6b29200553d6681d1a5f7bc6fe44bc0919066f47e5b",
+        "idle_exchange_interval_ms": 1000,
+        "max_batch_packets": 64,
+        "max_packet_bytes": 500
+      },
+      "encrypted_token": {
+        "plaintext_utf8": "5029ecd18434867d076929c0e10fac8974239f90ab7217afd6114cc875ebb8e3",
+        "ephemeral_private_hex": "07b2685f49be3076e362e994ea617487c46adb52f9e192f2518b5f537f09ecb4",
+        "ephemeral_public_hex": "c5fb8ea0192ab27fa4cd2909dd2c27fca5ad5a7e59ed74820a6efe4a14e4524b",
+        "iv_hex": "626e50869fb6008149ec34d25ec35138",
+        "shared_key_hex": "76ace4774b6867a010336955050d722c996b5b9384ebc6f6560b1d3b81fbb20a",
+        "hkdf_salt_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "derived_key_hex": "18d98d559e358b6d3864b57ce415b4a83a7202de185b14e66e8fac7757bc5e6c9cf9fb45746667c6e5362a54a54c5c01d4a72061a72f0562902f65ec37da7a27",
+        "hmac_key_hex": "18d98d559e358b6d3864b57ce415b4a83a7202de185b14e66e8fac7757bc5e6c",
+        "aes_key_hex": "9cf9fb45746667c6e5362a54a54c5c01d4a72061a72f0562902f65ec37da7a27",
+        "session_token_encrypted_hex": "c5fb8ea0192ab27fa4cd2909dd2c27fca5ad5a7e59ed74820a6efe4a14e4524b626e50869fb6008149ec34d25ec351384ee8e42bcbf131d964da496214636480df6db807c477fcd2101c40c93f5cee9731fadcce0da9172f65a3011f2cba68ff0b579e6b554a6600014a69a1db3e83c01645b2dd3db84deb08e7067afbca76dbe46458a47b166c5cd33ff6b29200553d6681d1a5f7bc6fe44bc0919066f47e5b",
+        "length": 160
+      }
+    },
+    {
+      "id": "browser-reregister",
+      "description": "The same browser re-registering after a 401 (session lost): its row is at seq 1, so the challenge's MAC binds seq 1 and the relay UPDATEs the row in place to seq 2. The name carries non-ASCII characters to pin UTF-8.",
+      "relay": "A",
+      "identity": "browser",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 1,
+        "at_capacity": false
+      },
+      "challenge_id": "A/browser/seq1",
+      "challenge_request": {
+        "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596"
+      },
+      "request_body": {
+        "name": "Retichat Web \u2014 Zo\u00eb",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
+          "signature": "581fe497a9b11812a61a2972d96c2ed7d86a7bb402225cbb23b288d9170b158e6feaedc6470a84617e85530ef9b962b45d0a1b0b8e264a3740f95ab3cbfa0f07"
+        }
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+          "lp_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+        },
+        {
+          "name": "challenge",
+          "value_hex": "3af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9",
+          "lp_hex": "00303af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a9"
+        },
+        {
+          "name": "public_key",
+          "value_hex": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "lp_hex": "0040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596"
+        },
+        {
+          "name": "name",
+          "value_hex": "52657469636861742057656220e28094205a6fc3ab",
+          "lp_hex": "001552657469636861742057656220e28094205a6fc3ab"
+        },
+        {
+          "name": "bitrate",
+          "value_hex": "00000000000f4240",
+          "lp_hex": "000800000000000f4240"
+        },
+        {
+          "name": "mtu",
+          "value_hex": "000001f4",
+          "lp_hex": "0004000001f4"
+        },
+        {
+          "name": "client",
+          "value_hex": "726e732d6a73",
+          "lp_hex": "0006726e732d6a73"
+        },
+        {
+          "name": "mode",
+          "value_hex": "01",
+          "lp_hex": "000101"
+        },
+        {
+          "name": "transport",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_interface_id",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_session_token",
+          "value_hex": "",
+          "lp_hex": "0000"
+        }
+      ],
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f763100303af6b90ea45d255af6865d210b9c3c5ac7335c83361d7d17b5e0480f16d717fdae14e10650a03e4c98798a1d214226a90040bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596001552657469636861742057656220e28094205a6fc3ab000800000000000f42400004000001f40006726e732d6a730001010000000000000000",
+      "signature_hex": "581fe497a9b11812a61a2972d96c2ed7d86a7bb402225cbb23b288d9170b158e6feaedc6470a84617e85530ef9b962b45d0a1b0b8e264a3740f95ab3cbfa0f07",
+      "expected": {
+        "status": 200,
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "relay_state_after": {
+          "row_registration_seq": 2
+        }
+      },
+      "response_example": {
+        "status": "registered",
+        "interface_id": "3992ba2a9a973676d8a8ca8c6dbdc47c",
+        "identity_hash": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "session_token_encrypted": "2c7385900c9bb3d8f499e0644b6c2d1d0dd4af36a2f149f11bba0f94dd78350ed89ef5b6b5733043aaaf273bc1fa1cac354e938f46f00bbb9afc93c82ad4988380b34abee8e4e1c5feeecadd4ffe7f8d4fb180b46f6f8661b92d014abebc6ca7cefdbc02215ae5f27ebc9589bafa757b78d492d9f4934e6d8ee22fcb71c5d351b5328b84638e369d0b26d4dddde81940d78bb187d4fad86bf98f93c754eeeef8",
+        "idle_exchange_interval_ms": 1000,
+        "max_batch_packets": 64,
+        "max_packet_bytes": 500
+      },
+      "encrypted_token": {
+        "plaintext_utf8": "84e22fb60ad4c806ca08b97a5d54d8e05d7caff5805088baed64a847b8f0efac",
+        "ephemeral_private_hex": "6651e2d9700a9f4c72a17b58393052f4b3b905f1de7870e18948df78d90ee7b4",
+        "ephemeral_public_hex": "2c7385900c9bb3d8f499e0644b6c2d1d0dd4af36a2f149f11bba0f94dd78350e",
+        "iv_hex": "d89ef5b6b5733043aaaf273bc1fa1cac",
+        "shared_key_hex": "753a68edce4a36605bdbf356a66ea91b4881b36a8736c42acc9a1138e6b6f57f",
+        "hkdf_salt_hex": "20bc2200ebcd73a552b6e6a7ff2a0ba8",
+        "derived_key_hex": "3b8d7c11b0fc01cb58363b35ef16d67a46b20d0fe89d59cf73ebce19346a5458a25e0e290952d93e7849ae411d797133d918a20235ba0cd0b1d955fe59fe8849",
+        "hmac_key_hex": "3b8d7c11b0fc01cb58363b35ef16d67a46b20d0fe89d59cf73ebce19346a5458",
+        "aes_key_hex": "a25e0e290952d93e7849ae411d797133d918a20235ba0cd0b1d955fe59fe8849",
+        "session_token_encrypted_hex": "2c7385900c9bb3d8f499e0644b6c2d1d0dd4af36a2f149f11bba0f94dd78350ed89ef5b6b5733043aaaf273bc1fa1cac354e938f46f00bbb9afc93c82ad4988380b34abee8e4e1c5feeecadd4ffe7f8d4fb180b46f6f8661b92d014abebc6ca7cefdbc02215ae5f27ebc9589bafa757b78d492d9f4934e6d8ee22fcb71c5d351b5328b84638e369d0b26d4dddde81940d78bb187d4fad86bf98f93c754eeeef8",
+        "length": 160
+      }
+    },
+    {
+      "id": "gateway-wake",
+      "description": "Reticulum-rust gateway (or Python PostInterface) in wake mode, signing with its persistent transport identity (no relay lists it: peering is open): client reticulum-php, mode 6, with peer_url / peer_interface_id / peer_session_token covered by the signature. Its row is at seq 5.",
+      "relay": "A",
+      "identity": "gateway",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "challenge_id": "A/gateway/seq5",
+      "challenge_request": {
+        "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f"
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "peer_url": "http://gateway.example.net:4371",
+          "peer_interface_id": "7214caf433be4cdb249dcb17af6b3bb6",
+          "peer_session_token": "9bb933a1933e1dafd827e16b0b13937009780a9af5c507f69d47f28aed7a7dd0"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
+        }
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+          "lp_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+        },
+        {
+          "name": "challenge",
+          "value_hex": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+          "lp_hex": "0030fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a"
+        },
+        {
+          "name": "public_key",
+          "value_hex": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "lp_hex": "0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f"
+        },
+        {
+          "name": "name",
+          "value_hex": "524e5320506f7374496e74657266616365202852657469636861742042726964676529",
+          "lp_hex": "0023524e5320506f7374496e74657266616365202852657469636861742042726964676529"
+        },
+        {
+          "name": "bitrate",
+          "value_hex": "0000000000989680",
+          "lp_hex": "00080000000000989680"
+        },
+        {
+          "name": "mtu",
+          "value_hex": "000001f4",
+          "lp_hex": "0004000001f4"
+        },
+        {
+          "name": "client",
+          "value_hex": "7265746963756c756d2d706870",
+          "lp_hex": "000d7265746963756c756d2d706870"
+        },
+        {
+          "name": "mode",
+          "value_hex": "06",
+          "lp_hex": "000106"
+        },
+        {
+          "name": "transport",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "687474703a2f2f676174657761792e6578616d706c652e6e65743a34333731",
+          "lp_hex": "001f687474703a2f2f676174657761792e6578616d706c652e6e65743a34333731"
+        },
+        {
+          "name": "peer_interface_id",
+          "value_hex": "3732313463616634333362653463646232343964636231376166366233626236",
+          "lp_hex": "00203732313463616634333362653463646232343964636231376166366233626236"
+        },
+        {
+          "name": "peer_session_token",
+          "value_hex": "39626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430",
+          "lp_hex": "004039626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430"
+        }
+      ],
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f76310030fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f4000d7265746963756c756d2d7068700001060000001f687474703a2f2f676174657761792e6578616d706c652e6e65743a3433373100203732313463616634333362653463646232343964636231376166366233626236004039626239333361313933336531646166643832376531366230623133393337303039373830613961663563353037663639643437663238616564376137646430",
+      "signature_hex": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a",
+      "expected": {
+        "status": 200,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "relay_state_after": {
+          "row_registration_seq": 6
+        }
+      },
+      "response_example": {
+        "status": "registered",
+        "interface_id": "c210138800c75dfc4c8f18a2e982592c",
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "session_token_encrypted": "b5d5c0ec1815c7dda0362a63f9e0a42e627e34ca99429f93efda03bd5a80ae68dff09c74bd490c20a85e3ddc0c60bbe1c5c01b11103fb1f184823cfb5954123148e1245b503fc36ccea5f1647a5d48615108763f9316a54149db214c456089b7d9b39668a6a8e5598cdb0ece8a2442063dc7ac393fd763db11e99d6609bbcbf0d83b5fac0a8cb3d0b75fc9e5ffe92e7d77137a90779ecaa885bd2c9c212a031a",
+        "idle_exchange_interval_ms": 1000,
+        "max_batch_packets": 64,
+        "max_packet_bytes": 500
+      },
+      "encrypted_token": {
+        "plaintext_utf8": "616c6e0a06c0405a32e829f59cfbf856f3cc0eb806106fcc730957600a23ebac",
+        "ephemeral_private_hex": "2d23c9b7a09cbaeb2ed1137d3dcae29f7653a0bacaa7b31d42c32a8bfaf8b52b",
+        "ephemeral_public_hex": "b5d5c0ec1815c7dda0362a63f9e0a42e627e34ca99429f93efda03bd5a80ae68",
+        "iv_hex": "dff09c74bd490c20a85e3ddc0c60bbe1",
+        "shared_key_hex": "cf175bfdbaced8fb48faefea416d03b9d1399d0baa43f04419babf87e4ca5f29",
+        "hkdf_salt_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "derived_key_hex": "445e573f3acb2e31ad94fa83b59195ed2f569e4ab55308a0e21cfdec4f94845992bfe8099451f8abb576bd06262b4b5701257c5247782f37d7aeb1ec24dac728",
+        "hmac_key_hex": "445e573f3acb2e31ad94fa83b59195ed2f569e4ab55308a0e21cfdec4f948459",
+        "aes_key_hex": "92bfe8099451f8abb576bd06262b4b5701257c5247782f37d7aeb1ec24dac728",
+        "session_token_encrypted_hex": "b5d5c0ec1815c7dda0362a63f9e0a42e627e34ca99429f93efda03bd5a80ae68dff09c74bd490c20a85e3ddc0c60bbe1c5c01b11103fb1f184823cfb5954123148e1245b503fc36ccea5f1647a5d48615108763f9316a54149db214c456089b7d9b39668a6a8e5598cdb0ece8a2442063dc7ac393fd763db11e99d6609bbcbf0d83b5fac0a8cb3d0b75fc9e5ffe92e7d77137a90779ecaa885bd2c9c212a031a",
+        "length": 160
+      }
+    },
+    {
+      "id": "gateway-poll",
+      "description": "The same gateway identity in poll mode (no wake_url): client rns-post-interface with the transport field, no peer fields (signed as empty strings). First registration, seq 0.",
+      "relay": "A",
+      "identity": "gateway",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "challenge_id": "A/gateway/seq0",
+      "challenge_request": {
+        "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f"
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-post-interface",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "transport": "tcp-backbone-gateway"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
+          "signature": "4f8ceb1ae21c87731d91248486789a43f0d256e3959d1bd655bfb504233998877446689bc1162e919ea58d2ed1d780b8e74031de92c71142df6bef5b3e9d760c"
+        }
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+          "lp_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+        },
+        {
+          "name": "challenge",
+          "value_hex": "20e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a",
+          "lp_hex": "003020e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a"
+        },
+        {
+          "name": "public_key",
+          "value_hex": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "lp_hex": "0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f"
+        },
+        {
+          "name": "name",
+          "value_hex": "524e5320506f7374496e74657266616365202852657469636861742042726964676529",
+          "lp_hex": "0023524e5320506f7374496e74657266616365202852657469636861742042726964676529"
+        },
+        {
+          "name": "bitrate",
+          "value_hex": "0000000000989680",
+          "lp_hex": "00080000000000989680"
+        },
+        {
+          "name": "mtu",
+          "value_hex": "000001f4",
+          "lp_hex": "0004000001f4"
+        },
+        {
+          "name": "client",
+          "value_hex": "726e732d706f73742d696e74657266616365",
+          "lp_hex": "0012726e732d706f73742d696e74657266616365"
+        },
+        {
+          "name": "mode",
+          "value_hex": "06",
+          "lp_hex": "000106"
+        },
+        {
+          "name": "transport",
+          "value_hex": "7463702d6261636b626f6e652d67617465776179",
+          "lp_hex": "00147463702d6261636b626f6e652d67617465776179"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_interface_id",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_session_token",
+          "value_hex": "",
+          "lp_hex": "0000"
+        }
+      ],
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631003020e518b5a9c617d668c944973bee6ff1abbd7317a9f507118ff7496e5cf404aa425cd1cc725fef9705d9508f32bb638a0040e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f0023524e5320506f7374496e74657266616365202852657469636861742042726964676529000800000000009896800004000001f40012726e732d706f73742d696e7465726661636500010600147463702d6261636b626f6e652d67617465776179000000000000",
+      "signature_hex": "4f8ceb1ae21c87731d91248486789a43f0d256e3959d1bd655bfb504233998877446689bc1162e919ea58d2ed1d780b8e74031de92c71142df6bef5b3e9d760c",
+      "expected": {
+        "status": 200,
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "relay_state_after": {
+          "row_registration_seq": 1
+        }
+      },
+      "response_example": {
+        "status": "registered",
+        "interface_id": "cf96d5f296cca0e36a8cd85bcaa2f0ab",
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "session_token_encrypted": "0bf9bf198bb61da608c854c7610c5799217d11028177fdd8487a82a39dcb5132c8ef590bb9ef88a2c2fdb568486c32d395edfd2f50cbd4b5367f44555d540583f974d20ae6747725d72dd5444291a1acdd30fe49c1e82b8225935832aa3f782374e5878c158a0aadb33921924badfe397729ff631a8cad8d337b404c003efc40c4b0eb3eb595106cd9b5570fa51220acb11bcac8c6c20d0de91735e0f8c52a85",
+        "idle_exchange_interval_ms": 1000,
+        "max_batch_packets": 64,
+        "max_packet_bytes": 500
+      },
+      "encrypted_token": {
+        "plaintext_utf8": "4bd58ee1d870ad125da02a1cc52fd9015f30c4841d44f9ce837e754ae7509ea3",
+        "ephemeral_private_hex": "4d8059d7c261b3540040b48a6f07dc5c92f213d0f11835e5468f3ed36234b87f",
+        "ephemeral_public_hex": "0bf9bf198bb61da608c854c7610c5799217d11028177fdd8487a82a39dcb5132",
+        "iv_hex": "c8ef590bb9ef88a2c2fdb568486c32d3",
+        "shared_key_hex": "987f69951cea31c4f78b76086d39a9c1baf28efec1c712f546d471172022cb0f",
+        "hkdf_salt_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "derived_key_hex": "4a30f41d1c37692cdec20ee824bb9d3487d1d2e825bed04af970e5cd865f8d1f60a14bd1f18c057ba4c796a2aa83b6b87e526b564035f48d4e844648d6b0e12b",
+        "hmac_key_hex": "4a30f41d1c37692cdec20ee824bb9d3487d1d2e825bed04af970e5cd865f8d1f",
+        "aes_key_hex": "60a14bd1f18c057ba4c796a2aa83b6b87e526b564035f48d4e844648d6b0e12b",
+        "session_token_encrypted_hex": "0bf9bf198bb61da608c854c7610c5799217d11028177fdd8487a82a39dcb5132c8ef590bb9ef88a2c2fdb568486c32d395edfd2f50cbd4b5367f44555d540583f974d20ae6747725d72dd5444291a1acdd30fe49c1e82b8225935832aa3f782374e5878c158a0aadb33921924badfe397729ff631a8cad8d337b404c003efc40c4b0eb3eb595106cd9b5570fa51220acb11bcac8c6c20d0de91735e0f8c52a85",
+        "length": 160
+      }
+    },
+    {
+      "id": "php-relay-peer",
+      "description": "PHP relay B registering at relay A exactly as a gateway does (section 10): signed with B's persistent relay identity (the identity file), client reticulum-php, mode 1, peer_url = B's canonical host_url, the peer fields random per registration. First registration, seq 0.",
+      "relay": "A",
+      "identity": "relay_b",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "challenge_id": "A/relay_b/seq0",
+      "challenge_request": {
+        "public_key": "5f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef"
+      },
+      "request_body": {
+        "name": "relay-b.example.org",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "Reticulum-post",
+          "mode": 1,
+          "peer_url": "https://relay-b.example.org/reticulum",
+          "peer_interface_id": "d5a190a211e658302a4d56232a925767",
+          "peer_session_token": "26cac23130fc1264cf7f1f3ff9251af4d58a8531492d433e499de2ebb9ea3184"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "5f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef",
+          "challenge": "48f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2",
+          "signature": "3560e0dbba073e8455395f6176f4953298cd8f6e9171fcfeea0eee1a6c79a1438cc6e77492220f8b411c14162e7186f09f0c93f9b7ad799be584cea0f9def106"
+        }
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f72656769737465722f7631",
+          "lp_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631"
+        },
+        {
+          "name": "challenge",
+          "value_hex": "48f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2",
+          "lp_hex": "003048f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec2"
+        },
+        {
+          "name": "public_key",
+          "value_hex": "5f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef",
+          "lp_hex": "00405f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef"
+        },
+        {
+          "name": "name",
+          "value_hex": "72656c61792d622e6578616d706c652e6f7267",
+          "lp_hex": "001372656c61792d622e6578616d706c652e6f7267"
+        },
+        {
+          "name": "bitrate",
+          "value_hex": "00000000000f4240",
+          "lp_hex": "000800000000000f4240"
+        },
+        {
+          "name": "mtu",
+          "value_hex": "000001f4",
+          "lp_hex": "0004000001f4"
+        },
+        {
+          "name": "client",
+          "value_hex": "7265746963756c756d2d706870",
+          "lp_hex": "000d7265746963756c756d2d706870"
+        },
+        {
+          "name": "mode",
+          "value_hex": "01",
+          "lp_hex": "000101"
+        },
+        {
+          "name": "transport",
+          "value_hex": "",
+          "lp_hex": "0000"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "68747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d",
+          "lp_hex": "002568747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d"
+        },
+        {
+          "name": "peer_interface_id",
+          "value_hex": "6435613139306132313165363538333032613464353632333261393235373637",
+          "lp_hex": "00206435613139306132313165363538333032613464353632333261393235373637"
+        },
+        {
+          "name": "peer_session_token",
+          "value_hex": "32366361633233313330666331323634636637663166336666393235316166346435386138353331343932643433336534393964653265626239656133313834",
+          "lp_hex": "004032366361633233313330666331323634636637663166336666393235316166346435386138353331343932643433336534393964653265626239656133313834"
+        }
+      ],
+      "signed_bytes_hex": "001a7265746963756c756d2d706f73742f72656769737465722f7631003048f2b43d0eeb22f1c72e9f8506318059f063f1356c6c41e31065bbf0a976d325626499e9b2de9b8b7fc447631c107ec200405f5554f5f8356564f850f1108c65d6085537c8ab240254955a450745fdfb6155f05cc545232ee358685a4c1a37a2294b818ebb73c41f34abd76bfddb60a50bef001372656c61792d622e6578616d706c652e6f7267000800000000000f42400004000001f4000d7265746963756c756d2d7068700001010000002568747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d00206435613139306132313165363538333032613464353632333261393235373637004032366361633233313330666331323634636637663166336666393235316166346435386138353331343932643433336534393964653265626239656133313834",
+      "signature_hex": "3560e0dbba073e8455395f6176f4953298cd8f6e9171fcfeea0eee1a6c79a1438cc6e77492220f8b411c14162e7186f09f0c93f9b7ad799be584cea0f9def106",
+      "expected": {
+        "status": 200,
+        "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+        "relay_state_after": {
+          "row_registration_seq": 1
+        }
+      },
+      "response_example": {
+        "status": "registered",
+        "interface_id": "6bdacdce9d63742aa7b7dc8115d82ace",
+        "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+        "session_token_encrypted": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad5038324b153a2ae1890e5a35d0c9ca449b165ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb28",
+        "idle_exchange_interval_ms": 1000,
+        "max_batch_packets": 64,
+        "max_packet_bytes": 500
+      },
+      "encrypted_token": {
+        "plaintext_utf8": "fd7c92cc82ef65d2b3345c78f9c969fda4e8e78262df73d1ddd088342f3b42dd",
+        "ephemeral_private_hex": "277b4b6685b2f55e86568e75aa09672c19a54c2fcf13bb51681ff71bff2e5cc1",
+        "ephemeral_public_hex": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad503",
+        "iv_hex": "8324b153a2ae1890e5a35d0c9ca449b1",
+        "shared_key_hex": "cd49fb8baf2d8ce035febd39c697075e4b9d2b214f8918f570195626eb596341",
+        "hkdf_salt_hex": "6dc1140ebf2306f750df931da80bb5be",
+        "derived_key_hex": "376c6e99209d81286db9e60d3fa59400ec48999803dbd6d6231c4816eb7d60b8e7b9f24d3cad7de0720512774fbefe4038967b32d3ad938cf6c242f3c31ca83f",
+        "hmac_key_hex": "376c6e99209d81286db9e60d3fa59400ec48999803dbd6d6231c4816eb7d60b8",
+        "aes_key_hex": "e7b9f24d3cad7de0720512774fbefe4038967b32d3ad938cf6c242f3c31ca83f",
+        "session_token_encrypted_hex": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad5038324b153a2ae1890e5a35d0c9ca449b165ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb28",
+        "length": 160
+      }
+    }
+  ],
+  "negative": [
+    {
+      "id": "tampered-name",
+      "description": "browser-first with the name changed after signing.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web (evil)",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "signature",
+      "expected": {
+        "status": 403,
+        "error": "bad_registration_signature"
+      }
+    },
+    {
+      "id": "tampered-bitrate",
+      "description": "browser-first with bitrate changed after signing.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 2000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "signature",
+      "expected": {
+        "status": 403,
+        "error": "bad_registration_signature"
+      }
+    },
+    {
+      "id": "tampered-peer-url",
+      "description": "gateway-wake with peer_url changed after signing.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "peer_url": "http://attacker.example.net:4371",
+          "peer_interface_id": "7214caf433be4cdb249dcb17af6b3bb6",
+          "peer_session_token": "9bb933a1933e1dafd827e16b0b13937009780a9af5c507f69d47f28aed7a7dd0"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
+        }
+      },
+      "fails_check": "signature",
+      "expected": {
+        "status": 403,
+        "error": "bad_registration_signature"
+      }
+    },
+    {
+      "id": "tampered-peer-session-token",
+      "description": "gateway-wake with peer_session_token changed after signing.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "peer_url": "http://gateway.example.net:4371",
+          "peer_interface_id": "7214caf433be4cdb249dcb17af6b3bb6",
+          "peer_session_token": "142b4617859465808bce87294be75ad056ea6086ed34771d48ce31bbd564c603"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "fee31215af1b72d45defe75e11bfbe31466e8814e5362a53a0eac93cb7d73b218b199682ebdeb9c4d05340f00d08d06a",
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
+        }
+      },
+      "fails_check": "signature",
+      "expected": {
+        "status": 403,
+        "error": "bad_registration_signature"
+      }
+    },
+    {
+      "id": "wrong-key-signature",
+      "description": "browser-first's exact signed bytes, signed by a different identity, presented with the browser's public key.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "effcd397b0f967a56ed90038c0c825592bff62d6c4298905115e033d97067da0cf938671694bfbfe95b392393123232ce9785045bebeeab10c19250203f5ec0f"
+        }
+      },
+      "fails_check": "signature",
+      "expected": {
+        "status": 403,
+        "error": "bad_registration_signature"
+      }
+    },
+    {
+      "id": "replay-after-success",
+      "description": "browser-first replayed verbatim after it succeeded. The signature is valid, but the row is now at seq 1 and the challenge's MAC bound seq 0.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 1,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "challenge",
+      "expected": {
+        "status": 409,
+        "error": "stale_challenge"
+      }
+    },
+    {
+      "id": "old-challenge-lower-seq",
+      "description": "A correctly signed gateway registration over a challenge relay A issued while the row was at seq 4, presented after the row moved to seq 5.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "peer_url": "http://gateway.example.net:4371",
+          "peer_interface_id": "7214caf433be4cdb249dcb17af6b3bb6",
+          "peer_session_token": "9bb933a1933e1dafd827e16b0b13937009780a9af5c507f69d47f28aed7a7dd0"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "1c4f5bb95ae980b7b4ee086555d27da56b95c2975e7fd9ac39eb9e4e8f91f5459eeb277a4f5cd9f2426655d8b8d28b04",
+          "signature": "02819c3877214b1cb4d1c1c13f23a4e187d27b6a46600bc48550e702f22f143c5f2f7e4bd2cdd12d0040d189964bc01feb54b5b8df87c0462c4716b1c7249601"
+        }
+      },
+      "fails_check": "challenge",
+      "expected": {
+        "status": 409,
+        "error": "stale_challenge"
+      }
+    },
+    {
+      "id": "other-relay-mac",
+      "description": "A correctly signed browser registration, addressed to relay A, over a challenge minted by relay B (different relay_secret). Same identity, same seq: only the MAC differs.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "d42a8c8a9bd3a52194348ba49f550dbfbfccc5ef73896cd76bd36f3547750e17d21de8aaba5c462da8b413da2f792492",
+          "signature": "c4e53c6c6082cd5fb76cd17f9dae432bfeff8238b31f477e387147ebb5a8283138768c52b984998a20714224be02da29162cf9af23dcd0d48997c9449f7b180c"
+        }
+      },
+      "fails_check": "challenge",
+      "expected": {
+        "status": 409,
+        "error": "stale_challenge"
+      }
+    },
+    {
+      "id": "challenge-for-other-identity",
+      "description": "The browser signs (validly) a challenge relay A issued for another identity. The MAC covers the identity hash, so it fails for the browser's hash.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "6198cec6b10e8c94b73b371ae393d8a30a917e4bb6f9a25d5b09a3b0f7d64fda97eaedc88ab3193a8bed516e05e041d6",
+          "signature": "25c0f2e77933d907bd3f0b43f98e238d9ef928c96bb6e46945e5bc8e5da164bea8f056d3bbc2947331eefcdd93ce9b5718c0edaa78728f1ec191fa3096f9a304"
+        }
+      },
+      "fails_check": "challenge",
+      "expected": {
+        "status": 409,
+        "error": "stale_challenge"
+      }
+    },
+    {
+      "id": "altered-challenge-nonce",
+      "description": "The browser flips one bit of the nonce inside a real seq-0 challenge and signs the result validly. The MAC no longer matches: a client cannot alter a challenge.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5bb138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "7c849b29088b128deba2eec7834bf8e5b61cc6f90fbc0b6860de26a361d035a9a6a6dd15024971a1fce738dc70777d6bbcbe639af6487dbb89755ba516fabe01"
+        }
+      },
+      "fails_check": "challenge",
+      "expected": {
+        "status": 409,
+        "error": "stale_challenge"
+      }
+    },
+    {
+      "id": "identity-hash-mismatch",
+      "description": "browser-first plus metadata.identity_hash naming another identity (not a signed field, so the signature still verifies).",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1,
+          "identity_hash": "3720edf2045f09b4343f3a5f2f473877"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "metadata_identity_hash",
+      "expected": {
+        "status": 400,
+        "error": "identity_hash_mismatch"
+      }
+    },
+    {
+      "id": "unsigned-metadata",
+      "description": "browser-first plus metadata.wake_url, a key the signature does not cover.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1,
+          "wake_url": "https://attacker.example.net/v1/wake"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "metadata_keys",
+      "expected": {
+        "status": 400,
+        "error": "unsigned_metadata"
+      }
+    },
+    {
+      "id": "uppercase-public-key",
+      "description": "browser-first with the public key in upper-case hex. Hex fields are lower-case only.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "BCF19510832328DBD8C358702009D38A9C3EEB0CC97448F70A34EB112F2CF25230A68D3A14F47435BAFFF78E0095FAB4C5376195CE0B473B62C7B31A4B321596",
+          "challenge": "5ab138262aa3ff7e40d3e0d18156b5b96bc78010ea1616eb57342eb81a75ee1610f5ba999763b15904037774de39808a",
+          "signature": "b1a0d662c1dbbb2c815bddf402f145e51a499085266f24daf539a671b31f6e1215e4ced2e52956751e5c0c602b8b66063ac7357fbd1313f2de6c61622a79b804"
+        }
+      },
+      "fails_check": "shape",
+      "expected": {
+        "status": 400,
+        "error": "bad_registration"
+      }
+    },
+    {
+      "id": "browser-transit-mode",
+      "description": "A correctly signed rns-js registration with mode 6 (gateway). Browsers are endpoints: modes 3, 5 and 6 are refused for client rns-js.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 6
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "134279e040618187e75c5cb2efe83f6fc5863de85a69b094ba0b392673d3c81a905b1e62ddabaeb333d0125a649f6e10",
+          "signature": "1d01c9f369d113860b61f96c17ad65793e71ede057c77c22272219231e93c495587939779215fafd04d7d6069f398ce90c008a8ab813e09386de358eb932f907"
+        }
+      },
+      "fails_check": "client_policy",
+      "expected": {
+        "status": 400,
+        "error": "transit_mode_not_allowed"
+      }
+    },
+    {
+      "id": "browser-with-peer-url",
+      "description": "A correctly signed rns-js registration that names a peer_url. A browser row may not carry peer fields: they would make it look like a PHP peer and draw wakes to any URL.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1,
+          "peer_url": "https://reflector.example.net"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "bcf19510832328dbd8c358702009d38a9c3eeb0cc97448f70a34eb112f2cf25230a68d3a14f47435bafff78e0095fab4c5376195ce0b473b62c7b31a4b321596",
+          "challenge": "55008110922cfbdc945224109b1f2fd585e55657bf4df3491d6d7bf1f741c06f7b63d13f0b3ce355181e0952fbf3d2ac",
+          "signature": "b04366465f54a8e4df12cb3c0f0305a48f8617a6b128e7a47e7d2da5ba918573874e6847617eddc9882f748c57e98c784341391292898867ae11bb5f21867407"
+        }
+      },
+      "fails_check": "client_policy",
+      "expected": {
+        "status": 400,
+        "error": "metadata_not_allowed"
+      }
+    },
+    {
+      "id": "unknown-client",
+      "description": "A correctly signed registration with client \"x\". Only rns-js, reticulum-php and rns-post-interface may register signed.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Something",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "x",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
+          "challenge": "a9b1e38c7adb609ee0ae9575267c0ff8a70192de151b37b8e7213b9c08eab6eae18ad41102ec5c5344c007f0789f795a",
+          "signature": "5d627ec61031a5ed6634529dc494c759d456b7ca08a98dff9fb647c0500cbab0072dec4807be8ae2de520cd5edc8d2b8a9fbc56f8b3b4608b24fc7fcacc3ff01"
+        }
+      },
+      "fails_check": "client_policy",
+      "expected": {
+        "status": 400,
+        "error": "unknown_client"
+      }
+    },
+    {
+      "id": "wake-gateway-without-peer-fields",
+      "description": "The gateway, correctly signed, client reticulum-php with no peer fields. A wake-mode gateway must name where it is woken.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "reticulum-php",
+          "implementation": "PostInterface",
+          "mode": 6
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "54b3c8b80e573988b3ad64345a29825aaa2a69bd76e46d002218a0ed936c035b3e83da2bad98443226918f330328129e",
+          "signature": "345b987f8908e66fb7ec6fd5c60b0e7309449e03363d11207a3702ad43ac1749766374f7c9b696d582b220cadd8300b676d493c2ef729bffbe73fd11d1b9a700"
+        }
+      },
+      "fails_check": "client_policy",
+      "expected": {
+        "status": 400,
+        "error": "peer_fields_required"
+      }
+    },
+    {
+      "id": "poll-gateway-with-peer-url",
+      "description": "The gateway, correctly signed, client rns-post-interface carrying a peer_url. A poll-mode gateway is never woken, so it may not name a URL.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": true,
+        "row_registration_seq": 5,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "RNS PostInterface (Retichat Bridge)",
+        "bitrate": 10000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-post-interface",
+          "implementation": "PostInterface",
+          "mode": 6,
+          "transport": "tcp-backbone-gateway",
+          "peer_url": "http://gateway.example.net:4371"
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "e99dd31ae1903bdb7d23f06bdc634cd8d638963f084d45e0e152d2c86c35dc3b511b1df9eba5bdce0c386ecbc8af32598d878000bf56e9fc8c1c8d299e988d1f",
+          "challenge": "2df8570b517ea7fb7ccb57d81450a7636ba2658b4f15ab7fe102671567175985edc8e664ce945bfa3836ba2af6ef114e",
+          "signature": "377beefee9e1a780f22087b5199c4e1cdf0318b6fddd0fc2e3ba254175eb883d48f73c2ed60d5861568a6add4d19c34b45f531034a399435ef75d0a886adcd0a"
+        }
+      },
+      "fails_check": "client_policy",
+      "expected": {
+        "status": 400,
+        "error": "metadata_not_allowed"
+      }
+    },
+    {
+      "id": "registration-capacity",
+      "description": "A correctly signed first registration (a new row) while relay A's interfaces table is at max_interface_rows and nothing is reclaimable.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": true
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "677897654e0003e3606997a89db859c3ce85221768eee56d33a4f51e51e40b558427d0151e465304f1fb00c048d06385935c406d26d78a4cc56fddedbdc8b80b",
+          "challenge": "d627509aee07f2c39b64944d7f9d091ee0b7d5c9adfbd2736325076c5ef0a564c14fcba5c5cee801464bb704753a9103",
+          "signature": "e642a357eebd61a77b9cc195d2b68d4816d47c484188c27a22008b425468503f2460ceb862df510704327baa555a38f485b1c28843f5617111206d1b14b63d07"
+        }
+      },
+      "fails_check": "capacity",
+      "expected": {
+        "status": 503,
+        "error": "registration_capacity"
+      }
+    },
+    {
+      "id": "low-order-x25519-key",
+      "description": "A correctly signed browser registration whose public key has the all-zero (low-order) X25519 half. The Ed25519 signature verifies, but no token can be encrypted to the key, so the relay refuses it before writing anything.",
+      "relay": "A",
+      "relay_state_before": {
+        "signed_row_exists": false,
+        "row_registration_seq": 0,
+        "at_capacity": false
+      },
+      "request_body": {
+        "name": "Retichat Web",
+        "bitrate": 1000000,
+        "mtu": 500,
+        "metadata": {
+          "client": "rns-js",
+          "implementation": "PostInterface",
+          "mode": 1
+        },
+        "registration": {
+          "version": 1,
+          "public_key": "00000000000000000000000000000000000000000000000000000000000000004abe202cea8f51835a678afe3509c46df531c568d0abf0633ad633116067cc7a",
+          "challenge": "4f4bb20133e73657b033a42adeee97043f00b4b5cee659b6d022c15ede057d7fe383b855a0ca4601a6bc59870e84d96c",
+          "signature": "a6b1d7d56b14dc347e7efbf761018f30d9dbe197cf1a6f95c81127cf6a010aafcf20c1dc8b1092a6caa30111578e14e4c83c931fbd698e5dbbf66909f1a8c90f"
+        }
+      },
+      "fails_check": "token_encryption",
+      "expected": {
+        "status": 400,
+        "error": "bad_registration"
+      }
+    }
+  ],
+  "tokens_negative": [
+    {
+      "id": "token-tampered-ciphertext",
+      "identity": "browser",
+      "description": "browser-first's encrypted token with one ciphertext bit flipped: the HMAC fails, decryption must fail, the client must not use it.",
+      "session_token_encrypted_hex": "c5fb8ea0192ab27fa4cd2909dd2c27fca5ad5a7e59ed74820a6efe4a14e4524b626e50869fb6008149ec34d25ec351384fe8e42bcbf131d964da496214636480df6db807c477fcd2101c40c93f5cee9731fadcce0da9172f65a3011f2cba68ff0b579e6b554a6600014a69a1db3e83c01645b2dd3db84deb08e7067afbca76dbe46458a47b166c5cd33ff6b29200553d6681d1a5f7bc6fe44bc0919066f47e5b",
+      "expected": "decrypt_fails"
+    },
+    {
+      "id": "token-wrong-identity",
+      "identity": "gateway",
+      "description": "browser-first's encrypted token decrypted by the gateway identity: a token is readable only by the identity it was encrypted to.",
+      "session_token_encrypted_hex": "c5fb8ea0192ab27fa4cd2909dd2c27fca5ad5a7e59ed74820a6efe4a14e4524b626e50869fb6008149ec34d25ec351384ee8e42bcbf131d964da496214636480df6db807c477fcd2101c40c93f5cee9731fadcce0da9172f65a3011f2cba68ff0b579e6b554a6600014a69a1db3e83c01645b2dd3db84deb08e7067afbca76dbe46458a47b166c5cd33ff6b29200553d6681d1a5f7bc6fe44bc0919066f47e5b",
+      "expected": "decrypt_fails"
+    }
+  ],
+  "url_canonical": [
+    {
+      "input": "https://retichat.com/reticulum",
+      "note": "already canonical",
+      "canonical": "https://retichat.com/reticulum",
+      "peer_url_key": "e0cf894f9182e725f9a0e8e4581cc47404a83a43a10324125b0b5c4838e4ea1b",
+      "refused": null
+    },
+    {
+      "input": "https://Retichat.COM/reticulum/",
+      "note": "host lower-cased, trailing slash dropped; the path keeps its case",
+      "canonical": "https://retichat.com/reticulum",
+      "peer_url_key": "e0cf894f9182e725f9a0e8e4581cc47404a83a43a10324125b0b5c4838e4ea1b",
+      "refused": null
+    },
+    {
+      "input": "HTTPS://retichat.com:443/reticulum/v1/wake",
+      "note": "scheme lower-cased, default port and /v1/wake dropped",
+      "canonical": "https://retichat.com/reticulum",
+      "peer_url_key": "e0cf894f9182e725f9a0e8e4581cc47404a83a43a10324125b0b5c4838e4ea1b",
+      "refused": null
+    },
+    {
+      "input": "https://retichat.com/reticulum/v1/wake/",
+      "note": "trailing slash, then /v1/wake, dropped",
+      "canonical": "https://retichat.com/reticulum",
+      "peer_url_key": "e0cf894f9182e725f9a0e8e4581cc47404a83a43a10324125b0b5c4838e4ea1b",
+      "refused": null
+    },
+    {
+      "input": "https://RETICHAT.com/Reticulum",
+      "note": "path case is significant: a different key",
+      "canonical": "https://retichat.com/Reticulum",
+      "peer_url_key": "77286e8050933c30bc23b41a041cbc48c23b18441fd3e0144e280332a1dd42b0",
+      "refused": null
+    },
+    {
+      "input": "https://retichat.com",
+      "note": "empty path",
+      "canonical": "https://retichat.com",
+      "peer_url_key": "b33fbe68394e2ea9c398fad5321c09c53a59eb0802fb4a042a7f83d360e64f99",
+      "refused": null
+    },
+    {
+      "input": "https://retichat.com/",
+      "note": "root path",
+      "canonical": "https://retichat.com",
+      "peer_url_key": "b33fbe68394e2ea9c398fad5321c09c53a59eb0802fb4a042a7f83d360e64f99",
+      "refused": null
+    },
+    {
+      "input": "https://retichat.com:8443/reticulum",
+      "note": "a non-default port is kept",
+      "canonical": "https://retichat.com:8443/reticulum",
+      "peer_url_key": "22b12a9b372ba9f2be51c4dcb99be54acf8cddd79649d7d1341069a1c5f43538",
+      "refused": null
+    },
+    {
+      "input": "http://127.0.0.1:4371/",
+      "note": "loopback http (staging)",
+      "canonical": "http://127.0.0.1:4371",
+      "peer_url_key": "835ad50493eef10035da3ea809ae01b9e71b7b88c86cfcb364d2fad677fc57e1",
+      "refused": null
+    },
+    {
+      "input": "http://[::1]:4371",
+      "note": "IPv6 literal",
+      "canonical": "http://[::1]:4371",
+      "peer_url_key": "4555660cfcf89efa425de88550607c150bd95b0d5ae362d6de9bc273448f8328",
+      "refused": null
+    },
+    {
+      "input": "https://xn--rtichat-bya.com/reticulum",
+      "note": "an IDN look-alike in ASCII form: valid, and a different key",
+      "canonical": "https://xn--rtichat-bya.com/reticulum",
+      "peer_url_key": "78856461daca38b32b9d0c868f29b52bb2d22b22922de9df3eb199da76b4fb84",
+      "refused": null
+    },
+    {
+      "input": "https://r\u00e9tichat.com/reticulum",
+      "note": "a non-ASCII look-alike: refused, never folded onto retichat.com",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "not_ascii"
+    },
+    {
+      "input": "https://retichat.com/reticulum ",
+      "note": "whitespace: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "whitespace_or_control"
+    },
+    {
+      "input": "https://user@retichat.com/reticulum",
+      "note": "userinfo: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "userinfo"
+    },
+    {
+      "input": "https://retichat.com/reticulum?x=1",
+      "note": "query: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "query_or_fragment"
+    },
+    {
+      "input": "https://retichat.com/reticulum#top",
+      "note": "fragment: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "query_or_fragment"
+    },
+    {
+      "input": "ftp://retichat.com/reticulum",
+      "note": "scheme other than http(s): refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "scheme"
+    },
+    {
+      "input": "retichat.com/reticulum",
+      "note": "not absolute: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "not_absolute"
+    },
+    {
+      "input": "https://retichat.com:0/reticulum",
+      "note": "port 0: refused",
+      "canonical": null,
+      "peer_url_key": null,
+      "refused": "port"
+    }
+  ],
+  "gateway_confirm": {
+    "domain": "reticulum-post/gateway-confirm/v1",
+    "domain_hex": "7265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631",
+    "path": "/v1/gateway/confirm",
+    "signed_field_order": [
+      "domain",
+      "nonce",
+      "identity_hash",
+      "relay_url",
+      "peer_url"
+    ],
+    "gateway": {
+      "identity": "gateway",
+      "config": {
+        "node_url": "https://relay-a.example.org/reticulum/",
+        "wake_url": "http://gateway.example.net:4371/v1/wake"
+      }
+    },
+    "relay_url": "https://relay-a.example.org/reticulum",
+    "positive": {
+      "id": "gateway-confirm",
+      "description": "Relay A confirms the wake URL stored for the gateway-wake row (canonical peer_url) before it ever wakes it. The gateway's config writes its node_url with a trailing slash: it compares canonical forms.",
+      "row": {
+        "identity": "gateway",
+        "peer_url": "http://gateway.example.net:4371",
+        "peer_url_key": "cae237c4b92d6deccaf4459c197da06e4bcf8e11ad7f72df71c40c52066aa74d"
+      },
+      "request_url": "http://gateway.example.net:4371/v1/gateway/confirm",
+      "request_body": {
+        "version": 1,
+        "nonce": "47e0c3c9956c9ec00f3e328018178229",
+        "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+        "relay_url": "https://relay-a.example.org/reticulum",
+        "peer_url": "http://gateway.example.net:4371"
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631",
+          "lp_hex": "00217265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631"
+        },
+        {
+          "name": "nonce",
+          "value_hex": "47e0c3c9956c9ec00f3e328018178229",
+          "lp_hex": "001047e0c3c9956c9ec00f3e328018178229"
+        },
+        {
+          "name": "identity_hash",
+          "value_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "lp_hex": "001003f43750ef2ba1ad2d3c67c5f358349b"
+        },
+        {
+          "name": "relay_url",
+          "value_hex": "68747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d",
+          "lp_hex": "002568747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "687474703a2f2f676174657761792e6578616d706c652e6e65743a34333731",
+          "lp_hex": "001f687474703a2f2f676174657761792e6578616d706c652e6e65743a34333731"
+        }
+      ],
+      "signed_bytes_hex": "00217265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631001047e0c3c9956c9ec00f3e328018178229001003f43750ef2ba1ad2d3c67c5f358349b002568747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d001f687474703a2f2f676174657761792e6578616d706c652e6e65743a34333731",
+      "signature_hex": "2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f5d32b0a333fdde05c5e21a5690369e6bf9e1fe678d7f1effdb97b3fe4e743001",
+      "response_body": {
+        "signature": "2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f5d32b0a333fdde05c5e21a5690369e6bf9e1fe678d7f1effdb97b3fe4e743001"
+      },
+      "expected_relay": {
+        "result": "confirmed"
+      }
+    },
+    "gateway_refusals": [
+      {
+        "id": "not-my-identity",
+        "description": "A confirm for another identity's row. The gateway signs only for its own transport identity.",
+        "request_body": {
+          "version": 1,
+          "nonce": "47e0c3c9956c9ec00f3e328018178229",
+          "identity_hash": "3720edf2045f09b4343f3a5f2f473877",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "http://gateway.example.net:4371"
+        },
+        "expected": {
+          "status": 403,
+          "error": "not_my_identity"
+        }
+      },
+      {
+        "id": "unknown-relay",
+        "description": "A confirm from a relay this gateway does not register with (its node_url is relay A). The gateway is not a signing oracle for anyone else.",
+        "request_body": {
+          "version": 1,
+          "nonce": "47e0c3c9956c9ec00f3e328018178229",
+          "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "relay_url": "https://relay-b.example.org/reticulum",
+          "peer_url": "http://gateway.example.net:4371"
+        },
+        "expected": {
+          "status": 403,
+          "error": "unknown_relay"
+        }
+      },
+      {
+        "id": "not-my-wake-url",
+        "description": "A confirm naming a wake URL that is not this gateway's own.",
+        "request_body": {
+          "version": 1,
+          "nonce": "47e0c3c9956c9ec00f3e328018178229",
+          "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "http://attacker.example.net:4371"
+        },
+        "expected": {
+          "status": 403,
+          "error": "not_my_wake_url"
+        }
+      },
+      {
+        "id": "bad-nonce",
+        "description": "The nonce in upper-case hex. Hex fields are lower-case only.",
+        "request_body": {
+          "version": 1,
+          "nonce": "47E0C3C9956C9EC00F3E328018178229",
+          "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "http://gateway.example.net:4371"
+        },
+        "expected": {
+          "status": 400,
+          "error": "bad_confirm_request"
+        }
+      },
+      {
+        "id": "extra-key",
+        "description": "A confirm body with a key outside the five.",
+        "request_body": {
+          "version": 1,
+          "nonce": "47e0c3c9956c9ec00f3e328018178229",
+          "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "http://gateway.example.net:4371",
+          "waker_url": "https://relay-a.example.org/reticulum"
+        },
+        "expected": {
+          "status": 400,
+          "error": "bad_confirm_request"
+        }
+      }
+    ],
+    "answer_negative": [
+      {
+        "id": "answer-other-key",
+        "description": "The right bytes, signed by another identity.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "58683202535d5d0c3c3a4c15613543137e491a8ab6e3694c80844b6f306c60075ae33327e66c59418a80ccfca02ed43d32e5d4bce8cf3553a14126d19da20a0f"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      },
+      {
+        "id": "answer-other-nonce",
+        "description": "The gateway's signature over another nonce (an earlier confirm's answer).",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "5bcfabfffa2871413941634a4abc703daa0a39eeb6bc657efde8c9d7b1691335567a32cebbb7d66f043f0a2b76a21b16f81b1db34ba8603c7b58191911df0e00"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      },
+      {
+        "id": "answer-other-peer-url",
+        "description": "The gateway's signature for another wake URL.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "5391b22b377164ebe7f5f0542c250fb92b130d03f971883b412b4ca533791d6fa3c48c02720d6f6b757f99aeaba75efd921f78596e77318cc60612c806544a03"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      },
+      {
+        "id": "answer-other-relay",
+        "description": "The gateway's signature for relay B's confirm.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "afc310b6ce8183d3dc4644fcc77a59c6de833321b52d72611b0303a586a44ef79f931f4b83a54b5b54bdbf79229cfa6b7adb3ac474eb0ab24bf3baf1f0b73604"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      },
+      {
+        "id": "answer-registration-signature",
+        "description": "The gateway's registration signature (vector gateway-wake) offered as the answer. The domains keep the two apart.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "8b8811c932a3f8eb4f9378f7f366960973226e283dbe4b60b7623f0dd380a3fd8052b116790b59199a8dc845d60b1976d73aead20e09bf245cdfbf5d1ec2af0a"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      },
+      {
+        "id": "answer-echo-nonce",
+        "description": "The nonce echoed back. Reaching the URL is not enough: the answer must be signed by the row's key.",
+        "answer_status": 200,
+        "answer_body": {
+          "nonce": "47e0c3c9956c9ec00f3e328018178229"
+        },
+        "expected": {
+          "result": "bad_answer",
+          "reason": "shape"
+        }
+      },
+      {
+        "id": "answer-wake-ok",
+        "description": "What today's wake route answers ({\"status\": \"ok\"}).",
+        "answer_status": 200,
+        "answer_body": {
+          "status": "ok"
+        },
+        "expected": {
+          "result": "bad_answer",
+          "reason": "shape"
+        }
+      },
+      {
+        "id": "answer-uppercase-signature",
+        "description": "The right signature in upper-case hex.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "2085E0334B54B74F152457865C7E4AC4D18059D0C67EEF051FA5902BAC469A8F5D32B0A333FDDE05C5E21A5690369E6BF9E1FE678D7F1EFFDB97B3FE4E743001"
+        },
+        "expected": {
+          "result": "bad_answer",
+          "reason": "shape"
+        }
+      },
+      {
+        "id": "answer-extra-key",
+        "description": "The right signature with a second key.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "2085e0334b54b74f152457865c7e4ac4d18059d0c67eef051fa5902bac469a8f5d32b0a333fdde05c5e21a5690369e6bf9e1fe678d7f1effdb97b3fe4e743001",
+          "status": "ok"
+        },
+        "expected": {
+          "result": "bad_answer",
+          "reason": "shape"
+        }
+      },
+      {
+        "id": "answer-404",
+        "description": "A server without the handler (an older gateway binary) answers 404.",
+        "answer_status": 404,
+        "answer_body": null,
+        "expected": {
+          "result": "bad_answer",
+          "reason": "status"
+        }
+      }
+    ]
+  },
+  "php_relay_peer": {
+    "identity": "relay_b",
+    "identity_file_hex": "c338de5da146fb07d14e183e3b3bc0027ca2684289920b0616fca2e56185028cc76cbb5a93176a779d00ccdc4c9a2219756fc56ec3d951a35a87cc412c21bd4a",
+    "identity_file_layout": "x25519_private(32) || ed25519_seed(32): the 64 bytes RNS Identity.to_file writes",
+    "identity_hash_hex": "6dc1140ebf2306f750df931da80bb5be",
+    "config": {
+      "host_url": "https://relay-b.example.org/reticulum",
+      "interfaces_node_urls": [
+        "https://relay-a.example.org/reticulum/",
+        "https://relay-c.example.org/reticulum"
+      ]
+    },
+    "registration_id": "php-relay-peer",
+    "decrypt": {
+      "registration_id": "php-relay-peer",
+      "session_token_encrypted_hex": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad5038324b153a2ae1890e5a35d0c9ca449b165ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb28",
+      "ephemeral_public_hex": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad503",
+      "iv_hex": "8324b153a2ae1890e5a35d0c9ca449b1",
+      "ciphertext_hex": "65ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98",
+      "hmac_hex": "c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb28",
+      "shared_key_hex": "cd49fb8baf2d8ce035febd39c697075e4b9d2b214f8918f570195626eb596341",
+      "hkdf_salt_hex": "6dc1140ebf2306f750df931da80bb5be",
+      "derived_key_hex": "376c6e99209d81286db9e60d3fa59400ec48999803dbd6d6231c4816eb7d60b8e7b9f24d3cad7de0720512774fbefe4038967b32d3ad938cf6c242f3c31ca83f",
+      "hmac_key_hex": "376c6e99209d81286db9e60d3fa59400ec48999803dbd6d6231c4816eb7d60b8",
+      "aes_key_hex": "e7b9f24d3cad7de0720512774fbefe4038967b32d3ad938cf6c242f3c31ca83f",
+      "expected": {
+        "result": "ok",
+        "session_token": "fd7c92cc82ef65d2b3345c78f9c969fda4e8e78262df73d1ddd088342f3b42dd"
+      }
+    },
+    "decrypt_negative": [
+      {
+        "id": "zero-ephemeral-key",
+        "description": "The good blob with its ephemeral public key replaced by 32 zero bytes: the X25519 result is all zero, so it is refused before any key is derived.",
+        "session_token_encrypted_hex": "00000000000000000000000000000000000000000000000000000000000000008324b153a2ae1890e5a35d0c9ca449b165ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb28",
+        "expected": {
+          "result": "zero_shared_secret"
+        }
+      },
+      {
+        "id": "hmac-flipped",
+        "description": "The good blob with one bit of its HMAC flipped.",
+        "session_token_encrypted_hex": "4661b9868f7412adad9430ada65016d81744d1df7f2b4ad72c89e83330cad5038324b153a2ae1890e5a35d0c9ca449b165ca22b8606b6727aa0e92d9a2401e712ee5a562b2c633f6288367530f6dc7e11b7b64caf8208efaa40cf2f7db674f5a0976dc91a6b6779663677dd5afa4dff93dd69c766dff2be760b2a76032b6cb98c2c38dbbee8243a282bdc314ff7d4c23d6226bc4e8047cd5434cf3060784eb29",
+        "expected": {
+          "result": "hmac"
+        }
+      },
+      {
+        "id": "other-identity",
+        "description": "The gateway-wake vector's token, encrypted to the gateway: the HMAC fails under relay B's keys.",
+        "session_token_encrypted_hex": "b5d5c0ec1815c7dda0362a63f9e0a42e627e34ca99429f93efda03bd5a80ae68dff09c74bd490c20a85e3ddc0c60bbe1c5c01b11103fb1f184823cfb5954123148e1245b503fc36ccea5f1647a5d48615108763f9316a54149db214c456089b7d9b39668a6a8e5598cdb0ece8a2442063dc7ac393fd763db11e99d6609bbcbf0d83b5fac0a8cb3d0b75fc9e5ffe92e7d77137a90779ecaa885bd2c9c212a031a",
+        "expected": {
+          "result": "hmac"
+        }
+      },
+      {
+        "id": "not-a-session-token",
+        "description": "A correctly encrypted blob whose plaintext is not 64 lower-case hex: it decrypts, and is refused as a protocol error.",
+        "session_token_encrypted_hex": "03946270d370ead3044e861b5e6e861874f4394c1d91b2f9955deb312f0d3f43ce74144418057ae7266d393071b7bb9b8c19d55d1a8273c477c59cc55edb1bee7bf426fb1387e3897f31a68919cbe4d13232a2e4629947236d5f7254413e857101dff457759756c93f15c45acbe72a29",
+        "expected": {
+          "result": "not_a_token"
+        }
+      }
+    ],
+    "confirm": {
+      "id": "php-relay-confirm",
+      "description": "Relay A confirms relay B's wake URL (its canonical host_url) after B's registration, before it ever wakes B. B's [interfaces] writes relay A's node_url with a trailing slash: it compares canonical forms.",
+      "request_url": "https://relay-b.example.org/reticulum/v1/gateway/confirm",
+      "request_body": {
+        "version": 1,
+        "nonce": "2450007e0618a300c34e2cff7065b58b",
+        "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+        "relay_url": "https://relay-a.example.org/reticulum",
+        "peer_url": "https://relay-b.example.org/reticulum"
+      },
+      "signed_fields": [
+        {
+          "name": "domain",
+          "value_hex": "7265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631",
+          "lp_hex": "00217265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f7631"
+        },
+        {
+          "name": "nonce",
+          "value_hex": "2450007e0618a300c34e2cff7065b58b",
+          "lp_hex": "00102450007e0618a300c34e2cff7065b58b"
+        },
+        {
+          "name": "identity_hash",
+          "value_hex": "6dc1140ebf2306f750df931da80bb5be",
+          "lp_hex": "00106dc1140ebf2306f750df931da80bb5be"
+        },
+        {
+          "name": "relay_url",
+          "value_hex": "68747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d",
+          "lp_hex": "002568747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d"
+        },
+        {
+          "name": "peer_url",
+          "value_hex": "68747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d",
+          "lp_hex": "002568747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d"
+        }
+      ],
+      "signed_bytes_hex": "00217265746963756c756d2d706f73742f676174657761792d636f6e6669726d2f763100102450007e0618a300c34e2cff7065b58b00106dc1140ebf2306f750df931da80bb5be002568747470733a2f2f72656c61792d612e6578616d706c652e6f72672f7265746963756c756d002568747470733a2f2f72656c61792d622e6578616d706c652e6f72672f7265746963756c756d",
+      "signature_hex": "706d8c70328282cb39014fc3a35630c6f5a345929abddeb213e7251c007dea43fe64cf4447e26e6b507f271ff5f6ae3c96e7dc899d788488a85d9716a076f305",
+      "response_body": {
+        "signature": "706d8c70328282cb39014fc3a35630c6f5a345929abddeb213e7251c007dea43fe64cf4447e26e6b507f271ff5f6ae3c96e7dc899d788488a85d9716a076f305"
+      },
+      "expected_relay": {
+        "result": "confirmed"
+      }
+    },
+    "confirm_refusals": [
+      {
+        "id": "not-my-identity",
+        "description": "A confirm for the gateway's identity, sent to relay B.",
+        "request_body": {
+          "version": 1,
+          "nonce": "2450007e0618a300c34e2cff7065b58b",
+          "identity_hash": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "https://relay-b.example.org/reticulum"
+        },
+        "expected": {
+          "status": 403,
+          "error": "not_my_identity"
+        }
+      },
+      {
+        "id": "unknown-relay",
+        "description": "A confirm from a relay that is not in relay B's [interfaces].",
+        "request_body": {
+          "version": 1,
+          "nonce": "2450007e0618a300c34e2cff7065b58b",
+          "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+          "relay_url": "https://relay-d.example.org/reticulum",
+          "peer_url": "https://relay-b.example.org/reticulum"
+        },
+        "expected": {
+          "status": 403,
+          "error": "unknown_relay"
+        }
+      },
+      {
+        "id": "not-my-wake-url",
+        "description": "A confirm naming relay A's URL as relay B's wake URL.",
+        "request_body": {
+          "version": 1,
+          "nonce": "2450007e0618a300c34e2cff7065b58b",
+          "identity_hash": "6dc1140ebf2306f750df931da80bb5be",
+          "relay_url": "https://relay-a.example.org/reticulum",
+          "peer_url": "https://relay-a.example.org/reticulum"
+        },
+        "expected": {
+          "status": 403,
+          "error": "not_my_wake_url"
+        }
+      }
+    ],
+    "confirm_answer_negative": [
+      {
+        "id": "answer-gateway-key",
+        "description": "The right bytes signed by the gateway's key, not relay B's.",
+        "answer_status": 200,
+        "answer_body": {
+          "signature": "e5763d85f0605ad5e15093492979d95af44b309cdbca375bedee8a6f9486bdfc5f2085c74217db80a7ae71247352da65b2475b77fc1eb7da5df6f4b57304b300"
+        },
+        "expected": {
+          "result": "bad_signature"
+        }
+      }
+    ],
+    "link_order": [
+      {
+        "relay_1": "https://relay-a.example.org/reticulum",
+        "relay_2": "https://relay-b.example.org/reticulum",
+        "note": "the vectors' two relays",
+        "canonical_1": "https://relay-a.example.org/reticulum",
+        "canonical_2": "https://relay-b.example.org/reticulum",
+        "link_is_registration_of": "https://relay-a.example.org/reticulum",
+        "stands_down": "https://relay-b.example.org/reticulum"
+      },
+      {
+        "relay_1": "https://selectivesubconscious.com/reticulum",
+        "relay_2": "https://retichat.com/reticulum",
+        "note": "the live pair",
+        "canonical_1": "https://selectivesubconscious.com/reticulum",
+        "canonical_2": "https://retichat.com/reticulum",
+        "link_is_registration_of": "https://retichat.com/reticulum",
+        "stands_down": "https://selectivesubconscious.com/reticulum"
+      },
+      {
+        "relay_1": "https://relay-a.example.org:8443/reticulum",
+        "relay_2": "https://relay-a.example.org/reticulum",
+        "note": "'/' (0x2f) sorts before ':' (0x3a)",
+        "canonical_1": "https://relay-a.example.org:8443/reticulum",
+        "canonical_2": "https://relay-a.example.org/reticulum",
+        "link_is_registration_of": "https://relay-a.example.org/reticulum",
+        "stands_down": "https://relay-a.example.org:8443/reticulum"
+      },
+      {
+        "relay_1": "https://Relay-B.example.org/reticulum/",
+        "relay_2": "https://relay-a.example.org/reticulum",
+        "note": "compared in canonical form",
+        "canonical_1": "https://relay-b.example.org/reticulum",
+        "canonical_2": "https://relay-a.example.org/reticulum",
+        "link_is_registration_of": "https://relay-a.example.org/reticulum",
+        "stands_down": "https://relay-b.example.org/reticulum"
+      }
+    ],
+    "transport_id": {
+      "rule": "REGISTRATION.md section 10.2 (revision 7): the transport id is the identity hash, SHA-256(x25519_pub || ed25519_pub)[:16] of the identity file, and is the only id the relay writes; the pre-switch id (transport_state.identity_hash_hex) stays its own too",
+      "transport_id_hex": "6dc1140ebf2306f750df931da80bb5be",
+      "pre_switch_transport_id_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+      "own_transport_ids_hex": [
+        "6dc1140ebf2306f750df931da80bb5be",
+        "d0ac3d0d7f0ad6c5f640f400f6c2dd14"
+      ],
+      "sent": {
+        "description": "A link request for the browser's lxmf.delivery destination, as its sender packs it (HEADER_1, hops 0), before it is put into transport.",
+        "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+        "raw_hex": "020052f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+        "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc"
+      },
+      "into_transport": "flags = HEADER_2 << 6 | TRANSPORT << 4 | (flags & 0x0f); raw = flags || hops || next_hop(16) || raw[2:] (RNS 1.5.2 Transport.outbound, Transport.py:1397-1403)",
+      "packets": [
+        {
+          "id": "via-transport-id",
+          "description": "The sender learned its path from an announce relay B relayed after the switch: the next hop is B's transport id. B forwards it.",
+          "next_hop_hex": "6dc1140ebf2306f750df931da80bb5be",
+          "raw_hex": "52006dc1140ebf2306f750df931da80bb5be52f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "6dc1140ebf2306f750df931da80bb5be",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": true
+          }
+        },
+        {
+          "id": "via-pre-switch-id",
+          "description": "The sender learned its path before the switch: the next hop is B's pre-switch id. B still forwards it.",
+          "next_hop_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+          "raw_hex": "5200d0ac3d0d7f0ad6c5f640f400f6c2dd1452f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "d0ac3d0d7f0ad6c5f640f400f6c2dd14",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": true
+          }
+        },
+        {
+          "id": "via-another-node",
+          "description": "The next hop is another transport node (the gateway's identity hash): not B's. B's packet filter refuses it.",
+          "next_hop_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+          "raw_hex": "520003f43750ef2ba1ad2d3c67c5f358349b52f362b69b3bb5cb7cca05c5405c52ce00530b03972786f298cc4875a43aa54c44281db46c9aa18e06b69fb9afe83d922974d2656ce1c4dfef2d60c21368076d16b97ad7e3af02461a28ef318d49448537",
+          "header": {
+            "flags_hex": "52",
+            "hops": 0,
+            "transport_id_hex": "03f43750ef2ba1ad2d3c67c5f358349b",
+            "destination_hash_hex": "52f362b69b3bb5cb7cca05c5405c52ce",
+            "context_hex": "00"
+          },
+          "packet_hash_hex": "2d98d4d4d05e394db684ee90afcab689a6c529e734c47b58bc9451276ea98bdc",
+          "expected": {
+            "own": false,
+            "filter": "transport_id_mismatch"
+          }
+        }
+      ]
+    }
+  }
+}
