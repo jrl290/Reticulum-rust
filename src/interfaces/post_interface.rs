@@ -281,6 +281,13 @@ impl PostInterface {
     /// `registration` proof a browser gives, in wake and poll mode alike.
     /// Never unsigned: both PHP nodes serve the challenge, and a gateway
     /// without its identity is an ordering error, not a reason to fall back.
+    ///
+    /// Deploy order: a PHP node before Reticulum-post 601b7d8 ("A peer or
+    /// gateway may sign the registration it already sends") answers this
+    /// 400 unknown_client, because it lets only rns-js sign, and the gateway
+    /// stays unregistered. So 601b7d8 goes live on every PHP node a gateway
+    /// registers at first (retichat.com needs d27c476 before it), and only
+    /// then is a gateway built with this.
     pub fn register_with_remote(&mut self) -> Result<(), String> {
         let identity = RnsTransport::transport_identity().ok_or(
             "no transport identity to sign the registration with (Transport::start loads it before interfaces are built)",
