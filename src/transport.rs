@@ -4062,14 +4062,23 @@ impl Transport {
         state.interfaces.sort_by(|a, b| b.bitrate.partial_cmp(&a.bitrate).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    /// Whether the §1 half-open warning ("no inbound for 30 s" while sending)
+    /// watches `iface`. Only a connection to one peer can be half-open, so only
+    /// those are watched: a TCP client where the OS's keepalive does not watch
+    /// it (not on linux, android, macos), a TCP server's or Backbone's
+    /// connection, and I2P, whose socket goes to the local router and whose
+    /// keepalive never sees the far end. A radio, BLE, UDP, a serial line, a
+    /// pipe or the local instance is quiet whenever its peers are, and its
+    /// silence says nothing: until 2026-10-18 every interface but a TCP client
+    /// was watched, and an idle BLE link logged this ERROR once a minute (L85).
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     fn inbound_silence_warning_enforced(iface: &InterfaceStub) -> bool {
-        !iface.repr.starts_with("TCPInterface[")
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    fn inbound_silence_warning_enforced(_iface: &InterfaceStub) -> bool {
-        true
+        const OS_KEEPALIVE_WATCHES_TCP: bool = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"));
+        match iface.repr.split('[').next().unwrap_or("") {
+            "TCPInterface" => !OS_KEEPALIVE_WATCHES_TCP,
+            "TCPServerInterface" | "BackboneInterface" | "BackboneClientInterface" | "I2PInterface" => true,
+            _ => false,
+        }
     }
 
     fn should_emit_offline_drop_warning(iface: &mut InterfaceStub, now_secs: f64) -> bool {
@@ -11150,13 +11159,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inbound_silence_warning_kept_for_non_tcp_interfaces() {
-        let iface = InterfaceStub {
-            repr: "SerialInterface[test]".to_string(),
-            ..InterfaceStub::default()
-        };
+    fn inbound_silence_warning_kept_for_connections_to_one_peer() {
+        for repr in [
+            "TCPServerInterface[test/192.0.2.1:4242]",
+            "BackboneInterface[test/192.0.2.1:4242]",
+            "BackboneClientInterface[test/192.0.2.1:4242]",
+            "I2PInterface[test]",
+        ] {
+            let iface = InterfaceStub { repr: repr.to_string(), ..InterfaceStub::default() };
+            assert!(Transport::inbound_silence_warning_enforced(&iface), "{repr}");
+        }
+    }
 
-        assert!(Transport::inbound_silence_warning_enforced(&iface));
+    /// L85: a quiet BLE link (its stub has no repr), radio, serial line, UDP,
+    /// pipe or local instance is not a half-open connection.
+    #[test]
+    fn inbound_silence_warning_not_for_links_that_are_quiet_with_their_peers() {
+        for repr in [
+            "",
+            "RNodeInterface[test]",
+            "SerialInterface[test]",
+            "KISSInterface[test]",
+            "UDPInterface[test/0.0.0.0:4242]",
+            "AutoInterface[test]",
+            "PipeInterface[test]",
+            "LocalInterface[37428]",
+        ] {
+            let iface = InterfaceStub { repr: repr.to_string(), ..InterfaceStub::default() };
+            assert!(!Transport::inbound_silence_warning_enforced(&iface), "{repr:?}");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
