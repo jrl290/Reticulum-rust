@@ -271,10 +271,11 @@ impl PostInterface {
         })
     }
 
-    /// Poll-mode floor, as in the Python PostInterface (`_min_interval`).
-    pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    /// Poll-mode floor, as in the Python PostInterface (`_min_interval`): the node's own
+    /// `idle_exchange_interval_ms` (1 s on both PHP nodes) is used as it is.
+    pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
     /// Before the node has told us its `idle_exchange_interval_ms`.
-    pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
     /// Register at the PHP node, signed with the transport identity
     /// (Reticulum-post REGISTRATION-STAGE1.md): today's body plus the
@@ -1106,8 +1107,10 @@ mod tests {
         let p = PostInterface::new(&cfg(&[])).unwrap();
         assert!(!p.is_wake_mode);
         assert_eq!(p.poll_interval, PostInterface::DEFAULT_POLL_INTERVAL);
+        assert_eq!(p.poll_interval, Duration::from_secs(1));
         let p = PostInterface::new(&cfg(&[("poll_interval_seconds", "0.2")])).unwrap();
         assert_eq!(p.poll_interval, PostInterface::MIN_POLL_INTERVAL, "never below the Python floor");
+        assert_eq!(p.poll_interval, Duration::from_secs(1));
         let p = PostInterface::new(&cfg(&[("poll_interval_seconds", "7.5")])).unwrap();
         assert_eq!(p.poll_interval, Duration::from_secs_f64(7.5));
     }
@@ -1118,7 +1121,7 @@ mod tests {
         let mut p = PostInterface::new(&cfg(&[])).unwrap();
         let from_node = Duration::from_millis(1000).max(PostInterface::MIN_POLL_INTERVAL);
         if p.configured_poll_interval.is_none() { p.poll_interval = from_node; }
-        assert_eq!(p.poll_interval, PostInterface::MIN_POLL_INTERVAL, "1000 ms from the node is floored to 3 s");
+        assert_eq!(p.poll_interval, Duration::from_millis(1000), "the node's 1000 ms is used as it is");
 
         let mut p = PostInterface::new(&cfg(&[("poll_interval_seconds", "10")])).unwrap();
         if p.configured_poll_interval.is_none() { p.poll_interval = from_node; }
