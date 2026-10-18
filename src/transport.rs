@@ -1017,6 +1017,15 @@ pub type InterfaceUpListener = Arc<dyn Fn(&str) + Send + Sync>;
 static INTERFACE_UP_LISTENERS: Lazy<Mutex<Vec<InterfaceUpListener>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+/// Called with an interface's name when it goes offline (a down-edge in
+/// `Transport::set_interface_online`) or is removed while online. With the
+/// up-edge listeners it tells what shows the user how many interfaces are up
+/// to read `Transport::online_interface_names` again, with no timer (L83).
+pub type InterfaceDownListener = Arc<dyn Fn(&str) + Send + Sync>;
+
+static INTERFACE_DOWN_LISTENERS: Lazy<Mutex<Vec<InterfaceDownListener>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
 /// `Transport::interface_up_edges`.
 static INTERFACE_UP_EDGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2017,9 +2026,15 @@ impl Transport {
     }
 
     pub fn deregister_interface_stub(name: &str) {
-        let mut state = TRANSPORT.lock().unwrap();
-        Self::remove_interface_stub_locked(&mut state, name);
-        state.announce_sent_at.retain(|(_, n), _| n != name);
+        let was_online = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let was_online = Self::remove_interface_stub_locked(&mut state, name);
+            state.announce_sent_at.retain(|(_, n), _| n != name);
+            was_online
+        };
+        if was_online {
+            Self::notify_interface_down(name);
+        }
     }
 
     /// Remove a spawned AutoInterface peer (timed out, or replaced by a new
@@ -2031,14 +2046,23 @@ impl Transport {
     /// destinations go, since the refresh sweep never reads them, so what
     /// stays is bounded by published destinations x peer addresses heard.
     pub fn deregister_auto_interface_peer(name: &str) {
-        let mut guard = TRANSPORT.lock().unwrap();
-        let state = &mut *guard;
-        Self::remove_interface_stub_locked(state, name);
-        let published = &state.published_destinations;
-        state.announce_sent_at.retain(|(h, n), _| n != name || published.contains_key(h));
+        let was_online = {
+            let mut guard = TRANSPORT.lock().unwrap();
+            let state = &mut *guard;
+            let was_online = Self::remove_interface_stub_locked(state, name);
+            let published = &state.published_destinations;
+            state.announce_sent_at.retain(|(h, n), _| n != name || published.contains_key(h));
+            was_online
+        };
+        if was_online {
+            Self::notify_interface_down(name);
+        }
     }
 
-    fn remove_interface_stub_locked(state: &mut TransportState, name: &str) {
+    /// Removes the stub; true when it was online.
+    fn remove_interface_stub_locked(state: &mut TransportState, name: &str) -> bool {
+        let was_online = state.interfaces.iter().chain(state.local_client_interfaces.iter())
+            .any(|iface| iface.name == name && iface.online);
         state.interfaces.retain(|iface| iface.name != name);
         state.local_client_interfaces.retain(|iface| iface.name != name);
         state.outbound_handlers.remove(name);
@@ -2046,6 +2070,7 @@ impl Transport {
         state.client_announce_last_sent.remove(name);
         state.pending_local_announces.retain(|(_, n, _)| n != name);
         state.up_edge_pending_interfaces.remove(name);
+        was_online
     }
 
     /// Forget every automatic-announce record (used on shutdown so a stack
@@ -2120,12 +2145,26 @@ impl Transport {
         }
         if transitioned_down {
             log(&format!("Interface {} transitioned offline", name), LOG_NOTICE, false, false);
+            Self::notify_interface_down(name);
         }
     }
 
     /// Be told whenever an interface comes online (see InterfaceUpListener).
     pub fn add_interface_up_listener(listener: InterfaceUpListener) {
         INTERFACE_UP_LISTENERS.lock().unwrap().push(listener);
+    }
+
+    /// Be told whenever an interface goes offline or an online one is removed
+    /// (see InterfaceDownListener).
+    pub fn add_interface_down_listener(listener: InterfaceDownListener) {
+        INTERFACE_DOWN_LISTENERS.lock().unwrap().push(listener);
+    }
+
+    /// The names of the interfaces online now, spawned ones (AutoInterface
+    /// peers, a server's clients) included.
+    pub fn online_interface_names() -> Vec<String> {
+        let state = TRANSPORT.lock().unwrap();
+        state.interfaces.iter().filter(|iface| iface.online).map(|iface| iface.name.clone()).collect()
     }
 
     /// How many up-edges Transport has told its up-edge listeners of, or is
@@ -2152,6 +2191,21 @@ impl Transport {
         // without listeners: the online flag is already set.
         INTERFACE_UP_EDGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let listeners = INTERFACE_UP_LISTENERS.lock().unwrap().clone();
+        if listeners.is_empty() {
+            return;
+        }
+        let name = name.to_string();
+        thread::spawn(move || {
+            for listener in listeners {
+                listener(&name);
+            }
+        });
+    }
+
+    /// Run the down-edge listeners on a thread of their own, as the up-edge
+    /// ones: the caller can be an interface's own thread.
+    fn notify_interface_down(name: &str) {
+        let listeners = INTERFACE_DOWN_LISTENERS.lock().unwrap().clone();
         if listeners.is_empty() {
             return;
         }
@@ -9969,6 +10023,53 @@ pub(crate) mod tests {
 
         Transport::set_interface_online(name, true);
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "each up-edge is reported");
+    }
+
+    /// L83 (2026-10-18): an interface going offline, or removed while online,
+    /// is reported to the down-edge listeners, once and off the caller's
+    /// thread; an up-edge, an interface already offline, or one removed while
+    /// offline reports nothing. `online_interface_names` reads what is up at
+    /// each edge, so Android's Settings can show the live count.
+    #[test]
+    fn an_interface_down_edge_is_reported_to_the_down_listeners_once() {
+        use std::sync::mpsc;
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+        let name = "test-down-listener";
+        let register = |online: bool| {
+            let mut stub_config = InterfaceStubConfig::default();
+            stub_config.name = name.to_string();
+            stub_config.online = Some(online);
+            stub_config.out = true;
+            stub_config.mode = InterfaceStub::MODE_FULL;
+            Transport::register_interface_stub_config(stub_config);
+        };
+        register(true);
+        assert!(Transport::online_interface_names().iter().any(|n| n == name));
+
+        let (tx, rx) = mpsc::channel::<std::thread::ThreadId>();
+        let tx = Mutex::new(tx);
+        Transport::add_interface_down_listener(Arc::new(move |down: &str| {
+            if down == name {
+                let _ = tx.lock().unwrap().send(std::thread::current().id());
+            }
+        }));
+
+        Transport::set_interface_online(name, false);
+        let reporter = rx.recv_timeout(Duration::from_secs(5)).expect("the down-edge is reported");
+        assert_ne!(reporter, std::thread::current().id(), "reported off the caller's thread");
+        assert!(!Transport::online_interface_names().iter().any(|n| n == name), "and it is no longer listed online");
+
+        Transport::set_interface_online(name, false); // already offline: no edge
+        Transport::set_interface_online(name, true); // an up-edge
+        // A report would arrive at once; the bound only ends the wait.
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "no down-edge, nothing reported");
+
+        Transport::deregister_interface_stub(name); // removed while online
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "removing an online interface is a down-edge");
+        register(false);
+        Transport::deregister_interface_stub(name); // removed while offline
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "removing an offline one is not");
     }
 
     /// Each up-edge is counted (`interface_up_edges`) once, after the
