@@ -2018,6 +2018,9 @@ pub struct Link {
     pub keepalive_timeout_factor: f64,
     pub keepalive: f64,
     pub stale_time: f64,
+    /// A responder's copy of the initiator's keepalive, from the rtt its
+    /// LRRTT reported; the pong gate waits this long, not `keepalive` (L73).
+    pub initiator_keepalive: Option<f64>,
     pub stale_since: Option<u64>,
     pub stale_grace: f64,
     pub establishment_timeout: f64,
@@ -2136,6 +2139,7 @@ impl Clone for Link {
             keepalive_timeout_factor: self.keepalive_timeout_factor,
             keepalive: self.keepalive,
             stale_time: self.stale_time,
+            initiator_keepalive: self.initiator_keepalive,
             stale_since: self.stale_since,
             stale_grace: self.stale_grace,
             establishment_timeout: self.establishment_timeout,
@@ -2404,6 +2408,7 @@ impl Link {
             keepalive_timeout_factor: KEEPALIVE_TIMEOUT_FACTOR,
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
+            initiator_keepalive: None,
             stale_since: None,
             stale_grace: STALE_GRACE,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
@@ -2479,6 +2484,7 @@ impl Link {
             keepalive_timeout_factor: KEEPALIVE_TIMEOUT_FACTOR,
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
+            initiator_keepalive: None,
             stale_since: None,
             stale_grace: STALE_GRACE,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
@@ -3832,8 +3838,14 @@ impl Link {
         // are the responder so the initiator's stale timer also resets.
         if packet.context == crate::packet::KEEPALIVE {
             // RNS/Link.py:1131 (1.5.2): the pong is only sent when nothing
-            // else went out within the last keepalive period.
-            let pong_due = current_time().unwrap_or(0) >= self.last_outbound + self.keepalive as u64;
+            // else went out within the last keepalive period. Departure (L73,
+            // James 10-01): the initiator's period, not ours. Our rtt is
+            // max(measured, the initiator's), so our keepalive can be the
+            // longer one (rfed over the PHP node: 220 s against the web's
+            // 109 s), and gated by it every ping went unanswered until the
+            // initiator's stale time closed the link.
+            let pong_period = self.initiator_keepalive.unwrap_or(self.keepalive);
+            let pong_due = current_time().unwrap_or(0) >= self.last_outbound + pong_period as u64;
             if !self.initiator && packet.data.as_slice() == [0xFFu8] && pong_due {
                 if let Some((dest, _link_id)) = self.prepare_keepalive() {
                     let mut reply = Packet::new(
@@ -4122,6 +4134,7 @@ impl Link {
 
         let peer_rtt: f64 = from_slice(plaintext).map_err(|e| format!("Invalid LRRTT payload: {}", e))?;
         self.rtt = Some(measured_rtt.max(peer_rtt));
+        self.initiator_keepalive = Some(keepalive_for_rtt(peer_rtt));
         self.status = STATE_ACTIVE;
         self.state = STATE_ACTIVE;
         self.activated_at = current_time();
@@ -5628,6 +5641,54 @@ mod tests {
              and silently dropped the ping — the exact regression we are guarding \
              against"
         );
+    }
+
+    fn keepalive_ping(link: &Link) -> Packet {
+        let dest = link.destination.lock().unwrap().clone();
+        Packet::new(
+            Some(dest),
+            vec![0xFFu8],
+            DATA,
+            crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        )
+    }
+
+    /// L73 (2026-10-18): a responder answers a ping by the initiator's
+    /// keepalive, not its own. Its rtt is max(measured, the initiator's)
+    /// (RNS/Link.py rtt_packet), so its keepalive is never the shorter one,
+    /// and over the PHP node it was about twice the web's: rfed measured
+    /// ~1.07 s against the web's ~0.53 s, a 220 s keepalive against the web's
+    /// 109 s ping and 218 s stale time. Gated by its own keepalive
+    /// (RNS/Link.py:1132), rfed left every ping unanswered and the web's idle
+    /// rfed.link timed out every ~4 min.
+    #[test]
+    fn a_responder_answers_pings_by_the_initiators_keepalive() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(31)).collect();
+        let mut link = make_incoming_link(link_id);
+        link.request_time = Some(now_seconds() - 1.07);
+        link.handle_lrrtt_packet(&to_vec(&0.53f64).unwrap()).expect("lrrtt");
+        let initiator_keepalive = keepalive_for_rtt(0.53);
+        assert!(link.keepalive > 2.0 * initiator_keepalive - 10.0, "the responder's own keepalive is the measured one");
+
+        // Quiet past the initiator's keepalive, though not past its own: the
+        // initiator's ping must be answered before its stale time.
+        let now = current_time().unwrap();
+        link.last_outbound = now - (initiator_keepalive as u64 + 5);
+        link.handle_data_packet(&keepalive_ping(&link)).unwrap();
+        assert_eq!(link.last_keepalive, now, "the ping went unanswered");
+
+        // Parity kept: anything sent within the initiator's keepalive already
+        // told it the link is alive, so no pong.
+        link.last_outbound = now - 30;
+        link.last_keepalive = 0;
+        link.handle_data_packet(&keepalive_ping(&link)).unwrap();
+        assert_eq!(link.last_keepalive, 0, "a pong went out although the link was not quiet");
     }
 
     /// RNS/Link.py __receive: every inbound packet but a keepalive refreshes
