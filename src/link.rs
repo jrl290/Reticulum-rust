@@ -858,11 +858,48 @@ fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
     }
 }
 
+/// The one msgpack value in `bytes` (nil for none). RNS/Link.py packs the
+/// value it is given, so it never sends bytes that are not one value; a
+/// caller here hands pre-encoded bytes, and anything but exactly one value
+/// is refused. Until 2026-10-18 bytes that did not decode went as nil and
+/// bytes whose start decoded went cut to that start, with no error.
+fn one_msgpack_value(bytes: &[u8], what: &str) -> Result<rmpv::Value, String> {
+    if bytes.is_empty() {
+        return Ok(rmpv::Value::Nil);
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value = rmpv_read_value(&mut cursor)
+        .map_err(|e| format!("{what} is not a msgpack value ({e}): raw bytes go as a msgpack bin"))?;
+    let used = cursor.position() as usize;
+    if used != bytes.len() {
+        return Err(format!(
+            "{what} has {} bytes after its first msgpack value ({used} of {}): raw bytes go as a msgpack bin",
+            bytes.len() - used,
+            bytes.len()
+        ));
+    }
+    Ok(value)
+}
+
+/// A request's wire form, `[timestamp, path_hash, <data value>]`
+/// (RNS/Link.py request(): `umsgpack.packb([time.time(), path_hash, data])`).
+fn pack_request(timestamp: f64, path: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    let outer = rmpv::Value::Array(vec![
+        rmpv::Value::F64(timestamp),
+        rmpv::Value::Binary(identity::truncated_hash(path.as_bytes())),
+        one_msgpack_value(data, "request data")?,
+    ]);
+    let mut packed = Vec::new();
+    rmpv_write_value(&mut packed, &outer).map_err(|e| format!("Failed to encode request payload: {}", e))?;
+    Ok(packed)
+}
+
 /// A response's wire form, `[bin request_id, <response value>]`
 /// (RNS/Link.py handle_request: `umsgpack.packb([request_id, response])`).
 /// The handler's bytes are already one msgpack value and go in as they are,
 /// never wrapped in a bin.
 fn pack_response(request_id: &[u8], response: &[u8]) -> Result<Vec<u8>, String> {
+    one_msgpack_value(response, "response")?;
     let mut packed = Vec::with_capacity(response.len() + request_id.len() + 4);
     rmp::encode::write_array_len(&mut packed, 2).map_err(|e| e.to_string())?;
     rmp::encode::write_bin(&mut packed, request_id).map_err(|e| e.to_string())?;
@@ -4609,28 +4646,10 @@ impl Link {
         // RNS/Link.py request(): `if timeout == None: timeout = self.rtt *
         // self.traffic_timeout_factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125`
         let timeout = timeout.unwrap_or_else(|| self.request_timeout());
-        // Python RNS wire format: [timestamp_f64, path_hash_16bytes, data_bytes]
-        let path_hash = identity::truncated_hash(path.as_bytes());
+        // RNS/Link.py request(): `umsgpack.packb([time.time(), path_hash, data])`,
+        // with `data` the value itself, never double-encoded as a bin.
         let timestamp = current_time().unwrap_or(0) as f64;
-        let payload = RequestPayload(
-            timestamp,
-            serde_bytes::ByteBuf::from(path_hash),
-            serde_bytes::ByteBuf::from(data),
-        );
-
-        // Python wire format: msgpack.packb([timestamp_f64, path_hash_bytes, data])
-        // where `data` is the VALUE itself — not double-encoded as bin.
-        // We decode our pre-encoded `data` bytes back to an rmpv Value so we can
-        // embed it inline in the outer array (matching Python's msgpack.packb behaviour).
-        let data_value = rmpv_read_value(&mut std::io::Cursor::new(&payload.2.as_ref()))
-            .unwrap_or(rmpv::Value::Nil);
-        let outer_value = rmpv::Value::Array(vec![
-            rmpv::Value::F64(payload.0),
-            rmpv::Value::Binary(payload.1.into_vec()),
-            data_value,
-        ]);
-        let mut payload_data = Vec::new();
-        rmpv_write_value(&mut payload_data, &outer_value).map_err(|e| format!("Failed to encode request payload: {}", e))?;
+        let payload_data = pack_request(timestamp, &path, &data)?;
 
         // RNS/Link.py request(): `if len(packed_request) <= self.mdu` it is a
         // single REQUEST packet, otherwise the same bytes go as a Resource.
@@ -5360,6 +5379,39 @@ fn now_seconds() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RNS/Link.py request() and handle_request() take a value and pack it
+    /// (`umsgpack.packb([time.time(), path_hash, data])`, `packb([request_id,
+    /// response])`), so the reference can never send bytes that are not one
+    /// value. Here the caller hands pre-encoded bytes. Until 2026-10-18 bytes
+    /// that did not decode went as nil, and bytes whose start decoded went
+    /// cut to that start: both phone apps sent a channel post bare, its
+    /// channel hash (0x9a...) decoded as a 10-element array, and rfed got 44
+    /// of its 300 bytes, changed (staging, 2026-10-18).
+    #[test]
+    fn a_request_or_response_is_exactly_one_msgpack_value_or_refused() {
+        let post: Vec<u8> = [0x9a, 0x5e, 0x1b, 0xed, 0x3d, 0x16, 0x82, 0xf2, 0x55, 0xf4, 0x11, 0xd2, 0x15, 0xc2, 0x23, 0x62]
+            .iter().copied().chain(std::iter::repeat(0x41).take(284)).collect();
+        assert!(pack_request(1.0, "/channel/publish", &post).is_err(), "bare bytes whose start decodes are refused");
+        assert!(pack_request(1.0, "/channel/publish", &[0xc4, 0x05, 0x01]).is_err(), "bytes that are no value are refused");
+
+        let mut bin = vec![0xc5, 0x01, 0x2c];
+        bin.extend_from_slice(&post);
+        let packed = pack_request(1.0, "/channel/publish", &bin).expect("a bin is one value");
+        let outer = rmpv_read_value(&mut std::io::Cursor::new(&packed)).expect("packed");
+        let items = outer.as_array().expect("array");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].as_slice(), Some(identity::truncated_hash(b"/channel/publish").as_slice()));
+        assert_eq!(items[2].as_slice(), Some(post.as_slice()), "the post arrives whole");
+
+        let none = pack_request(1.0, "/x", &[]).expect("no data");
+        let outer = rmpv_read_value(&mut std::io::Cursor::new(&none)).expect("packed");
+        assert!(outer.as_array().expect("array")[2].is_nil(), "no data is nil, as request(path) sends None");
+
+        assert!(pack_response(&[1; 16], &[0xc3]).is_ok());
+        assert!(pack_response(&[1; 16], &[0xc3, 0xc3]).is_err(), "a response with bytes after its value is refused");
+        assert!(pack_response(&[1; 16], &[0xc4, 0x05, 0x01]).is_err(), "a response that is no value is refused");
+    }
 
     /// The hand-packed link DATA packet behind `send_packet` and
     /// `send_packet_with_receipt` carries a payload over the link MDU as one
@@ -7153,7 +7205,10 @@ mod tests {
         let (interface, frames) = CarryingInterface::register("ProvenCompressTest", true);
         for (seed, auto_compress) in [(247u8, false), (251u8, true)] {
             let (link, _registry) = live_keyed_link_on(seed, STATE_ACTIVE, Some("ProvenCompressTest"));
-            link.send_proven_response(vec![seed; 16], vec![0x41; 4096], auto_compress, Arc::new(|_: bool| {}));
+            // One msgpack value (a bin of 4096 bytes), as every handler returns.
+            let mut response = vec![0xc5, 0x10, 0x00];
+            response.extend_from_slice(&[0x41; 4096]);
+            link.send_proven_response(vec![seed; 16], response, auto_compress, Arc::new(|_: bool| {}));
             let link_id = link.link_id();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let advertisement = loop {
