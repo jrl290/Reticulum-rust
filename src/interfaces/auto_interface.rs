@@ -59,6 +59,18 @@ pub const ALL_IGNORE_IFS: &[&str] = &["lo0"];
 pub const DARWIN_IGNORE_IFS: &[&str] = &["awdl0", "llw0", "lo0", "en5"];
 pub const ANDROID_IGNORE_IFS: &[&str] = &["dummy0", "lo", "tun0"];
 
+/// Darwin interface name prefixes that never carry the local network's
+/// multicast: VPN and system tunnels (utun0, utun1, ...: on 2026-10-12
+/// Retichat on Mac Catalyst took utun2 and logged "No multicast echoes
+/// received"), IPsec, and cellular data (pdp_ip0, ...).
+pub const DARWIN_IGNORE_IF_PREFIXES: &[&str] = &["utun", "ipsec", "pdp_ip"];
+
+/// Whether AutoInterface skips `ifname` on macOS, iOS and Mac Catalyst.
+pub fn darwin_ignored(ifname: &str) -> bool {
+    DARWIN_IGNORE_IFS.contains(&ifname)
+        || DARWIN_IGNORE_IF_PREFIXES.iter().any(|p| ifname.starts_with(p))
+}
+
 /// How often a blocked socket read wakes to see whether the interface was
 /// detached.
 const SOCKET_WAKE: Duration = Duration::from_secs(1);
@@ -585,10 +597,12 @@ impl AutoInterface {
             return true;
         }
 
-        #[cfg(target_os = "macos")]
-        if DARWIN_IGNORE_IFS.contains(&ifname) && !self.allowed_interfaces.contains(&ifname.to_string()) {
+        // iOS and Mac Catalyst too (both target_os = "ios"): until 2026-10-19
+        // only macOS skipped these, and Retichat on Mac Catalyst took utun2.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if darwin_ignored(ifname) && !self.allowed_interfaces.contains(&ifname.to_string()) {
             log(
-                &format!("{} skipping Darwin AWDL or tethering interface {}", self, ifname),
+                &format!("{} skipping Darwin AWDL, tethering, tunnel or cellular interface {}", self, ifname),
                 crate::LOG_EXTREME,
                 false,
                 false,
@@ -1353,6 +1367,16 @@ impl std::fmt::Display for AutoInterfacePeer {
 mod tests {
     use std::collections::HashSet;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn darwin_skips_tunnels_and_cellular_but_not_wifi_or_ethernet() {
+        for skipped in ["awdl0", "llw0", "lo0", "en5", "utun0", "utun2", "ipsec0", "pdp_ip0"] {
+            assert!(super::darwin_ignored(skipped), "{skipped}");
+        }
+        for kept in ["en0", "en1", "bridge100", "ap1"] {
+            assert!(!super::darwin_ignored(kept), "{kept}");
+        }
+    }
 
     /// After detach every thread of the interface ends (each holds an Arc),
     /// its data listeners close and no peer is added. Until 2026-10-19
