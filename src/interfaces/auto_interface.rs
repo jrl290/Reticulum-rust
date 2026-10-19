@@ -59,6 +59,15 @@ pub const ALL_IGNORE_IFS: &[&str] = &["lo0"];
 pub const DARWIN_IGNORE_IFS: &[&str] = &["awdl0", "llw0", "lo0", "en5"];
 pub const ANDROID_IGNORE_IFS: &[&str] = &["dummy0", "lo", "tun0"];
 
+/// How often a blocked socket read wakes to see whether the interface was
+/// detached.
+const SOCKET_WAKE: Duration = Duration::from_secs(1);
+
+/// A read that timed out only to wake ([`SOCKET_WAKE`]), not a failure.
+fn is_wake(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
 pub const BITRATE_GUESS: u64 = 10_000_000;
 
 pub const MULTI_IF_DEQUE_LEN: usize = 48;
@@ -120,6 +129,9 @@ pub struct AutoInterface {
     pub initial_echoes: Arc<Mutex<HashMap<String, f64>>>,
     pub timed_out_interfaces: Arc<Mutex<HashMap<String, bool>>>,
     pub carrier_changed: Arc<AtomicBool>,
+    /// Set by [`AutoInterface::detach`]: every thread of this interface
+    /// (discovery, announce, data and peer jobs) ends, and no peer is added.
+    pub detached: Arc<AtomicBool>,
 
     // Duplicate packet detection across multiple interfaces
     pub mif_deque: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -225,6 +237,7 @@ impl AutoInterface {
             initial_echoes: Arc::new(Mutex::new(HashMap::new())),
             timed_out_interfaces: Arc::new(Mutex::new(HashMap::new())),
             carrier_changed: Arc::new(AtomicBool::new(false)),
+            detached: Arc::new(AtomicBool::new(false)),
 
             mif_deque: Arc::new(Mutex::new(VecDeque::with_capacity(MULTI_IF_DEQUE_LEN))),
             mif_deque_times: Arc::new(Mutex::new(VecDeque::with_capacity(MULTI_IF_DEQUE_LEN))),
@@ -336,6 +349,9 @@ impl AutoInterface {
             .map_err(|e| format!("Failed to bind unicast discovery socket: {}", e))?;
 
         let unicast_udp: UdpSocket = unicast_socket.into();
+        unicast_udp
+            .set_read_timeout(Some(SOCKET_WAKE))
+            .map_err(|e| format!("Failed to set unicast discovery socket timeout: {}", e))?;
         let unicast_iface = Arc::clone(self);
         let ifname_unicast = ifname.to_string();
         thread::spawn(move || {
@@ -372,6 +388,9 @@ impl AutoInterface {
             .map_err(|e| format!("Failed to bind multicast discovery socket: {}", e))?;
 
         let mcast_udp: UdpSocket = mcast_socket.into();
+        mcast_udp
+            .set_read_timeout(Some(SOCKET_WAKE))
+            .map_err(|e| format!("Failed to set multicast discovery socket timeout: {}", e))?;
         let mcast_iface = Arc::clone(self);
         let ifname_mcast = ifname.to_string();
         thread::spawn(move || {
@@ -591,6 +610,28 @@ impl AutoInterface {
         false
     }
 
+    /// Stop the interface for good (the stack is shutting down): its threads
+    /// end within [`SOCKET_WAKE`] (peer jobs within a peer job interval), its
+    /// data sockets close, and every peer goes offline and leaves Transport.
+    /// Until 2026-10-19 nothing stopped an AutoInterface, so a library
+    /// restarted in the same process (Retichat turning its Local network
+    /// switch off) kept the old one discovering and adding peers.
+    pub fn detach(&self) {
+        if self.detached.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.online.store(false, Ordering::SeqCst);
+        let listeners: Vec<String> = self.interface_listeners.lock().unwrap().keys().cloned().collect();
+        for ifname in listeners {
+            self.stop_data_listener(&ifname);
+        }
+        let peers: Vec<String> = self.peers.lock().unwrap().keys().cloned().collect();
+        for peer_addr in peers {
+            self.remove_peer(&peer_addr);
+        }
+        log(&format!("{} detached", self), crate::LOG_VERBOSE, false, false);
+    }
+
     pub fn final_init(self: &Arc<Self>) {
         let peering_wait = self.announce_interval * 1.2;
         log(
@@ -639,6 +680,9 @@ impl AutoInterface {
         socket
             .bind(&SockAddr::from(bind_addr))
             .map_err(|e| format!("Failed to bind data socket: {}", e))?;
+        socket
+            .set_read_timeout(Some(SOCKET_WAKE))
+            .map_err(|e| format!("Failed to set data socket timeout: {}", e))?;
         let socket = Arc::new(socket);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -649,7 +693,7 @@ impl AutoInterface {
         let socket_clone = Arc::clone(&socket);
         thread::spawn(move || {
             let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); 65536];
-            while !stop_clone.load(Ordering::SeqCst) {
+            while !stop_clone.load(Ordering::SeqCst) && !iface.detached.load(Ordering::SeqCst) {
                 match socket_clone.recv_from(&mut buf) {
                     Ok((size, addr)) => {
                         if let Some(std::net::SocketAddr::V6(src)) = addr.as_socket() {
@@ -659,6 +703,7 @@ impl AutoInterface {
                             iface.process_incoming(data, src, &ifname_str);
                         }
                     }
+                    Err(e) if is_wake(&e) => continue,
                     Err(_) => break,
                 }
             }
@@ -704,7 +749,7 @@ impl AutoInterface {
         }
 
         let mut buf = [0u8; 1024];
-        loop {
+        while !self.detached.load(Ordering::SeqCst) {
             match socket.recv_from(&mut buf) {
                 Ok((size, addr)) => {
                     if !self.final_init_done.load(Ordering::SeqCst) {
@@ -737,13 +782,14 @@ impl AutoInterface {
                         );
                     }
                 }
+                Err(e) if is_wake(&e) => continue,
                 Err(_) => break,
             }
         }
     }
 
     fn announce_handler(self: &Arc<Self>, ifname: &str) {
-        loop {
+        while !self.detached.load(Ordering::SeqCst) {
             self.peer_announce(ifname);
             thread::sleep(Duration::from_secs_f64(self.announce_interval));
         }
@@ -845,6 +891,9 @@ impl AutoInterface {
     fn peer_jobs(self: &Arc<Self>) {
         loop {
             thread::sleep(Duration::from_secs_f64(self.peer_job_interval));
+            if self.detached.load(Ordering::SeqCst) {
+                break;
+            }
             let now = Self::now();
 
             // Check for timed out peers
@@ -1001,6 +1050,9 @@ impl AutoInterface {
     }
 
     pub fn add_peer(&self, addr: &str, ifname: &str) {
+        if self.detached.load(Ordering::SeqCst) {
+            return;
+        }
         // Check if this is our own multicast echo
         if self.link_local_addresses.lock().unwrap().contains(&addr.to_string()) {
             let mut matched_if = None;
@@ -1301,6 +1353,49 @@ impl std::fmt::Display for AutoInterfacePeer {
 mod tests {
     use std::collections::HashSet;
     use std::net::Ipv6Addr;
+
+    /// After detach every thread of the interface ends (each holds an Arc),
+    /// its data listeners close and no peer is added. Until 2026-10-19
+    /// nothing stopped an AutoInterface: Retichat turning its Local network
+    /// switch off restarted the stack and left the old one discovering and
+    /// adding peers. Ports of its own, so a running rnsd doesn't interfere; a
+    /// host with no link-local address adopts nothing and passes trivially.
+    #[test]
+    fn detach_ends_every_thread_and_adds_no_peer() {
+        use super::{AutoInterface, AutoInterfaceConfig};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let iface = AutoInterface::new(AutoInterfaceConfig {
+            name: "detach test".to_string(),
+            group_id: Some("retichat-detach-test".to_string()),
+            discovery_scope: None,
+            discovery_port: Some(39716),
+            multicast_address_type: None,
+            data_port: Some(52671),
+            allowed_interfaces: None,
+            ignored_interfaces: None,
+            configured_bitrate: None,
+            stub_config: Default::default(),
+        })
+        .expect("AutoInterface::new");
+        iface.final_init();
+        assert!(iface.online.load(Ordering::SeqCst));
+
+        iface.detach();
+        assert!(!iface.online.load(Ordering::SeqCst));
+        assert!(iface.interface_listeners.lock().unwrap().is_empty());
+        iface.add_peer("fe80::1", "en0");
+        assert!(iface.peers.lock().unwrap().is_empty());
+
+        // Socket reads wake every second; peer jobs every PEER_JOB_INTERVAL.
+        let deadline = Instant::now() + Duration::from_secs_f64(super::PEER_JOB_INTERVAL + 3.0);
+        while Arc::strong_count(&iface) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(Arc::strong_count(&iface), 1, "a thread of the detached interface is still running");
+    }
 
     /// A link-local address with any scope embedded in bytes 2-3 cleared
     /// (Darwin's kernel form), so the two listings compare equal.

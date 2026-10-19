@@ -2226,10 +2226,17 @@ pub fn exit_handler() {
         if let Some(ref rns_arc) = *instance_guard {
             if let Ok(rns) = rns_arc.try_lock() {
                 for iface in &rns.system_interfaces {
-                    if let SystemInterface::TcpClient(ref tcp_arc) = iface {
-                        if let Ok(mut tcp) = tcp_arc.lock() {
-                            tcp.detach();
+                    match iface {
+                        SystemInterface::TcpClient(ref tcp_arc) => {
+                            if let Ok(mut tcp) = tcp_arc.lock() {
+                                tcp.detach();
+                            }
                         }
+                        // Its discovery, announce and peer threads hold their
+                        // own Arc and run until detached, adding peers to
+                        // Transport after a restart (Retichat 2026-10-19).
+                        SystemInterface::Auto(ref auto) => auto.detach(),
+                        _ => {}
                     }
                 }
             }
