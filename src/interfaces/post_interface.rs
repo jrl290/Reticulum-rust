@@ -142,6 +142,10 @@ pub struct PostInterface {
     pub wake_listen_host: Option<String>,
     pub wake_listen_port: Option<u16>,
     exchange_signal: Arc<(Mutex<bool>, Condvar)>,
+    /// Tests only: the identity `register_with_remote` signs with, in place
+    /// of the transport's.
+    #[cfg(test)]
+    test_identity: Option<Identity>,
 }
 
 fn generate_hex(bytes: usize) -> String {
@@ -268,6 +272,8 @@ impl PostInterface {
             wake_listen_host,
             wake_listen_port,
             exchange_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            #[cfg(test)]
+            test_identity: None,
         })
     }
 
@@ -276,6 +282,17 @@ impl PostInterface {
     pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
     /// Before the node has told us its `idle_exchange_interval_ms`.
     pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The registration cadence (DESIGN_PRINCIPLES.md §3, James's exception
+    /// for the gateway's registration; Reticulum-post REGISTRATION.md §11.5):
+    /// after the n-th failed registration in a row the next one is made
+    /// `min(2 s × 2^(n−1), 5 min)` later; with none failed, at once.
+    pub fn registration_backoff(failures: u32) -> Duration {
+        match failures {
+            0 => Duration::ZERO,
+            n => Duration::from_secs((2u64 << (n - 1).min(8)).min(300)),
+        }
+    }
 
     /// Register at the PHP node, signed with the transport identity
     /// (Reticulum-post REGISTRATION-STAGE1.md): today's body plus the
@@ -290,6 +307,10 @@ impl PostInterface {
     /// registers at first (retichat.com needs d27c476 before it), and only
     /// then is a gateway built with this.
     pub fn register_with_remote(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(identity) = self.test_identity.clone() {
+            return self.register_signed(&identity);
+        }
         let identity = RnsTransport::transport_identity().ok_or(
             "no transport identity to sign the registration with (Transport::start loads it before interfaces are built)",
         )?;
@@ -753,6 +774,12 @@ impl PostInterface {
     /// the PHP node.  If PHP returns `delivery_more: true`, the worker
     /// immediately exchanges again.  When there is no more work, it goes
     /// back to waiting on the signal.
+    ///
+    /// While it holds no session (the first registration failed, or an
+    /// exchange got 401/403) it waits for no signal: none can come, because
+    /// Transport sends nothing to an offline interface and the node does not
+    /// know it to wake it. It registers again on the
+    /// [`Self::registration_backoff`] cadence instead, in both modes.
     pub fn start_exchange_worker(iface: Arc<Mutex<PostInterface>>) {
         let running = {
             let guard = iface.lock().unwrap();
@@ -780,12 +807,22 @@ impl PostInterface {
         }
 
         thread::spawn(move || {
+            // Failed registrations in a row, and when the next is due.
+            let mut registration_failures: u32 = 0;
+            let mut next_registration = Instant::now();
+            // Whether the current session has carried an exchange: a 401 on
+            // its first is a failed registration (REGISTRATION.md §11.4).
+            let mut session_exchanged = false;
+
             // Initial setup: register and wire outbound handler
             {
                 let mut guard = iface.lock().unwrap();
                 if let Err(e) = guard.register_with_remote() {
+                    registration_failures = 1;
+                    let delay = Self::registration_backoff(registration_failures);
+                    next_registration = Instant::now() + delay;
                     log(
-                        &format!("PostInterface initial registration failed: {}. Will retry on first exchange.", e),
+                        &format!("PostInterface initial registration at {} failed: {}. Next attempt in {} s.", guard.node_url, e, delay.as_secs()),
                         crate::LOG_ERROR, false, false,
                     );
                 }
@@ -838,17 +875,27 @@ impl PostInterface {
                 // dropped as "no usable path". Found on the private staging
                 // network on its first run; masked in production by public
                 // backbones that never stay quiet that long.
+                //
+                // Without a session there is nothing to signal: the worker
+                // waits for the next registration instead, and a wake in the
+                // meantime starts nothing (REGISTRATION.md §11.5).
                 {
-                    let (is_wake, interval) = {
+                    let (is_wake, interval, registered) = {
                         let guard = iface.lock().unwrap();
-                        (guard.is_wake_mode, guard.poll_interval)
+                        (guard.is_wake_mode, guard.poll_interval, guard.interface_id.is_some())
                     };
                     let (lock, cvar) = &*exchange_signal;
                     let mut triggered = lock.lock().unwrap();
-                    while !*triggered && running.load(Ordering::SeqCst) {
-                        let due = if is_wake { None } else { Some(interval.saturating_sub(last_exchange.elapsed())) };
+                    while running.load(Ordering::SeqCst) && !(registered && *triggered) {
+                        let due = if !registered {
+                            Some(next_registration.saturating_duration_since(Instant::now()))
+                        } else if is_wake {
+                            None
+                        } else {
+                            Some(interval.saturating_sub(last_exchange.elapsed()))
+                        };
                         if due == Some(Duration::ZERO) {
-                            break; // poll interval elapsed: exchange now
+                            break; // registration or poll interval due: go now
                         }
                         let slice = due.unwrap_or(Duration::from_secs(1)).min(Duration::from_secs(1));
                         let (guard, _timeout) = cvar.wait_timeout(triggered, slice).unwrap();
@@ -868,12 +915,17 @@ impl PostInterface {
                         let mut guard = iface.lock().unwrap();
                         if guard.interface_id.is_none() {
                             match guard.register_with_remote() {
-                                Ok(()) => consecutive_errors = 0,
+                                Ok(()) => {
+                                    consecutive_errors = 0;
+                                    session_exchanged = false;
+                                }
                                 Err(e) => {
-                                    consecutive_errors += 1;
-                                    log(&format!("PostInterface re-registration failed: {}", e),
+                                    registration_failures += 1;
+                                    let delay = Self::registration_backoff(registration_failures);
+                                    next_registration = Instant::now() + delay;
+                                    log(&format!("PostInterface re-registration at {} failed: {}. Next attempt in {} s.", guard.node_url, e, delay.as_secs()),
                                         crate::LOG_ERROR, false, false);
-                                    break; // try again after backoff
+                                    break; // the wait above holds the backoff
                                 }
                             }
                         }
@@ -885,8 +937,22 @@ impl PostInterface {
                         let mut guard = iface.lock().unwrap();
                         if guard.interface_id.is_some() {
                             match guard.exchange() {
-                                Ok(r) => Some(r),
+                                Ok(r) => {
+                                    // The session works: its registration succeeded.
+                                    session_exchanged = true;
+                                    registration_failures = 0;
+                                    Some(r)
+                                }
                                 Err(e) => {
+                                    if guard.interface_id.is_none() {
+                                        // Session lost (401/403): register again at
+                                        // once, or after the backoff if the session
+                                        // never carried an exchange.
+                                        if !session_exchanged {
+                                            registration_failures += 1;
+                                        }
+                                        next_registration = Instant::now() + Self::registration_backoff(registration_failures);
+                                    }
                                     consecutive_errors += 1;
                                     if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
                                         log(
@@ -920,6 +986,10 @@ impl PostInterface {
                             consecutive_errors = 0;
                         }
                         None => {
+                            // Session lost: the wait above registers again.
+                            if iface.lock().unwrap().interface_id.is_none() {
+                                break;
+                            }
                             // Exchange failed — backoff then retry
                             let backoff = (consecutive_errors as f64).min(60.0);
                             thread::sleep(Duration::from_secs_f64(backoff));
@@ -1294,6 +1364,133 @@ mod tests {
             assert!(seen.iter().all(|(path, body)| path != "/v1/interfaces/register" || body.get("registration").is_some()), "{what}: never unsigned");
             assert!(p.session_token.is_none() && p.interface_id.is_none() && !p.base.online, "{what}");
         }
+    }
+
+    // ── The worker registers again by itself, on the backoff ─────────────
+    //
+    // 2026-10-18: retichat.com moved to a fresh SQLite, the gateway's next
+    // exchange got 401, and the wake-mode worker went back to waiting for a
+    // signal that could not come: Transport sends nothing to an offline
+    // interface, and the node no longer knew the gateway to wake it. It
+    // stayed offline until rnsd restarted.
+
+    fn signal(p: &Arc<Mutex<PostInterface>>) {
+        let s = Arc::clone(&p.lock().unwrap().exchange_signal);
+        let (lock, cvar) = &*s;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+    }
+
+    /// The paths the fake node has seen, once there are `n` of them or
+    /// `within` has passed.
+    fn seen_after(seen: &Seen, n: usize, within: Duration) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            let paths: Vec<String> = seen.lock().unwrap().iter().map(|(p, _)| p.clone()).collect();
+            if paths.len() >= n || start.elapsed() >= within {
+                return paths;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A wake-mode gateway worker at `url`, signing with the vector identity.
+    fn start_wake_worker(url: &str, name: &str) -> Arc<Mutex<PostInterface>> {
+        let doc = vectors::doc();
+        let mut p = vector_gateway(url, vectors::registration(&doc, "gateway-wake"));
+        p.base.name = Some(name.into());
+        p.test_identity = Some(vectors::identity(&doc, "gateway"));
+        let p = Arc::new(Mutex::new(p));
+        PostInterface::start_exchange_worker(Arc::clone(&p));
+        p
+    }
+
+    fn registration_answers() -> (Value, Value) {
+        let doc = vectors::doc();
+        let v = vectors::registration(&doc, "gateway-wake");
+        let c = vectors::challenge(&doc, v["challenge_id"].as_str().unwrap())["challenge_response"].clone();
+        (c, v["response_example"].clone())
+    }
+
+    const CHALLENGE: &str = "/v1/interfaces/challenge";
+    const REGISTER: &str = "/v1/interfaces/register";
+    const EXCHANGE: &str = "/v1/interfaces/exchange";
+
+    #[test]
+    fn the_registration_backoff_is_2_s_doubling_to_5_min() {
+        let secs: Vec<u64> = (0..12).map(|n| PostInterface::registration_backoff(n).as_secs()).collect();
+        assert_eq!(secs, [0, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+        assert_eq!(PostInterface::registration_backoff(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_wake_gateway_registers_again_by_itself_after_a_401() {
+        let (challenge, registered) = registration_answers();
+        let ok = json!({"status": "ok"});
+        let (url, seen) = fake_php_node(vec![
+            (200, challenge.clone()),
+            (200, registered.clone()),
+            (200, ok.clone()),
+            (401, refusal("unknown_session")),
+            (200, challenge),
+            (200, registered),
+            (200, ok),
+        ]);
+        let p = start_wake_worker(&url, "post-test-401");
+        assert_eq!(seen_after(&seen, 2, Duration::from_secs(5)).len(), 2, "registered at start");
+        signal(&p);
+        assert_eq!(seen_after(&seen, 3, Duration::from_secs(5)).len(), 3, "one exchange in the session");
+        signal(&p);
+        // No signal after the 401: the worker registers again on its own.
+        let paths = seen_after(&seen, 7, Duration::from_secs(3));
+        p.lock().unwrap().shutdown();
+        assert_eq!(paths, [CHALLENGE, REGISTER, EXCHANGE, EXCHANGE, CHALLENGE, REGISTER, EXCHANGE]);
+        assert!(p.lock().unwrap().interface_id.is_some() && p.lock().unwrap().base.online);
+    }
+
+    #[test]
+    fn a_failed_registration_is_made_again_after_the_backoff_not_at_once() {
+        let (challenge, registered) = registration_answers();
+        let (url, seen) = fake_php_node(vec![
+            (503, refusal("unavailable")),
+            (200, challenge),
+            (200, registered),
+        ]);
+        let p = start_wake_worker(&url, "post-test-refused");
+        assert_eq!(seen_after(&seen, 1, Duration::from_secs(5)).len(), 1);
+        let failed = Instant::now();
+        let paths = seen_after(&seen, 3, Duration::from_secs(5));
+        let waited = failed.elapsed();
+        p.lock().unwrap().shutdown();
+        assert_eq!(paths, [CHALLENGE, CHALLENGE, REGISTER]);
+        assert!(waited >= Duration::from_millis(1500) && waited < Duration::from_secs(3), "the first delay is 2 s, waited {waited:?}");
+        assert!(p.lock().unwrap().interface_id.is_some());
+    }
+
+    /// A 401 on the first exchange of a session is a failed registration
+    /// (REGISTRATION.md §11.4 `session_lost_at_once`): a node that grants
+    /// sessions and loses them at once gets one registration per delay.
+    #[test]
+    fn a_401_on_the_first_exchange_of_a_session_waits_out_the_backoff() {
+        let (challenge, registered) = registration_answers();
+        let (url, seen) = fake_php_node(vec![
+            (200, challenge.clone()),
+            (200, registered.clone()),
+            (401, refusal("unknown_session")),
+            (200, challenge),
+            (200, registered),
+            (200, json!({"status": "ok"})),
+        ]);
+        let p = start_wake_worker(&url, "post-test-401-at-once");
+        assert_eq!(seen_after(&seen, 2, Duration::from_secs(5)).len(), 2);
+        signal(&p);
+        assert_eq!(seen_after(&seen, 3, Duration::from_secs(5)).len(), 3);
+        let lost = Instant::now();
+        let paths = seen_after(&seen, 6, Duration::from_secs(5));
+        let waited = lost.elapsed();
+        p.lock().unwrap().shutdown();
+        assert_eq!(paths, [CHALLENGE, REGISTER, EXCHANGE, CHALLENGE, REGISTER, EXCHANGE]);
+        assert!(waited >= Duration::from_millis(1500) && waited < Duration::from_secs(3), "the first delay is 2 s, waited {waited:?}");
     }
 }
 
