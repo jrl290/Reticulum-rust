@@ -1383,8 +1383,10 @@ impl Reticulum {
                 .iter()
                 .map(|(name, section)| (name.clone(), section.clone()))
                 .collect();
+            let mut dialled = Self::dial_tcp_clients(&entries);
             for (name, section) in entries {
-                self.synthesize_interface(&section, &name, true);
+                let dialled = dialled.remove(&name);
+                self.synthesize_interface(&section, &name, true, dialled);
             }
         }
         log("System interfaces are ready", LOG_VERBOSE, false, false);
@@ -1447,16 +1449,75 @@ impl Reticulum {
         base.ifac_signature = stub.ifac_signature.clone();
     }
 
-    fn synthesize_interface(&mut self, config: &ConfigSection, name: &str, instance_init: bool) {
+    /// An interface section's settings as the interface constructors take
+    /// them: its items plus its name.
+    fn interface_config_map(config: &ConfigSection, name: &str) -> HashMap<String, String> {
         let mut config_map = HashMap::new();
         for (key, value) in config.items() {
             config_map.insert(key.to_string(), value.to_string());
         }
         config_map.insert("name".to_string(), name.to_string());
+        config_map
+    }
 
-        let enabled = config.get_bool("interface_enabled").unwrap_or(false)
-            || config.get_bool("enabled").unwrap_or(false);
-        if !enabled {
+    fn interface_enabled(config: &ConfigSection) -> bool {
+        config.get_bool("interface_enabled").unwrap_or(false)
+            || config.get_bool("enabled").unwrap_or(false)
+    }
+
+    /// Creates every enabled TCPClientInterface in `entries`, each with its
+    /// initial connect done (or failed: it is then pending, and its read loop
+    /// reconnects it), by name.
+    ///
+    /// They are dialled at once, one thread each, so start-up waits for the
+    /// slowest connect instead of the sum of them all (up to 5 s each, see
+    /// INITIAL_CONNECT_TIMEOUT). Separate interfaces are independent
+    /// (DESIGN_PRINCIPLES §5). Only the dial runs here: load_system_interfaces
+    /// still registers each one and synthesizes its tunnel, in turn, before
+    /// start-up returns.
+    fn dial_tcp_clients(
+        entries: &[(String, ConfigSection)],
+    ) -> HashMap<String, Result<crate::interfaces::tcp_interface::TcpClientInterface, String>> {
+        use crate::interfaces::tcp_interface::TcpClientInterface;
+        thread::scope(|scope| {
+            let dials: Vec<_> = entries
+                .iter()
+                .filter(|(_, section)| {
+                    Self::interface_enabled(section) && section.get("type") == Some("TCPClientInterface")
+                })
+                .map(|(name, section)| {
+                    let config_map = Self::interface_config_map(section, name);
+                    let dial = thread::Builder::new()
+                        .name(format!("tcp_dial_{}", name))
+                        .spawn_scoped(scope, move || TcpClientInterface::new(&config_map))
+                        .map_err(|e| e.to_string());
+                    (name.clone(), dial)
+                })
+                .collect();
+            dials
+                .into_iter()
+                .map(|(name, dial)| {
+                    let created = dial.and_then(|handle| {
+                        handle.join().unwrap_or_else(|_| Err("its dial panicked".to_string()))
+                    });
+                    (name, created)
+                })
+                .collect()
+        })
+    }
+
+    /// `dialled`: the TCPClientInterface [`Self::dial_tcp_clients`] created
+    /// for this section, if it did; otherwise it is created here.
+    fn synthesize_interface(
+        &mut self,
+        config: &ConfigSection,
+        name: &str,
+        instance_init: bool,
+        dialled: Option<Result<crate::interfaces::tcp_interface::TcpClientInterface, String>>,
+    ) {
+        let config_map = Self::interface_config_map(config, name);
+
+        if !Self::interface_enabled(config) {
             log(&format!("Skipping disabled interface \"{}\"", name), LOG_DEBUG, false, false);
             return;
         }
@@ -1646,7 +1707,10 @@ impl Reticulum {
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
                 "TCPClientInterface" => {
-                    match crate::interfaces::tcp_interface::TcpClientInterface::new(&config_map) {
+                    let created = dialled.unwrap_or_else(|| {
+                        crate::interfaces::tcp_interface::TcpClientInterface::new(&config_map)
+                    });
+                    match created {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
                             stub_config.online = Some(interface.base.online && !interface.detached);
@@ -2492,5 +2556,66 @@ mod tests {
     fn queued_announce_constants_match_the_reference() {
         assert_eq!(MAX_QUEUED_ANNOUNCES, 4096, "RNS/Reticulum.py:111");
         assert_eq!(QUEUED_ANNOUNCE_LIFE, 60.0 * 60.0 * 3.0, "RNS/Reticulum.py:112");
+    }
+
+    // Start-up dialled its TCP client interfaces one after another, so a
+    // backbone slow to answer held up every one after it, and the stack's
+    // start with them: on the Android emulator (2026-10-21) three default
+    // backbones took 0.13 s, 0.03 s and 1.1 s in turn. They are dialled at
+    // once now. Each is still registered and its tunnel synthesized before
+    // start-up returns (synthesize_interface), as before.
+    #[test]
+    fn tcp_client_interfaces_are_dialled_at_once() {
+        use std::time::Instant;
+        // TEST-NET-1 (RFC 5737) is never routed: a connect there waits out its timeout.
+        let unanswered = |n: u8| {
+            format!(
+                "  [[Slow{n}]]\n    type = TCPClientInterface\n    enabled = yes\n    \
+                 target_host = 192.0.2.{n}\n    target_port = 4242\n    connect_timeout = 1\n"
+            )
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let text = format!(
+            "[interfaces]\n{}{}  [[Fast]]\n    type = TCPClientInterface\n    enabled = yes\n    \
+             target_host = 127.0.0.1\n    target_port = {port}\n  [[Off]]\n    type = TCPClientInterface\n    \
+             enabled = no\n    target_host = 127.0.0.1\n    target_port = {port}\n",
+            unanswered(1),
+            unanswered(2)
+        );
+        let config = Config::from_str(&text);
+        let entries: Vec<(String, ConfigSection)> = config
+            .get_section("interfaces")
+            .expect("interfaces section")
+            .subsections()
+            .iter()
+            .map(|(name, section)| (name.clone(), section.clone()))
+            .collect();
+        assert_eq!(entries.len(), 4);
+
+        // Where TEST-NET-1 is refused at once (no route at all) the dials
+        // can't show their order.
+        let probe = Instant::now();
+        let refused = TcpStream::connect_timeout(&"192.0.2.9:4242".parse().unwrap(), Duration::from_secs(1)).is_ok()
+            || probe.elapsed() < Duration::from_millis(900);
+        if refused {
+            eprintln!("skipped: a connect to 192.0.2.9 doesn't wait out its timeout here");
+            return;
+        }
+
+        let start = Instant::now();
+        let dialled = Reticulum::dial_tcp_clients(&entries);
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_millis(1_800),
+            "two unanswered 1 s connects one after the other take 2 s; at once 1 s. Took {:?}",
+            took
+        );
+        assert_eq!(dialled.len(), 3, "the disabled one isn't dialled");
+        assert!(dialled["Fast"].as_ref().expect("Fast created").base.online, "Fast connected");
+        for slow in ["Slow1", "Slow2"] {
+            let iface = dialled[slow].as_ref().expect("a failed dial still creates the interface");
+            assert!(!iface.base.online && iface.never_connected, "{} pending, for its read loop", slow);
+        }
     }
 }
