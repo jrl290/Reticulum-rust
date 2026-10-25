@@ -8,7 +8,9 @@ A Rust implementation of the [Reticulum Network Stack](https://reticulum.network
 
 ## About
 
-Rusticulum is a from-scratch Rust port of the [Python Reticulum reference implementation](https://github.com/markqvist/Reticulum) (v1.1.3). The project aims to bring the Reticulum protocol to environments where Rust's performance, safety, and cross-compilation strengths are beneficial — embedded systems, mobile applications via FFI, and high-throughput transport nodes.
+Rusticulum is a Rust port of the [Python Reticulum reference implementation](https://github.com/markqvist/Reticulum) (v1.1.3). The project aims to bring the Reticulum protocol to environments where Rust's performance, safety, and cross-compilation strengths are beneficial — embedded systems, mobile applications via FFI, and high-throughput transport nodes.
+
+It is written for our own projects (RFed, Retichat and the gateway node) and is not offered as an alternative Reticulum implementation. For Reticulum itself, use the [reference implementation](https://github.com/markqvist/Reticulum).
 
 ### AI-Assisted Development
 
@@ -142,7 +144,7 @@ src/
 
 ## License
 
-This project is provided under the same spirit as the Reticulum ecosystem. See [LICENSE](LICENSE) for details.
+This is a port of Mark Qvist's Reticulum and is distributed under the same license as the reference implementation, the Reticulum License, including its conditions: the software may not be used in systems that can purposefully harm people, or to build AI, machine-learning or language-model training datasets. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
