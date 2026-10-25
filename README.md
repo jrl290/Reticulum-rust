@@ -146,6 +146,8 @@ src/
 
 This is a port of Mark Qvist's Reticulum and is distributed under the same license as the reference implementation, the Reticulum License, including its conditions: the software may not be used in systems that can purposefully harm people, or to build AI, machine-learning or language-model training datasets. See [LICENSE](LICENSE).
 
+We follow the license as written. When Mark Qvist introduced the AI condition, he explained that it does not restrict which tools a developer uses ([his reply of 17 April 2025](https://github.com/markqvist/Reticulum/discussions/790#discussioncomment-12871253)).
+
 ## Acknowledgments
 
 - **Mark Qvist** — Creator of the [Reticulum Network Stack](https://reticulum.network/) and the Python reference implementation
