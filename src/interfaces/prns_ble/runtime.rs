@@ -10,22 +10,23 @@
 //!   last;
 //! - `prns-ble-timer`: the handshake ceiling.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
-use rand::RngCore;
 
-use super::engine::{Characteristic, Effect, Engine, LinkState};
-use super::wire::{self, Endpoint, IDENTITY_LEN};
+use ::prns_ble::engine::{Characteristic, Effect, Engine, Level, LinkState};
+use ::prns_ble::identity::{self, Loaded};
+use ::prns_ble::wire::{Endpoint, IDENTITY_LEN};
+use ::prns_ble::{BITRATE, MAX_QUEUED_PACKETS};
 use crate::transport::{InterfaceStub, InterfaceStubConfig, Transport};
 
-/// Link bitrate Prns assumes for a Bluetooth peer (`policy.rs`), and RTNode
-/// registers for its Bluetooth slots.
-pub const BITRATE: u64 = 700_000;
+// A link's queue holds a whole Resource window: a part dropped there costs
+// the receiver a wait and a re-request.
+const _: () = assert!(MAX_QUEUED_PACKETS > crate::resource::Resource::WINDOW_MAX_FAST);
 
 /// What the platform's Bluetooth code does for the engine. Called on
 /// engine-internal threads as well as the caller's; implementations hand the
@@ -64,27 +65,26 @@ fn log(message: &str, level: i32) {
     crate::log(&format!("[PRNS-BLE] {message}"), level, false, false);
 }
 
-/// Loads `<storage_dir>/ble_identity` (the record Prns writes), creating it
-/// on first use. The identity persists by design: RTNode keys the phone's
-/// interface by it.
-pub fn load_or_create_identity(storage_dir: &Path) -> Result<[u8; IDENTITY_LEN], String> {
-    let path: PathBuf = storage_dir.join("ble_identity");
-    match std::fs::read(&path) {
-        Ok(record) => match wire::decode_identity_record(&record) {
-            Ok(identity) => return Ok(identity),
-            Err(why) => log(&format!("{}: {why}; writing a new identity", path.display()), crate::LOG_ERROR),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+fn log_level(level: Level) -> i32 {
+    match level {
+        Level::Error => crate::LOG_ERROR,
+        Level::Warning => crate::LOG_WARNING,
+        Level::Notice => crate::LOG_NOTICE,
+        Level::Debug => crate::LOG_DEBUG,
     }
-    let mut identity = [0u8; IDENTITY_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut identity);
-    std::fs::create_dir_all(storage_dir).map_err(|e| format!("cannot create {}: {e}", storage_dir.display()))?;
-    let temp = storage_dir.join("ble_identity.tmp");
-    std::fs::write(&temp, wire::encode_identity_record(&identity)).map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
-    std::fs::rename(&temp, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    log(&format!("new Bluetooth identity {}", crate::hexrep(&identity, false)), crate::LOG_NOTICE);
-    Ok(identity)
+}
+
+/// Loads `<storage_dir>/ble_identity` (the record Prns writes), creating it
+/// on first use (`prns_ble::identity`).
+pub fn load_or_create_identity(storage_dir: &Path) -> Result<[u8; IDENTITY_LEN], String> {
+    let loaded = identity::load_or_create(storage_dir)?;
+    if let Loaded::Created { identity, damaged } = &loaded {
+        if let Some(why) = damaged {
+            log(&format!("{why}; wrote a new identity"), crate::LOG_ERROR);
+        }
+        log(&format!("new Bluetooth identity {}", crate::hexrep(identity, false)), crate::LOG_NOTICE);
+    }
+    Ok(loaded.identity())
 }
 
 /// Starts the engine. The stack must be running and the app's destinations
@@ -251,7 +251,7 @@ fn run_host(host: &Arc<dyn Host>, effects: Vec<Effect>) {
             Effect::State { link, state, peer, interface } => host.link_state(link, state, peer.as_ref(), interface.as_deref()),
             // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
             Effect::CheckLate { label, sent_at_unix } => crate::send_assertion::assert_send_completed_in_time(label, sent_at_unix),
-            Effect::Log { level, message } => log(&message, level),
+            Effect::Log { level, message } => log(&message, log_level(level)),
             Effect::Register { .. } | Effect::HandOver { .. } | Effect::Deregister { .. } | Effect::Inbound { .. } => {}
         }
     }
@@ -321,32 +321,5 @@ fn timer_loop() {
         // link_ready (or stop) bumps the generation and wakes this thread.
         let wait = next.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(Duration::from_secs(3600));
         let _ = condvar.wait_timeout(guard, wait);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_identity_is_created_once_and_then_read_back() {
-        let dir = std::env::temp_dir().join(format!("prns-ble-identity-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let first = load_or_create_identity(&dir).unwrap();
-        assert_eq!(load_or_create_identity(&dir).unwrap(), first);
-        let record = std::fs::read(dir.join("ble_identity")).unwrap();
-        assert_eq!(wire::decode_identity_record(&record), Ok(first));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_damaged_identity_record_is_replaced() {
-        let dir = std::env::temp_dir().join(format!("prns-ble-identity-damaged-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ble_identity"), b"not a record").unwrap();
-        let identity = load_or_create_identity(&dir).unwrap();
-        assert_eq!(wire::decode_identity_record(&std::fs::read(dir.join("ble_identity")).unwrap()), Ok(identity));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

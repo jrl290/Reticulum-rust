@@ -2,7 +2,9 @@
 
 > **See [DESIGN_PRINCIPLES.md](../DESIGN_PRINCIPLES.md): it must be considered on every change here.**
 
-A phone running Retichat reaches the mesh through a nearby RTNode over Bluetooth LE. It speaks the Prns native protocol, from the dialer's (GATT central's) side only. RTNode (`RTNode-HeltecV4/BleInterface.h`) is the listener.
+A phone running Retichat reaches the mesh through a nearby RTNode over Bluetooth LE. It speaks the Prns native protocol, from the dialer's (GATT central's) side only. RTNode is the listener (`RTNode-HeltecV4/BleInterface.h`, with the protocol's bytes in `BlePrns.h`).
+
+The protocol is the work of the [Prns](https://github.com/KenAKAFrosty/Prns) authors. It lives in its own package, [`prns-ble/`](prns-ble/README.md), under their license (MIT OR Apache-2.0); that README says what was taken from Prns and what changed. This repository's `src/interfaces/prns_ble/` is only the glue that runs it.
 
 ## Scope (James, 2026-09-28)
 
@@ -24,7 +26,7 @@ A phone running Retichat reaches the mesh through a nearby RTNode over Bluetooth
 
 ## Wire format
 
-Taken from Prns 0.3.7 `prns-core/src/interfaces/bluetooth_auto/` (MIT OR Apache-2.0). There is no written spec. See `src/interfaces/prns_ble/wire.rs`, whose tests include RTNode's exact Welcome bytes.
+Taken from Prns 0.3.7 (commit `d48e9fc`) `prns-core/src/interfaces/bluetooth_auto/` (MIT OR Apache-2.0). There is no written spec. See `prns-ble/src/wire.rs`, whose tests include RTNode's exact Welcome bytes. The service UUID, the fragment header and the advertisement's role flag are [ble-reticulum](https://github.com/torlando-tech/ble-reticulum)'s (torlando-tech, MIT), which Prns's protocol builds on.
 
 - **Service** `37145b00-442d-4a94-917f-8f42c5da28e3`. Control characteristic `…e7`, data characteristic `…e8`.
 - **Advertisement:** manufacturer data, company `0xFFFF`, `[version ≥ 3, flags]`. Flag bit 0 means peripheral-only; RTNode sends `03 01`.
@@ -44,9 +46,10 @@ Taken from Prns 0.3.7 `prns-core/src/interfaces/bluetooth_auto/` (MIT OR Apache-
 
 | Where | What |
 |---|---|
-| `engine.rs` | A pure state machine: host events in, `Effect`s out. It holds the dial decision, the handshake, fragments, reassembly, write pacing and the interface lifecycle. Unit tested without Bluetooth. |
-| `runtime.rs` | One engine per process. Transport effects run in order on the `prns-ble-transport` thread (register before any inbound, deregister after). Host calls run outside the engine lock. `prns-ble-timer` enforces the ceilings. It also manages the identity file. |
-| `cffi.rs` | The C ABI (`rns_prns_ble_*`) for iOS. Declared by hand in Retichat-ios `CRetichatFFI.h`. |
+| `prns-ble/src/engine.rs` | A pure state machine: host events in, `Effect`s out. It holds the dial decision, the handshake, fragments, reassembly, write pacing and the interface lifecycle. Unit tested without Bluetooth (`cargo test -p prns-ble`). |
+| `prns-ble/src/identity.rs` | The identity file, in Prns's record format. |
+| `src/interfaces/prns_ble/runtime.rs` | One engine per process. Transport effects run in order on the `prns-ble-transport` thread (register before any inbound, deregister after). Host calls run outside the engine lock. `prns-ble-timer` enforces the ceilings. |
+| `src/interfaces/prns_ble/cffi.rs` | The C ABI (`rns_prns_ble_*`) for iOS. Declared by hand in Retichat-ios `CRetichatFFI.h`. |
 | Retichat-android `rust/retichat-jni` | The JNI (`nativePrnsBle*`) plus `JniBleHost`, the Kotlin `PrnsBleCallback`. |
 | Retichat-ios `RTNodeBluetoothCoordinator.swift`, Retichat-android `RTNodeBluetooth.kt` | The radio. It scans when asked and reports each advertisement. It connects on the link the engine returns, then does MTU (Android), discovery and both subscriptions, and reports `link_ready`. It performs writes and reports every event. It keeps no timers and never re-dials by itself. |
 
@@ -66,7 +69,7 @@ These are Prns's rules, taken from `policy.rs` and the Prns backends. A dial is 
 
 Each settled RTNode becomes one interface, `PrnsBLE[<its 16-byte identity>]`. The name is stable across reconnects: Transport keys paths, links and writers by name, so a node that comes back keeps its routes.
 
-- **Settings:** MODE_FULL, 700 kbps (Prns's figure, and what RTNode registers for its slots), announce cap `ANNOUNCE_CAP`.
+- **Settings:** MODE_FULL, 700 kbps (Prns's figure, `BLE_BITRATE_GUESS_BPS`, which is ble-reticulum's `BITRATE_GUESS`, and what RTNode registers for its slots), announce cap `ANNOUNCE_CAP`.
 - **Registration order:**
   1. the outbound handler;
   2. the stub, registered **offline**;

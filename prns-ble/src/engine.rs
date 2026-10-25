@@ -8,19 +8,31 @@
 //! scans and reports every advertisement it sees; `sighted` decides whether
 //! to dial it. A link exists from that decision on, so a dial that never
 //! completes is bounded like a handshake that never completes.
+//!
+//! The handshake, the dial rules and the timers are Prns's (named at each
+//! constant below). The state machine is ours, written with AI assistance
+//! for a phone that links one RTNode. Changes from Prns: one node at a
+//! time, only RTNode advertisements are dialled, and a failed handshake
+//! keeps the pause from its dial.
+//!
+//! Copyright (c) 2026 The Prns Authors
+//! Copyright (c) 2026 James LaFarge
+//! SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::wire::{self, Control, Endpoint, Greeting, IDENTITY_LEN};
 
-/// Hello to Welcome. The Prns protocol constant (prns tokio runtime, both
-/// sides); a hard ceiling for a peer that never answers, not a fix for a
-/// slow one (DESIGN_PRINCIPLES §4). The 5-second rule still applies inside it.
+/// Hello to Welcome. Prns's handshake timeout (`HANDSHAKE_TIMEOUT`, both
+/// sides, in `prns-interfaces/impls/tokio/src/bluetooth_auto/runtime.rs`);
+/// a hard ceiling for a peer that never answers, not a fix for a slow one
+/// (DESIGN_PRINCIPLES §4). The 5-second rule still applies inside it.
 pub const HANDSHAKE_CEILING: Duration = Duration::from_secs(10);
 
 /// Sighting to `link_ready` (connect, discover, subscribe): Prns's Apple
-/// backend dial timeout (prns-ffi macos `backend.rs`). A ceiling like the
+/// backend dial timeout (`DIAL_TIMEOUT` in
+/// `prns-ffi/src/bluetooth_auto/macos/backend.rs`). A ceiling like the
 /// handshake's; the 5-second rule applies inside it too.
 pub const DIAL_CEILING: Duration = Duration::from_secs(15);
 
@@ -39,14 +51,13 @@ pub const DIAL_FAILED_RETRY: Duration = Duration::from_secs(5);
 pub const MAX_NODES: usize = 1;
 
 /// Packets waiting on one link: more than RNS's largest Resource window
-/// (`Resource::WINDOW_MAX_FAST`, 75 parts). A sender answers a window
-/// request with every part at once, far faster than Bluetooth carries them,
-/// and a part dropped here costs the receiver a wait and a re-request. At
-/// 64, a writer queue's depth, a photo from the iPad lost parts once its
-/// window passed 64 (2026-09-30). Past it a packet is dropped with a
-/// warning, as a full writer queue does.
+/// (`Resource::WINDOW_MAX_FAST`, 75 parts; Reticulum-rust checks this when
+/// it builds). A sender answers a window request with every part at once,
+/// far faster than Bluetooth carries them, and a part dropped here costs
+/// the receiver a wait and a re-request. At 64, a writer queue's depth, a
+/// photo from the iPad lost parts once its window passed 64 (2026-09-30).
+/// Past it a packet is dropped with a warning, as a full writer queue does.
 pub const MAX_QUEUED_PACKETS: usize = 96;
-const _: () = assert!(MAX_QUEUED_PACKETS > crate::resource::Resource::WINDOW_MAX_FAST);
 
 /// The largest value this side writes. Hosts pass the value length a write
 /// of one ATT PDU can carry (ATT MTU - 3), so a write never becomes an ATT
@@ -103,7 +114,17 @@ pub enum Effect {
     Inbound { name: String, packet: Vec<u8> },
     /// A send that completed: check it against the 5-second rule.
     CheckLate { label: &'static str, sent_at_unix: f64 },
-    Log { level: i32, message: String },
+    Log { level: Level, message: String },
+}
+
+/// How much a log line matters. The program running the engine maps it to
+/// its own levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Error,
+    Warning,
+    Notice,
+    Debug,
 }
 
 #[derive(Debug)]
@@ -133,7 +154,12 @@ struct Link {
 /// A Transport interface name for a peer: stable across reconnects, since
 /// Transport keys everything (paths, links, writers) by interface name.
 pub fn interface_name(peer: &[u8; IDENTITY_LEN]) -> String {
-    format!("PrnsBLE[{}]", crate::hexrep(peer, false))
+    format!("PrnsBLE[{}]", hex(peer))
+}
+
+/// Lower-case hex, no separators.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub struct Engine {
@@ -195,7 +221,7 @@ impl Engine {
         );
         let mut effects = vec![
             Effect::State { link, state: LinkState::Dialing, peer: None, interface: None },
-            Effect::Log { level: crate::LOG_NOTICE, message: format!("link {link}: dialling RTNode {address}") },
+            Effect::Log { level: Level::Notice, message: format!("link {link}: dialling RTNode {address}") },
         ];
         effects.extend(self.scan_effect());
         (Some(link), effects)
@@ -239,28 +265,28 @@ impl Engine {
             Effect::CheckLate { label: "prns_ble.dial", sent_at_unix: dialed_at_unix },
             Effect::State { link, state: LinkState::Handshaking, peer: None, interface: None },
             Effect::Write { link, characteristic: Characteristic::Control, bytes: hello },
-            Effect::Log { level: crate::LOG_NOTICE, message: format!("link {link}: Hello sent, fragments up to {fragment_size} bytes") },
+            Effect::Log { level: Level::Notice, message: format!("link {link}: Hello sent, fragments up to {fragment_size} bytes") },
         ])
     }
 
     pub fn link_received(&mut self, link: u64, characteristic: Characteristic, bytes: &[u8], now_unix: f64) -> Vec<Effect> {
         let Some(state) = self.links.get_mut(&link) else {
-            return vec![Effect::Log { level: crate::LOG_DEBUG, message: format!("link {link}: {} bytes after close, ignored", bytes.len()) }];
+            return vec![Effect::Log { level: Level::Debug, message: format!("link {link}: {} bytes after close, ignored", bytes.len()) }];
         };
         match characteristic {
             Characteristic::Control => match Control::decode(bytes) {
                 Some(Control::Welcome(greeting)) => match state.phase {
                     Phase::Handshaking { hello_sent_at_unix, .. } => self.settle(link, greeting, hello_sent_at_unix, now_unix),
                     Phase::Dialing { .. } => self.close(link, "a Welcome before the Hello", true),
-                    Phase::Settled { .. } => vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: second Welcome ignored") }],
+                    Phase::Settled { .. } => vec![Effect::Log { level: Level::Warning, message: format!("link {link}: second Welcome ignored") }],
                 },
                 Some(Control::Close(reason)) => self.close(link, &format!("the peer closed it ({reason:?})"), true),
                 Some(Control::Hello(_)) => self.close(link, "the peer sent a Hello; this side only dials", true),
-                None => self.close(link, &format!("undecodable control message {}", crate::hexrep(bytes, false)), true),
+                None => self.close(link, &format!("undecodable control message {}", hex(bytes)), true),
             },
             Characteristic::Data => {
                 let Phase::Settled { interface, .. } = &state.phase else {
-                    return vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: data before Welcome ignored") }];
+                    return vec![Effect::Log { level: Level::Warning, message: format!("link {link}: data before Welcome ignored") }];
                 };
                 let interface = interface.clone();
                 let result = match wire::decode_fragment(bytes) {
@@ -272,7 +298,7 @@ impl Engine {
                     Ok(None) => Vec::new(),
                     Err(why) => {
                         state.bad_fragments += 1;
-                        vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: {why} ({} so far)", state.bad_fragments) }]
+                        vec![Effect::Log { level: Level::Warning, message: format!("link {link}: {why} ({} so far)", state.bad_fragments) }]
                     }
                 }
             }
@@ -309,10 +335,10 @@ impl Engine {
         }
         effects.push(Effect::State { link, state: LinkState::Settled, peer: Some(greeting.identity), interface: Some(name.clone()) });
         effects.push(Effect::Log {
-            level: crate::LOG_NOTICE,
+            level: Level::Notice,
             message: format!(
                 "link {link}: settled with peer {} (endpoint {}/{}), interface {name}{}",
-                crate::hexrep(&greeting.identity, false),
+                hex(&greeting.identity),
                 greeting.endpoint.stack,
                 greeting.endpoint.host,
                 if previous.is_some() { ", taken over from its previous link" } else { "" }
@@ -329,7 +355,7 @@ impl Engine {
             return Vec::new();
         };
         let Some(done) = state.in_flight.take() else {
-            return vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: write completion with no write outstanding") }];
+            return vec![Effect::Log { level: Level::Warning, message: format!("link {link}: write completion with no write outstanding") }];
         };
         if !ok {
             let what = if done.handshake { "the Hello write failed" } else { "a write failed" };
@@ -349,16 +375,16 @@ impl Engine {
     /// accepted.
     pub fn send_packet(&mut self, link: u64, packet: &[u8], now_unix: f64) -> (bool, Vec<Effect>) {
         let Some(state) = self.links.get_mut(&link) else {
-            return (false, vec![Effect::Log { level: crate::LOG_DEBUG, message: format!("link {link}: packet for a closed link dropped") }]);
+            return (false, vec![Effect::Log { level: Level::Debug, message: format!("link {link}: packet for a closed link dropped") }]);
         };
         if !matches!(state.phase, Phase::Settled { .. }) {
-            return (false, vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: packet before Welcome dropped") }]);
+            return (false, vec![Effect::Log { level: Level::Warning, message: format!("link {link}: packet before Welcome dropped") }]);
         }
         if packet.len() > wire::HW_MTU {
-            return (false, vec![Effect::Log { level: crate::LOG_ERROR, message: format!("link {link}: {} byte packet exceeds the {} byte MTU", packet.len(), wire::HW_MTU) }]);
+            return (false, vec![Effect::Log { level: Level::Error, message: format!("link {link}: {} byte packet exceeds the {} byte MTU", packet.len(), wire::HW_MTU) }]);
         }
         if state.tx.len() >= MAX_QUEUED_PACKETS {
-            return (false, vec![Effect::Log { level: crate::LOG_WARNING, message: format!("link {link}: {MAX_QUEUED_PACKETS} packets queued, {} byte packet dropped", packet.len()) }]);
+            return (false, vec![Effect::Log { level: Level::Warning, message: format!("link {link}: {MAX_QUEUED_PACKETS} packets queued, {} byte packet dropped", packet.len()) }]);
         }
         state.tx.push_back(wire::fragments(packet, state.fragment_size).into());
         (true, next_write(link, state, now_unix).into_iter().collect())
@@ -443,7 +469,7 @@ impl Engine {
             effects.push(Effect::Disconnect { link });
         }
         effects.push(Effect::State { link, state: LinkState::Closed, peer, interface });
-        effects.push(Effect::Log { level: crate::LOG_NOTICE, message: format!("link {link}: closed, {why}") });
+        effects.push(Effect::Log { level: Level::Notice, message: format!("link {link}: closed, {why}") });
         effects.extend(self.scan_effect());
         effects
     }

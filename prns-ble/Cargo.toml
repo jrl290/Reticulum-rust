@@ -1,0 +1,13 @@
+[package]
+name = "prns-ble"
+version = "0.1.0"
+edition = "2021"
+# The Prns authors' license, kept for their protocol and our changes alike.
+license = "MIT OR Apache-2.0"
+description = "The Prns native Bluetooth LE protocol, dialer (GATT central) side: wire format and state machine"
+repository = "https://github.com/jrl290/Reticulum-rust"
+readme = "README.md"
+publish = false
+
+[dependencies]
+rand = "0.8"

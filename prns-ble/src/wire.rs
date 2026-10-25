@@ -1,10 +1,20 @@
 //! The Prns native Bluetooth LE wire format, dialer (GATT central) side.
 //!
-//! Ported from Prns 0.3.7 (`prns-core/src/interfaces/bluetooth_auto/`:
+//! The format is the Prns authors' work. This file is a port of Prns 0.3.7
+//! (commit d48e9fc, `prns-core/src/interfaces/bluetooth_auto/`:
 //! `advertisement.rs`, `framing.rs`, `handshake.rs`, `identity.rs`),
-//! Copyright (c) 2026 The Prns Authors, MIT OR Apache-2.0. Prns has no
-//! written spec; that code is the spec, and RTNode's `BleInterface.h`
-//! implements the same bytes on the listener side.
+//! written with AI assistance. Prns has no written spec; that code is the
+//! spec, and RTNode's `BlePrns.h` implements the same bytes on the listener
+//! side. The service UUID, the fragment header and the role advertisement
+//! are ble-reticulum's (torlando-tech), which Prns's protocol builds on.
+//!
+//! Changes from Prns: only the dialer's half, in this crate's own types
+//! (UUIDs as strings, one `Greeting` for Hello and Welcome, `Endpoint` as a
+//! stack and host pair), and no L2CAP or Columba handshake.
+//!
+//! Copyright (c) 2026 The Prns Authors
+//! Copyright (c) 2026 James LaFarge (the changes)
+//! SPDX-License-Identifier: MIT OR Apache-2.0
 
 /// Primary service. Every characteristic is this UUID with the last byte
 /// changed.
@@ -284,7 +294,7 @@ mod tests {
         core::array::from_fn(|i| seed.wrapping_add(i as u8))
     }
 
-    /// The Welcome RTNode sends (BleInterface.h on_control): its identity,
+    /// The Welcome RTNode sends (BlePrns.h `write_welcome`): its identity,
     /// endpoint ESP32, no PSM, link MTU 500, RSSI unknown.
     fn rtnode_welcome(id: &[u8; IDENTITY_LEN]) -> Vec<u8> {
         let mut bytes = vec![0x02];

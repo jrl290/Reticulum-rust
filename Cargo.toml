@@ -13,7 +13,9 @@ serial = ["dep:serialport", "dep:btleplug", "dep:uuid", "dep:futures"]
 post-interface = ["dep:reqwest", "dep:base64", "dep:serde_json"]
 # Phone-to-RTNode Bluetooth LE (Prns native protocol, central side); the
 # phone apps drive the radio. Off by default: rnsd and rfed never use it.
-prns-ble = []
+# The protocol is its own package, prns-ble/, under the Prns authors'
+# license (MIT OR Apache-2.0); this crate holds only the glue to Transport.
+prns-ble = ["dep:prns-ble"]
 python-oracle-tests = []
 
 [dependencies]
@@ -56,7 +58,14 @@ futures = { version = "0.3", optional = true }
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
 base64 = { version = "0.22", optional = true }
 serde_json = { version = "1.0", optional = true }
+prns-ble = { path = "prns-ble", optional = true }
 
 [dev-dependencies]
 data-encoding = "2.5"
 pyo3 = { version = "0.21", features = ["auto-initialize"] }
+
+# prns-ble/ is its own package (the Prns authors' protocol, their license);
+# one workspace so both share a target directory and `cargo test --workspace`
+# runs both.
+[workspace]
+members = ["prns-ble"]

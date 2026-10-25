@@ -8,9 +8,10 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::engine::{Characteristic, LinkState};
+use ::prns_ble::engine::{Characteristic, LinkState};
+use ::prns_ble::wire::{Endpoint, IDENTITY_LEN};
+
 use super::runtime::{self, Host};
-use super::wire::{Endpoint, IDENTITY_LEN};
 use crate::ffi::set_error;
 
 /// Start (`on` non-zero) or stop scanning for the Prns service.

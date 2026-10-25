@@ -40,6 +40,7 @@ This codebase was generated with significant assistance from **GitHub Copilot (C
 | **PipeInterface** | Unix pipes | HDLC framing |
 | **BackboneInterface** | Multi-hop backbone links | Custom |
 | **I2PInterface** | I2P anonymity network | SAM protocol |
+| **PrnsBLE** (feature `prns-ble`) | Bluetooth LE, a phone to an RTNode | The [Prns](https://github.com/KenAKAFrosty/Prns) native protocol, in its own package, [`prns-ble/`](prns-ble/README.md) |
 
 ### Cross-Language Support
 - **FFI module** — Handle-based C-compatible registry for integration with C, JNI (Android), and other languages
@@ -148,8 +149,12 @@ This is a port of Mark Qvist's Reticulum and is distributed under the same licen
 
 We follow the license as written. When Mark Qvist introduced the AI condition, he explained that it does not restrict which tools a developer uses ([his reply of 17 April 2025](https://github.com/markqvist/Reticulum/discussions/790#discussioncomment-12871253)).
 
+One directory is a separate package under its own license: [`prns-ble/`](prns-ble/README.md), the Prns authors' Bluetooth LE protocol, licensed MIT OR Apache-2.0 as Prns is (its `LICENSE-MIT` and `LICENSE-APACHE`). It contains none of Mark Qvist's code. The glue that connects it to this stack, `src/interfaces/prns_ble/`, is part of Reticulum-rust and under the Reticulum License.
+
 ## Acknowledgments
 
 - **Mark Qvist** — Creator of the [Reticulum Network Stack](https://reticulum.network/) and the Python reference implementation
 - **GitHub Copilot (Claude, Anthropic)** — AI pair-programming assistant that helped generate and debug the Rust implementation
 - **attermann** — Author of [microReticulum](https://github.com/attermann/microReticulum), the C++ implementation that informed embedded testing strategies
+- **The Prns Authors** — [Prns](https://github.com/KenAKAFrosty/Prns), whose native Bluetooth LE protocol links Retichat phones to RTNodes (`prns-ble/`)
+- **torlando-tech** — [ble-reticulum](https://github.com/torlando-tech/ble-reticulum), whose GATT service and fragment format the Prns protocol builds on
