@@ -160,6 +160,7 @@ struct ReticulumFlags {
     discovery_enabled: bool,
     discover_interfaces: bool,
     autoconnect_discovered_interfaces: usize,
+    autoconnect_interface_mode: Option<InterfaceMode>,
     required_discovery_value: Option<u32>,
     publish_blackhole: bool,
     blackhole_sources: Vec<Vec<u8>>,
@@ -178,6 +179,7 @@ impl Default for ReticulumFlags {
             discovery_enabled: false,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
+            autoconnect_interface_mode: None,
             required_discovery_value: None,
             publish_blackhole: false,
             blackhole_sources: Vec::new(),
@@ -215,7 +217,9 @@ pub struct Reticulum {
     pub jobs_thread_running: bool,
     pub last_data_persist: f64,
     pub last_cache_clean: f64,
-    pub bootstrap_configs: Vec<HashMap<String, String>>,
+    /// Interface sections marked `bootstrap_only`, kept at start-up so
+    /// interface discovery can bring them back.
+    pub bootstrap_configs: Vec<(String, ConfigSection)>,
     pub requested_loglevel: Option<i32>,
     pub requested_verbosity: Option<i32>,
 }
@@ -815,7 +819,7 @@ impl Reticulum {
 
     pub fn discovered_interfaces() -> Vec<crate::discovery::InterfaceInfo> {
         let required = required_discovery_value();
-        let discovery = crate::discovery::InterfaceDiscovery::new(required, None, false);
+        let discovery = crate::discovery::InterfaceDiscovery::new(required, None);
         if let Ok(discovery) = discovery {
             discovery.list_discovered_interfaces(false, false)
         } else {
@@ -1109,6 +1113,25 @@ impl Reticulum {
             if let Some(value) = reticulum.get_int("autoconnect_discovered_interfaces") {
                 if value > 0 {
                     FLAGS.lock().unwrap().autoconnect_discovered_interfaces = value as usize;
+                }
+            }
+
+            // The reference also takes "internal", a mode this port lacks,
+            // and autoconnect_interface_gravity and
+            // autoconnect_announces_to_internal, which set interface
+            // properties this port does not have.
+            if let Some(value) = reticulum.get("autoconnect_interface_mode") {
+                let mode = match value.to_lowercase().as_str() {
+                    "full" => Some(InterfaceMode::Full),
+                    "access_point" | "accesspoint" | "ap" => Some(InterfaceMode::AccessPoint),
+                    "pointtopoint" | "ptp" => Some(InterfaceMode::PointToPoint),
+                    "roaming" => Some(InterfaceMode::Roaming),
+                    "boundary" => Some(InterfaceMode::Boundary),
+                    "gateway" | "gw" => Some(InterfaceMode::Gateway),
+                    _ => None,
+                };
+                if mode.is_some() {
+                    FLAGS.lock().unwrap().autoconnect_interface_mode = mode;
                 }
             }
         }
@@ -1506,6 +1529,153 @@ impl Reticulum {
         })
     }
 
+    /// Register a dialled TCP client with Transport and start it. Start-up
+    /// and interface auto-connect (discovery.rs) both start clients here.
+    pub(crate) fn start_tcp_client(
+        mut interface: crate::interfaces::tcp_interface::TcpClientInterface,
+        mode: InterfaceMode,
+        mut stub_config: crate::transport::InterfaceStubConfig,
+    ) -> Arc<Mutex<crate::interfaces::tcp_interface::TcpClientInterface>> {
+        Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+        stub_config.online = Some(interface.base.online && !interface.detached);
+        let kiss_framing = interface.kiss_framing;
+        let is_online = interface.base.online;
+        let interface_repr = interface.to_string();
+        let interface = Arc::new(Mutex::new(interface));
+        let handler_iface = Arc::clone(&interface);
+        let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
+        crate::transport::Transport::register_outbound_handler(
+            &name,
+            Arc::new(move |raw| {
+                let mut iface = handler_iface.lock().unwrap();
+                iface.process_outgoing(raw.to_vec()).is_ok()
+            }),
+        );
+        crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
+        crate::interfaces::tcp_interface::TcpClientInterface::start_heartbeat_loop(Arc::clone(&interface));
+        // Store the repr so synthesize_tunnel_all_tcp can
+        // refresh this interface's tunnel binding on demand
+        // (e.g. before each LRREQ in start_persistent_link).
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        stub_config.repr = Some(interface_repr.clone());
+        // STRICT ORDERING (DESIGN_PRINCIPLES.md §3 + §4):
+        // `register_interface_stub_config` MUST run before
+        // `synthesize_tunnel`. The latter calls
+        // `Transport::outbound`, which iterates
+        // `state.interfaces` to broadcast the tunnel
+        // synthesis packet. If the stub isn't there
+        // yet, the broadcast loop finds zero matching
+        // interfaces, returns sent=false, and THE
+        // TUNNEL SYNTHESIS NEVER REACHES THE WIRE.
+        //
+        // The downstream consequence is catastrophic:
+        // the upstream rnsd has no mapping from this
+        // TCP connection back to our transport identity,
+        // so it will not route PATH_RESPONSE packets
+        // back to us. PATH_REQUESTs we send go
+        // unanswered (or only "answered" when an
+        // organic broadcast announce happens to pass
+        // through carrying the path we asked for —
+        // observed at 22 seconds in retichat.log on
+        // 2026-04-30 for dest 2b8f4b46).
+        //
+        // NEVER REMOVE EVER. NEVER REORDER. The fix
+        // for "synthesize_tunnel: sent=false" is to
+        // ensure the stub is registered first, NOT to
+        // sleep, NOT to retry, NOT to defer.
+        crate::transport::Transport::register_interface_stub_config(stub_config.clone());
+        // For non-KISS TCP client interfaces, synthesize a
+        // tunnel so the remote transport daemon associates
+        // this connection with our transport identity.
+        //
+        // Runs inline, before `Reticulum::new()` returns.
+        // The race the previously-deferred call masked:
+        // the iOS / Android host calls
+        // `requestEssentialPaths()` immediately after
+        // `Reticulum::new()` returns. If `synthesize_tunnel`
+        // hasn't yet been written to the wire when those
+        // PATH_REQUESTs go out, the upstream rnsd has no
+        // mapping from this TCP connection back to our
+        // transport identity, so it will not route the
+        // PATH_RESPONSE / announce reply back to us. The
+        // observable failure mode was minute-scale "no
+        // path" gaps after every cold start.
+        //
+        // NEVER REMOVE EVER — this is the load-bearing
+        // ordering guarantee for the cold-start launch
+        // budget. If you re-introduce a sleep here, you
+        // will re-introduce the cold-start stall.
+        if !kiss_framing && is_online {
+            crate::transport::Transport::synthesize_tunnel(&name, &interface_repr);
+        }
+        interface
+    }
+
+    /// Bring the bootstrap-only interfaces back as configured (the
+    /// reference re-synthesizes its `bootstrap_configs`). TCP clients are
+    /// dialled first, outside the instance lock.
+    pub(crate) fn restore_bootstrap_interfaces() {
+        let instance = match Self::get_instance() {
+            Some(instance) => instance,
+            None => return,
+        };
+        let entries = instance.lock().unwrap().bootstrap_configs.clone();
+        let mut dialled = Self::dial_tcp_clients(&entries);
+        let mut reticulum = instance.lock().unwrap();
+        for (name, section) in entries {
+            let dialled = dialled.remove(&name);
+            reticulum.synthesize_interface(&section, &name, false, dialled);
+        }
+    }
+
+    /// Detach the named TCP and Backbone clients and remove them from
+    /// Transport. Returns the names left alone: another interface type, or
+    /// a client whose writer holds it now (the caller tries again later).
+    pub(crate) fn teardown_interfaces(names: &[String]) -> Vec<String> {
+        let instance = match Self::get_instance() {
+            Some(instance) => instance,
+            None => return names.to_vec(),
+        };
+        let mut torn_down = Vec::new();
+        instance.lock().unwrap().system_interfaces.retain(|iface| {
+            let detached = match iface {
+                SystemInterface::TcpClient(client) => match client.try_lock() {
+                    Ok(mut client) => match client.base.name.clone() {
+                        Some(name) if names.contains(&name) => {
+                            client.detach();
+                            Some(name)
+                        }
+                        _ => None,
+                    },
+                    Err(_) => None,
+                },
+                SystemInterface::BackboneClient(client) => match client.try_lock() {
+                    Ok(mut client) => match client.base.name.clone() {
+                        Some(name) if names.contains(&name) => {
+                            client.detach();
+                            Some(name)
+                        }
+                        _ => None,
+                    },
+                    Err(_) => None,
+                },
+                _ => None,
+            };
+            match detached {
+                Some(name) => {
+                    torn_down.push(name);
+                    false
+                }
+                None => true,
+            }
+        });
+        for name in &torn_down {
+            crate::transport::Transport::unregister_outbound_handler(name);
+            crate::transport::Transport::deregister_interface_stub(name);
+        }
+        names.iter().filter(|name| !torn_down.contains(name)).cloned().collect()
+    }
+
     /// `dialled`: the TCPClientInterface [`Self::dial_tcp_clients`] created
     /// for this section, if it did; otherwise it is created here.
     fn synthesize_interface(
@@ -1558,6 +1728,9 @@ impl Reticulum {
             let ic_held_release_interval = config.get_float("ic_held_release_interval");
 
             let bootstrap_only = config.get_bool("bootstrap_only");
+            if bootstrap_only == Some(true) && instance_init {
+                self.bootstrap_configs.push((name.to_string(), config.clone()));
+            }
             let outgoing = config.get_bool("outgoing");
 
             let ifac_size = config.get_int("ifac_size")
@@ -1711,79 +1884,8 @@ impl Reticulum {
                         crate::interfaces::tcp_interface::TcpClientInterface::new(&config_map)
                     });
                     match created {
-                        Ok(mut interface) => {
-                            Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
-                            stub_config.online = Some(interface.base.online && !interface.detached);
-                            let kiss_framing = interface.kiss_framing;
-                            let is_online = interface.base.online;
-                            let interface_repr = interface.to_string();
-                            let interface = Arc::new(Mutex::new(interface));
-                            let handler_iface = Arc::clone(&interface);
-                            let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
-                            crate::transport::Transport::register_outbound_handler(
-                                &name,
-                                Arc::new(move |raw| {
-                                    let mut iface = handler_iface.lock().unwrap();
-                                    iface.process_outgoing(raw.to_vec()).is_ok()
-                                }),
-                            );
-                            crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
-                            crate::interfaces::tcp_interface::TcpClientInterface::start_heartbeat_loop(Arc::clone(&interface));
-                            // Store the repr so synthesize_tunnel_all_tcp can
-                            // refresh this interface's tunnel binding on demand
-                            // (e.g. before each LRREQ in start_persistent_link).
-                            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                            stub_config.repr = Some(interface_repr.clone());
-                            // STRICT ORDERING (DESIGN_PRINCIPLES.md §3 + §4):
-                            // `register_interface_stub_config` MUST run before
-                            // `synthesize_tunnel`. The latter calls
-                            // `Transport::outbound`, which iterates
-                            // `state.interfaces` to broadcast the tunnel
-                            // synthesis packet. If the stub isn't there
-                            // yet, the broadcast loop finds zero matching
-                            // interfaces, returns sent=false, and THE
-                            // TUNNEL SYNTHESIS NEVER REACHES THE WIRE.
-                            //
-                            // The downstream consequence is catastrophic:
-                            // the upstream rnsd has no mapping from this
-                            // TCP connection back to our transport identity,
-                            // so it will not route PATH_RESPONSE packets
-                            // back to us. PATH_REQUESTs we send go
-                            // unanswered (or only "answered" when an
-                            // organic broadcast announce happens to pass
-                            // through carrying the path we asked for —
-                            // observed at 22 seconds in retichat.log on
-                            // 2026-04-30 for dest 2b8f4b46).
-                            //
-                            // NEVER REMOVE EVER. NEVER REORDER. The fix
-                            // for "synthesize_tunnel: sent=false" is to
-                            // ensure the stub is registered first, NOT to
-                            // sleep, NOT to retry, NOT to defer.
-                            crate::transport::Transport::register_interface_stub_config(stub_config.clone());
-                            // For non-KISS TCP client interfaces, synthesize a
-                            // tunnel so the remote transport daemon associates
-                            // this connection with our transport identity.
-                            //
-                            // Runs inline, before `Reticulum::new()` returns.
-                            // The race the previously-deferred call masked:
-                            // the iOS / Android host calls
-                            // `requestEssentialPaths()` immediately after
-                            // `Reticulum::new()` returns. If `synthesize_tunnel`
-                            // hasn't yet been written to the wire when those
-                            // PATH_REQUESTs go out, the upstream rnsd has no
-                            // mapping from this TCP connection back to our
-                            // transport identity, so it will not route the
-                            // PATH_RESPONSE / announce reply back to us. The
-                            // observable failure mode was minute-scale "no
-                            // path" gaps after every cold start.
-                            //
-                            // NEVER REMOVE EVER — this is the load-bearing
-                            // ordering guarantee for the cold-start launch
-                            // budget. If you re-introduce a sleep here, you
-                            // will re-introduce the cold-start stall.
-                            if !kiss_framing && is_online {
-                                crate::transport::Transport::synthesize_tunnel(&name, &interface_repr);
-                            }
+                        Ok(interface) => {
+                            let interface = Self::start_tcp_client(interface, mode, stub_config.clone());
                             self.system_interfaces.push(SystemInterface::TcpClient(interface));
                         }
                         Err(err) => {
@@ -2271,6 +2373,9 @@ fn default_config_dir() -> PathBuf {
 pub fn exit_handler() {
     crate::log("Reticulum exit handler invoked", crate::LOG_DEBUG, false, false);
     crate::transport::Transport::exit_handler();
+    // Auto-connected interfaces are not system interfaces; discovery
+    // detaches them, and stops its monitor.
+    crate::transport::Transport::stop_interface_discovery();
     crate::identity::exit_handler();
     if crate::Profiler::ran() {
         crate::Profiler::results();
@@ -2367,6 +2472,10 @@ pub fn should_autoconnect_discovered_interfaces() -> bool {
 
 pub fn max_autoconnected_interfaces() -> usize {
     FLAGS.lock().unwrap().autoconnect_discovered_interfaces
+}
+
+pub fn autoconnect_interface_mode() -> Option<InterfaceMode> {
+    FLAGS.lock().unwrap().autoconnect_interface_mode
 }
 
 fn create_default_config(config_path: &Path, config_dir: &Path) -> Result<(), String> {
@@ -2488,7 +2597,7 @@ fn parse_interface_mode(config: &ConfigSection, interface_type: &str, ignore_war
     mode
 }
 
-fn interface_mode_to_stub(mode: InterfaceMode) -> u8 {
+pub(crate) fn interface_mode_to_stub(mode: InterfaceMode) -> u8 {
     match mode {
         InterfaceMode::Full => crate::transport::InterfaceStub::MODE_FULL,
         InterfaceMode::PointToPoint => crate::transport::InterfaceStub::MODE_POINT_TO_POINT,
@@ -2509,7 +2618,7 @@ fn default_ifac_size_for_type(interface_type: &str) -> Option<usize> {
     }
 }
 
-fn derive_ifac_material(netname: Option<&str>, netkey: Option<&str>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+pub(crate) fn derive_ifac_material(netname: Option<&str>, netkey: Option<&str>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     if netname.is_none() && netkey.is_none() {
         return (None, None);
     }

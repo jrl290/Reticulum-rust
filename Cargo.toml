@@ -62,6 +62,7 @@ prns-ble = { path = "prns-ble", optional = true }
 
 [dev-dependencies]
 data-encoding = "2.5"
+serde_json = "1.0"
 pyo3 = { version = "0.21", features = ["auto-initialize"] }
 
 # prns-ble/ is its own package (the Prns authors' protocol, their license);

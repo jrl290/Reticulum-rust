@@ -567,7 +567,7 @@ pub struct TransportState {
     pub drop_announces: bool,
     pub announce_watchlist: std::collections::HashSet<Vec<u8>>,
     pub discovery_announcer: Option<InterfaceAnnouncer>,
-    pub interface_discovery: Option<InterfaceDiscovery>,
+    pub interface_discovery: Option<Arc<InterfaceDiscovery>>,
     pub interface_announce_handler: Option<Arc<InterfaceAnnounceHandler>>,
     pub outbound_handlers: HashMap<String, Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
     /// Per-client earliest-next-dispatch time for announce pacing (enqueue scheduling).
@@ -2293,20 +2293,95 @@ impl Transport {
         state.discovery_announcer = Some(announcer);
     }
 
+    /// Listen for discovered interfaces (RNS `InterfaceDiscovery` with
+    /// `discover_interfaces` set): the announce handler hands each one to the
+    /// discovery on its own thread, never on the inbound path, and the
+    /// discovery reconnects what it already knows.
     pub fn discover_interfaces() {
-        let mut state = TRANSPORT.lock().unwrap();
-        if state.interface_discovery.is_some() {
+        if TRANSPORT.lock().unwrap().interface_discovery.is_some() {
             return;
         }
         let required = crate::reticulum::required_discovery_value();
-        if let Ok(discovery) = InterfaceDiscovery::new(required, None, true) {
-            state.interface_discovery = Some(discovery);
-        }
-
-        if state.interface_announce_handler.is_none() {
-            let handler = InterfaceAnnounceHandler::new(required, None);
+        let discovery = match InterfaceDiscovery::new(required, None) {
+            Ok(discovery) => Arc::new(discovery),
+            Err(e) => {
+                log(&format!("Could not start interface discovery: {}", e), LOG_ERROR, false, false);
+                return;
+            }
+        };
+        let discovered = Arc::clone(&discovery);
+        let handler = InterfaceAnnounceHandler::new(required, Some(Box::new(move |info| {
+            let discovery = Arc::clone(&discovered);
+            let spawned = thread::Builder::new()
+                .name("interface_discovered".to_string())
+                .spawn(move || discovery.interface_discovered(info));
+            if let Err(e) = spawned {
+                log(&format!("Could not process a discovered interface: {}", e), LOG_ERROR, false, false);
+            }
+        })));
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            if state.interface_discovery.is_some() {
+                return;
+            }
+            state.interface_discovery = Some(Arc::clone(&discovery));
             state.interface_announce_handler = Some(Arc::new(handler));
         }
+        let spawned = thread::Builder::new()
+            .name("connect_discovered".to_string())
+            .spawn(move || discovery.connect_discovered());
+        if let Err(e) = spawned {
+            log(&format!("Could not reconnect discovered interfaces: {}", e), LOG_ERROR, false, false);
+        }
+    }
+
+    /// Stop interface discovery and detach what it connected (shutdown).
+    pub fn stop_interface_discovery() {
+        let discovery = {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.interface_announce_handler = None;
+            state.interface_discovery.take()
+        };
+        if let Some(discovery) = discovery {
+            discovery.stop();
+        }
+    }
+
+    /// Bootstrap-only interfaces registered now, as (name, repr).
+    pub fn bootstrap_interfaces() -> Vec<(String, String)> {
+        let state = TRANSPORT.lock().unwrap();
+        state.interfaces
+            .iter()
+            .filter(|iface| iface.bootstrap_only)
+            .map(|iface| {
+                let repr = if iface.repr.is_empty() { iface.name.clone() } else { iface.repr.clone() };
+                (iface.name.clone(), repr)
+            })
+            .collect()
+    }
+
+    /// Whether an interface targets `address`, on `port` when one is given
+    /// (the reference's `target_ip`/`target_port` match).
+    pub fn has_interface_endpoint(address: &str, port: Option<u16>) -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        state.interfaces.iter().any(|iface| {
+            iface.address.as_deref() == Some(address) && port.map_or(true, |port| iface.port == Some(port))
+        })
+    }
+
+    pub fn interface_registered(name: &str) -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        state.interfaces.iter().chain(state.local_client_interfaces.iter()).any(|iface| iface.name == name)
+    }
+
+    pub fn blackholed_identity_hashes() -> HashSet<Vec<u8>> {
+        TRANSPORT.lock().unwrap().blackholed_identities.keys().cloned().collect()
+    }
+
+    /// Decrypt with the network identity, as discovery does for an encrypted announce.
+    pub fn network_identity_decrypt(token: &[u8]) -> Option<Vec<u8>> {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.network_identity.as_mut()?.decrypt(token).ok()
     }
 
     pub fn enable_blackhole_updater() {
@@ -5951,7 +6026,11 @@ impl Transport {
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
         ), crate::LOG_DEBUG, false, false);
 
-        let interface_announce_callback = if packet.packet_type == ANNOUNCE && announce_should_add {
+        // Like the reference, the discovery handler never sees path responses.
+        let interface_announce_callback = if packet.packet_type == ANNOUNCE
+            && announce_should_add
+            && packet.context != crate::packet::PATH_RESPONSE
+        {
             let handler = {
                 let state = TRANSPORT.lock().unwrap();
                 state.interface_announce_handler.clone()

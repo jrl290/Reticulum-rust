@@ -1,0 +1,587 @@
+{
+ "generator": "Reticulum-rust tests/fixtures/discovery_vectors.py (RNS 1.5.2)",
+ "note": "Regenerate with the generator, never by hand. Hex is lower-case.",
+ "required_value": 16,
+ "backbone_support": false,
+ "network_identity_public_key": "f53ebbd84f8e4772be9a543e0b74880a93b451eeb9181ea4c2f43ee8a48db65d2b41f3fdd4150d51d285f8a366c89150f8582b6ebd2ba763c086be8107600f65",
+ "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+ "destination_hash": "f83c10e9b94178fecf48a10dfa815c6b",
+ "announces": [
+  {
+   "label": "backbone_hostname",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffb24578616d706c65204261636b626f6e65203103cb404a40000000000004cb402acccccccccccd05cb404100000000000002af726e732e6578616d706c652e6f726706cd109235b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171d",
+   "stamp_value": 16,
+   "expected": {
+    "type": "BackboneInterface",
+    "transport": true,
+    "name": "Example Backbone 1",
+    "stamp": {
+     "hex": "35b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171d"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": 52.5,
+    "longitude": 13.4,
+    "height": 34.0,
+    "reachable_on": "rns.example.org",
+    "port": 4242,
+    "config_entry": "[[Example Backbone 1]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = rns.example.org\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "1d3b0abbb2370144ce8de6b013ca71ae64840cadad238ca0bda486388a1ce9dc"
+    }
+   }
+  },
+  {
+   "label": "tcpserver_ipv4_ifac",
+   "app_data": "008d00b2544350536572766572496e7465726661636501c2ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffac20207a6572306269747a202003c004c005c002ab3230332e302e3131332e3706cd136507a7746573746e657408ad73656372657420706872617365acc851b1790c5e05d5aa4f65e604f5504b7fedf8cff0bde77c6bb17a07317d52",
+   "stamp_value": 16,
+   "expected": {
+    "type": "TCPServerInterface",
+    "transport": false,
+    "name": "zer0bitz",
+    "stamp": {
+     "hex": "acc851b1790c5e05d5aa4f65e604f5504b7fedf8cff0bde77c6bb17a07317d52"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "ifac_netname": "testnet",
+    "ifac_netkey": "secret phrase",
+    "reachable_on": "203.0.113.7",
+    "port": 4965,
+    "config_entry": "[[zer0bitz]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = 203.0.113.7\n  target_port = 4965\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17\n  network_name = testnet\n  passphrase = secret phrase",
+    "discovery_hash": {
+     "hex": "f48f9476f4a5304e79aa085202ed2b7831e3553885042f86bdd427e132ecd081"
+    }
+   }
+  },
+  {
+   "label": "backbone_ipv6_operator",
+   "app_data": "008c00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffaa524d415020576f726c6403c004c005c002ab323030313a6462383a3a3106cd1092ccf0c41006e55b633481f7bb072957eabcf110c940ea5e87b6861d7607bde939911d52248ec0886bbf5246085fbb152846afefb9",
+   "stamp_value": 16,
+   "expected": {
+    "type": "BackboneInterface",
+    "transport": true,
+    "name": "RMAP World",
+    "stamp": {
+     "hex": "40ea5e87b6861d7607bde939911d52248ec0886bbf5246085fbb152846afefb9"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "reachable_on": "2001:db8::1",
+    "port": 4242,
+    "config_entry": "[[RMAP World]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = 2001:db8::1\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "e6bf19f5c833d9e6f3da620c6aedb629a9caa546c50871c6aa989467a8996fad"
+    },
+    "operator_lxmf_address": "06e55b633481f7bb072957eabcf110c9"
+   }
+  },
+  {
+   "label": "backbone_hostname_trailing_dot",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa8446f7420486f737403c004c005c002b0726e732e6578616d706c652e6f72672e06cd10929ab027d3d643f28a6e5f73d6a0c8e13634964389b8030449bcc55160823ad899",
+   "stamp_value": 17,
+   "expected": {
+    "type": "BackboneInterface",
+    "transport": true,
+    "name": "Dot Host",
+    "stamp": {
+     "hex": "9ab027d3d643f28a6e5f73d6a0c8e13634964389b8030449bcc55160823ad899"
+    },
+    "value": 17,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "reachable_on": "rns.example.org.",
+    "port": 4242,
+    "config_entry": "[[Dot Host]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = rns.example.org.\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "92601b2fd9badc500fae60d0ab4647bfc8f2f66e4d9a3fc1863feb6df2ca4c49"
+    }
+   }
+  },
+  {
+   "label": "backbone_no_name",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ad3139382e35312e3130302e323006cd10928e75c544bfc03cd78dfcaa66627900fb3d93610b5103b5f81c17c906c2d97468",
+   "stamp_value": 16,
+   "expected": {
+    "type": "BackboneInterface",
+    "transport": true,
+    "name": "Discovered BackboneInterface",
+    "stamp": {
+     "hex": "8e75c544bfc03cd78dfcaa66627900fb3d93610b5103b5f81c17c906c2d97468"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "reachable_on": "198.51.100.20",
+    "port": 4242,
+    "config_entry": "[[Discovered BackboneInterface]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = 198.51.100.20\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "f956bf22052377ba7ae65242396749b33e14652a63bcbb8e1428695d8ea4b6b6"
+    }
+   }
+  },
+  {
+   "label": "backbone_lowercase_name",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffae6c6f77657263617365206f6e6c7903c004c005c002ad3139382e35312e3130302e323106cd1092b2b68402f0e2ac51aaa3a1e47e62d06889af5acf2d65e399a49af9ea2b88398e",
+   "stamp_value": 18,
+   "expected": {
+    "type": "BackboneInterface",
+    "transport": true,
+    "name": "lowercase only",
+    "stamp": {
+     "hex": "b2b68402f0e2ac51aaa3a1e47e62d06889af5acf2d65e399a49af9ea2b88398e"
+    },
+    "value": 18,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "reachable_on": "198.51.100.21",
+    "port": 4242,
+    "config_entry": "[[lowercase only]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = 198.51.100.21\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "dfdd63fdbe6ca8625539a4850c2f9b90c4ea6869e396bb607d158bff7704d19f"
+    }
+   }
+  },
+  {
+   "label": "rnode",
+   "app_data": "008d00ae524e6f6465496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffad524e6f6465204761746577617903cbc040f3333333333304cb4062e6666666666605cb402400000000000009ce33bca1000ace0001e8480b080c05b20a1f0f3c939fa65efeb29591d09fbe342b81fdb9ba0da75361f0f17b4d1141",
+   "stamp_value": 16,
+   "expected": {
+    "type": "RNodeInterface",
+    "transport": true,
+    "name": "RNode Gateway",
+    "stamp": {
+     "hex": "b20a1f0f3c939fa65efeb29591d09fbe342b81fdb9ba0da75361f0f17b4d1141"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": -33.9,
+    "longitude": 151.2,
+    "height": 10.0,
+    "frequency": 868000000,
+    "bandwidth": 125000,
+    "sf": 8,
+    "cr": 5,
+    "config_entry": "[[RNode Gateway]]\n  type = RNodeInterface\n  enabled = yes\n  port = \n  frequency = 868000000\n  bandwidth = 125000\n  spreadingfactor = 8\n  codingrate = 5\n  txpower = ",
+    "discovery_hash": {
+     "hex": "2e3b1ec885ea44e588debdf0bb5a638c125846ed9712709e406f461197d25d2d"
+    }
+   }
+  },
+  {
+   "label": "i2p",
+   "app_data": "008a00ac493250496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa8493250204e6f646503c004c005c002d93c6162636465666768696a6b6c6d6e6f707172737475767778797a3233343536376162636465666768696a6b6c6d6e6f70717273742e6233322e6932708b0d47b2d43b3de48cee446d2f68a4e921434cbab95854cf64cac09b96d902bc",
+   "stamp_value": 16,
+   "expected": {
+    "type": "I2PInterface",
+    "transport": true,
+    "name": "I2P Node",
+    "stamp": {
+     "hex": "8b0d47b2d43b3de48cee446d2f68a4e921434cbab95854cf64cac09b96d902bc"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "reachable_on": "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst.b32.i2p",
+    "config_entry": "[[I2P Node]]\n  type = I2PInterface\n  enabled = yes\n  peers = abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst.b32.i2p\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "924e8fd280666f6189be7f5419c1d1a948b5178412f2a5884b98fc6ba18b3c16"
+    }
+   }
+  },
+  {
+   "label": "kiss",
+   "app_data": "008c00ad4b495353496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa84b49535320544e4303c004c005c009ce19cf0e400ace0001e8480da44c6f5261c03327a3cd3bdcf642684a4fefcc3e3ca8e5a62452b1425d60997353e110e7ed",
+   "stamp_value": 16,
+   "expected": {
+    "type": "KISSInterface",
+    "transport": true,
+    "name": "KISS TNC",
+    "stamp": {
+     "hex": "c03327a3cd3bdcf642684a4fefcc3e3ca8e5a62452b1425d60997353e110e7ed"
+    },
+    "value": 16,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "frequency": 433000000,
+    "bandwidth": 125000,
+    "modulation": "LoRa",
+    "config_entry": "[[KISS TNC]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: 433000000\n  # Bandwidth: 125000\n  # Modulation: LoRa\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+    "discovery_hash": {
+     "hex": "6fe49011621d5a5848f310c1672553d35aea308d07aa929e15cbec5396e9d7ef"
+    }
+   }
+  },
+  {
+   "label": "weave",
+   "app_data": "008d00ae5765617665496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffaa5765617665204d65736803c004c005c009ce8f0d18000ace000f42400e030da44746534badf99b354f65c1aaea3887da1c67aa3d871105e62f972afe4bb1bb159d0bf794",
+   "stamp_value": 22,
+   "expected": {
+    "type": "WeaveInterface",
+    "transport": true,
+    "name": "Weave Mesh",
+    "stamp": {
+     "hex": "adf99b354f65c1aaea3887da1c67aa3d871105e62f972afe4bb1bb159d0bf794"
+    },
+    "value": 22,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "frequency": 2400000000,
+    "bandwidth": 1000000,
+    "channel": 3,
+    "modulation": "GFSK",
+    "config_entry": "[[Weave Mesh]]\n  type = WeaveInterface\n  enabled = yes\n  port = ",
+    "discovery_hash": {
+     "hex": "c65e062ab8d823c10166d59fff444c3718fbc66800e4ad2fc3a2cc3effa0c489"
+    }
+   }
+  },
+  {
+   "label": "tcpclient_type",
+   "app_data": "008b00b2544350436c69656e74496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffaa54435020436c69656e7403c004c005c002ad3139382e35312e3130302e323206cd10926285fc83957b35be7f9571582b50984eef20dbf75c9e0857c0158c9867598d38",
+   "stamp_value": 17,
+   "expected": {
+    "type": "TCPClientInterface",
+    "transport": true,
+    "name": "TCP Client",
+    "stamp": {
+     "hex": "6285fc83957b35be7f9571582b50984eef20dbf75c9e0857c0158c9867598d38"
+    },
+    "value": 17,
+    "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+    "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+    "hops": 128,
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "discovery_hash": {
+     "hex": "75ac358902ccadd05fa88c5fce439294e53e894d7dad6df2c1012797753c14c2"
+    }
+   }
+  },
+  {
+   "label": "low_stamp",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa94c6f77205374616d7003c004c005c002ad3139382e35312e3130302e323306cd1092924611f4d99b4f3da1201c0676e6d05bfc0c95ec7252e3731a2869613949bd7b",
+   "stamp_value": 10,
+   "expected": null
+  },
+  {
+   "label": "short_transport_id",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec408c032aeb51b2d2a2cccfda3524e53ccfca5312e352e32ccffa853686f727420494403c004c005c002ad3139382e35312e3130302e323406cd1092ce26830abf2465631a46013c8f952435418198ae34332afebe3bb4adbb0347dc",
+   "stamp_value": 16,
+   "expected": null
+  },
+  {
+   "label": "bad_reachable_on",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa842616420486f737403c004c005c002ab6e6f74206120686f73742106cd1092a5bf533c76051a270ebe30893b3ee4c37807bc72af3c45c432a47437ad30e3b6",
+   "stamp_value": 17,
+   "expected": null
+  },
+  {
+   "label": "integer_latitude",
+   "app_data": "008b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa7496e74204c6174033404c005c002ad3139382e35312e3130302e323506cd1092379b1e0acd0c55f9f74e8b44e7aa182ff76f7b030dd6701efb369f5592be7c7d",
+   "stamp_value": 17,
+   "expected": null
+  },
+  {
+   "label": "unknown_type",
+   "app_data": "008b00af53657269616c496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa653657269616c03c004c005c002ad3139382e35312e3130302e323606cd10927eea5f3012855cdbb5345d08992ea3a8bb0eb4e180410c3fd2832894ba7a0882",
+   "stamp_value": 16,
+   "expected": null
+  },
+  {
+   "label": "encrypted_without_network_identity",
+   "app_data": "028b00b14261636b626f6e65496e7465726661636501c3ccfec410c032aeb51b2d2a2c90a2b9deaff79e17ccfda3524e53ccfca5312e352e32ccffa9456e6372797074656403c004c005c002ad3139382e35312e3130302e323706cd1092728418f8f866548eb3eab1fbd4a11185d8feab6f2f89a5b5bcc513e2632b34e3",
+   "stamp_value": 16,
+   "expected": null
+  }
+ ],
+ "stored": {
+  "first_heard": "de0013a474797065b14261636b626f6e65496e74657266616365a97472616e73706f7274c3a46e616d65b24578616d706c65204261636b626f6e652031a87265636569766564cb41dab8e16b3650c1a57374616d70c42035b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171da576616c756510ac7472616e73706f72745f6964d9206330333261656235316232643261326339306132623964656166663739653137aa6e6574776f726b5f6964d9206633306436623530303538613064356632353737646130646466613633326165a4686f7073cc80a86c61746974756465cb404a400000000000a96c6f6e676974756465cb402acccccccccccda6686569676874cb4041000000000000ac726561636861626c655f6f6eaf726e732e6578616d706c652e6f7267a4706f7274cd1092ac636f6e6669675f656e747279d9af5b5b4578616d706c65204261636b626f6e6520315d5d0a202074797065203d20544350436c69656e74496e746572666163650a2020656e61626c6564203d207965730a20207461726765745f686f7374203d20726e732e6578616d706c652e6f72670a20207461726765745f706f7274203d20343234320a20207472616e73706f72745f6964656e74697479203d206330333261656235316232643261326339306132623964656166663739653137ae646973636f766572795f68617368c4201d3b0abbb2370144ce8de6b013ca71ae64840cadad238ca0bda486388a1ce9dcaa646973636f7665726564cb41dab8e16b3650c1aa6c6173745f6865617264cb41dab8e16b3650c1ab68656172645f636f756e7400",
+  "heard_again": "de0013a474797065b14261636b626f6e65496e74657266616365a97472616e73706f7274c3a46e616d65b24578616d706c65204261636b626f6e652031a87265636569766564cb41dab8e17a3650c1a57374616d70c42035b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171da576616c756510ac7472616e73706f72745f6964d9206330333261656235316232643261326339306132623964656166663739653137aa6e6574776f726b5f6964d9206633306436623530303538613064356632353737646130646466613633326165a4686f7073cc80a86c61746974756465cb404a400000000000a96c6f6e676974756465cb402acccccccccccda6686569676874cb4041000000000000ac726561636861626c655f6f6eaf726e732e6578616d706c652e6f7267a4706f7274cd1092ac636f6e6669675f656e747279d9af5b5b4578616d706c65204261636b626f6e6520315d5d0a202074797065203d20544350436c69656e74496e746572666163650a2020656e61626c6564203d207965730a20207461726765745f686f7374203d20726e732e6578616d706c652e6f72670a20207461726765745f706f7274203d20343234320a20207472616e73706f72745f6964656e74697479203d206330333261656235316232643261326339306132623964656166663739653137ae646973636f766572795f68617368c4201d3b0abbb2370144ce8de6b013ca71ae64840cadad238ca0bda486388a1ce9dcaa646973636f7665726564cb41dab8e16b3650c1aa6c6173745f6865617264cb41dab8e17a3650c1ab68656172645f636f756e7401",
+  "endpoint_hash": "183fe32c455586e80affb6741df99427f1344e64a777659b2529d609bfb59171",
+  "first_heard_info": {
+   "type": "BackboneInterface",
+   "transport": true,
+   "name": "Example Backbone 1",
+   "received": 1793295788.8486788,
+   "stamp": {
+    "hex": "35b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171d"
+   },
+   "value": 16,
+   "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+   "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+   "hops": 128,
+   "latitude": 52.5,
+   "longitude": 13.4,
+   "height": 34.0,
+   "reachable_on": "rns.example.org",
+   "port": 4242,
+   "config_entry": "[[Example Backbone 1]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = rns.example.org\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+   "discovery_hash": {
+    "hex": "1d3b0abbb2370144ce8de6b013ca71ae64840cadad238ca0bda486388a1ce9dc"
+   },
+   "discovered": 1793295788.8486788,
+   "last_heard": 1793295788.8486788,
+   "heard_count": 0
+  },
+  "heard_again_info": {
+   "type": "BackboneInterface",
+   "transport": true,
+   "name": "Example Backbone 1",
+   "received": 1793295848.8486788,
+   "stamp": {
+    "hex": "35b90e6b90d38cdeb971df4f450999df8887e807fee2d32b0ed3e23578b8171d"
+   },
+   "value": 16,
+   "transport_id": "c032aeb51b2d2a2c90a2b9deaff79e17",
+   "network_id": "f30d6b50058a0d5f2577da0ddfa632ae",
+   "hops": 128,
+   "latitude": 52.5,
+   "longitude": 13.4,
+   "height": 34.0,
+   "reachable_on": "rns.example.org",
+   "port": 4242,
+   "config_entry": "[[Example Backbone 1]]\n  type = TCPClientInterface\n  enabled = yes\n  target_host = rns.example.org\n  target_port = 4242\n  transport_identity = c032aeb51b2d2a2c90a2b9deaff79e17",
+   "discovery_hash": {
+    "hex": "1d3b0abbb2370144ce8de6b013ca71ae64840cadad238ca0bda486388a1ce9dc"
+   },
+   "discovered": 1793295788.8486788,
+   "last_heard": 1793295848.8486788,
+   "heard_count": 1
+  }
+ },
+ "sanitize_name": [
+  [
+   "",
+   null
+  ],
+  [
+   "zer0bitz",
+   "zer0bitz"
+  ],
+  [
+   "  zer0bitz  ",
+   "zer0bitz"
+  ],
+  [
+   "Example Backbone 1",
+   "Example Backbone 1"
+  ],
+  [
+   "RMAP World",
+   "RMAP World"
+  ],
+  [
+   "My Backbone Node!",
+   "My Backbone Node"
+  ],
+  [
+   "lowercase only",
+   "lowercase only"
+  ],
+  [
+   "Node (EU)",
+   "Node (EU)"
+  ],
+  [
+   "Node (EU) ",
+   "Node (EU)"
+  ],
+  [
+   "(Paren) Node",
+   "Paren) Node"
+  ],
+  [
+   "Caf\u00e9 Z\u00fcrich 2",
+   "Caf Zrich 2"
+  ],
+  [
+   "A     B   C  D",
+   "A B C D"
+  ],
+  [
+   "A\tB",
+   "A\tB"
+  ],
+  [
+   "--- X ---",
+   "X"
+  ],
+  [
+   "123",
+   "123"
+  ],
+  [
+   "\u00c4\u00d6\u00dc",
+   ""
+  ],
+  [
+   "Discovered BackboneInterface",
+   "Discovered BackboneInterface"
+  ],
+  [
+   "x)",
+   "x)"
+  ],
+  [
+   "X)",
+   "X)"
+  ]
+ ],
+ "hosts": [
+  [
+   "rns.example.org",
+   false,
+   true
+  ],
+  [
+   "rns.example.org.",
+   false,
+   true
+  ],
+  [
+   "rns.example.org..",
+   false,
+   false
+  ],
+  [
+   "localhost",
+   false,
+   true
+  ],
+  [
+   "a-b.c",
+   false,
+   true
+  ],
+  [
+   "-a.b",
+   false,
+   false
+  ],
+  [
+   "a-.b",
+   false,
+   false
+  ],
+  [
+   "a_b.c",
+   false,
+   false
+  ],
+  [
+   "1.2.3.4",
+   true,
+   false
+  ],
+  [
+   "1.2.3.4.",
+   false,
+   false
+  ],
+  [
+   "example.123",
+   false,
+   false
+  ],
+  [
+   "123",
+   false,
+   false
+  ],
+  [
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+   false,
+   true
+  ],
+  [
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+   false,
+   false
+  ],
+  [
+   "",
+   false,
+   null
+  ],
+  [
+   ".",
+   false,
+   false
+  ],
+  [
+   "2001:db8::1",
+   true,
+   false
+  ],
+  [
+   "::1",
+   true,
+   false
+  ],
+  [
+   "fe80::1%en0",
+   true,
+   false
+  ],
+  [
+   "256.1.1.1",
+   false,
+   false
+  ],
+  [
+   "1.2.3",
+   false,
+   false
+  ],
+  [
+   "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst.b32.i2p",
+   false,
+   true
+  ],
+  [
+   "example.onion",
+   false,
+   true
+  ]
+ ]
+}
