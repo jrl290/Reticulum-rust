@@ -2860,7 +2860,18 @@ impl Transport {
                 requesting_interface: attached_interface.clone(),
             };
             state.discovery_path_requests.insert(destination_hash.clone(), entry);
-            let interface_list: Vec<String> = state.interfaces.iter().map(|i| i.name.clone()).collect();
+            // RNS 1.5.2 path_request: `if not interface.online: continue`.
+            // Until 2026-11-10 every registered interface was asked, offline
+            // ones included: on the gateway, the bootstrap-only backbones
+            // discovery had torn down and the discovered ones it had rotated
+            // out. Each such request failed in Packet::send ("No interfaces
+            // could process the outbound packet").
+            let interface_list: Vec<String> = state
+                .interfaces
+                .iter()
+                .filter(|i| i.online)
+                .map(|i| i.name.clone())
+                .collect();
             drop(state);
 
             for name in interface_list {
@@ -13129,6 +13140,55 @@ pub(crate) mod tests {
                 "the forwarded path request must carry the ORIGINAL tag — destination_hash + tag \
                  is the only loop suppression path requests have"
             );
+        }
+
+        /// RNS 1.5.2 path_request asks only online interfaces
+        /// (`if not interface.online: continue`). Each request made on an
+        /// offline one failed in Packet::send: on the gateway, 2026-11-10,
+        /// about 250 a minute, for its torn-down bootstrap-only and
+        /// rotated-out discovered backbones. A request made on an interface
+        /// is charged to its announce cap (`announce_allowed_at`), which is
+        /// how this sees one that never reaches a wire.
+        #[test]
+        fn discovery_skips_offline_interfaces() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = Fixture::new(InterfaceStub::MODE_GATEWAY);
+            const OFFLINE_IFACE: &str = "upr-offline";
+            {
+                let mut state = TRANSPORT.lock().unwrap();
+                let mut stub = InterfaceStub::default();
+                stub.name = OFFLINE_IFACE.to_string();
+                stub.out = true;
+                stub.online = false;
+                stub.mode = InterfaceStub::MODE_FULL;
+                stub.bitrate = Some(1_000_000.0);
+                stub.announce_cap = crate::reticulum::ANNOUNCE_CAP / 100.0;
+                state.interfaces.push(stub);
+            }
+            let unknown = Identity::get_random_hash();
+
+            Transport::path_request(
+                unknown.clone(),
+                false,
+                Some(REQ_IFACE.to_string()),
+                None,
+                Some(Identity::get_random_hash()),
+            );
+
+            let emitted = fixture.drain();
+            assert_eq!(
+                emitted.iter().filter(|raw| contains(raw, &unknown)).count(),
+                1,
+                "the online interface is still asked"
+            );
+            let state = TRANSPORT.lock().unwrap();
+            let offline = state.interfaces.iter().find(|i| i.name == OFFLINE_IFACE).unwrap();
+            assert_eq!(
+                offline.announce_allowed_at, 0.0,
+                "a path request was made on an offline interface"
+            );
+            let other = state.interfaces.iter().find(|i| i.name == OTHER_IFACE).unwrap();
+            assert!(other.announce_allowed_at > 0.0, "the charge this test relies on is gone");
         }
 
         #[test]
