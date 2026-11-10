@@ -3,7 +3,7 @@ use crate::transport::Transport;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -155,6 +155,11 @@ pub struct TcpClientInterface {
     /// `start_read_loop` is restarted (e.g. after detach/reattach).
     /// Cleared when the heartbeat thread exits.
     pub heartbeat_running: bool,
+    /// For a connection a TCPServerInterface accepted: that server's list
+    /// of connected clients, which this connection leaves when it closes,
+    /// as RNS's TCPClientInterface.teardown removes itself from
+    /// parent_interface.spawned_interfaces. None for an initiator.
+    pub parent_spawned: Option<Weak<Mutex<Vec<Arc<Mutex<TcpClientInterface>>>>>>,
 }
 
 impl TcpClientInterface {
@@ -269,6 +274,7 @@ impl TcpClientInterface {
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
             heartbeat_running: false,
+            parent_spawned: None,
         };
 
         // Attempt initial connection.  If it fails, the interface is still
@@ -321,6 +327,7 @@ impl TcpClientInterface {
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
             heartbeat_running: false,
+            parent_spawned: None,
         }
     }
 
@@ -1084,7 +1091,26 @@ impl TcpClientInterface {
                 // If we have no socket, skip straight to the reconnect logic
                 // instead of breaking out entirely.
                 if socket_result.is_none() {
-                    let iface_name = interface.lock().unwrap().base.name.clone();
+                    let (iface_name, initiator) = {
+                        let iface = interface.lock().unwrap();
+                        (iface.base.name.clone(), iface.initiator)
+                    };
+                    if !initiator {
+                        // An accepted connection cannot be reconnected: RNS
+                        // refuses ("Attempt to reconnect on a non-initiator
+                        // TCP interface") and tears it down.
+                        Self::teardown_accepted(&interface);
+                        if let Some(ref name) = iface_name {
+                            Transport::set_interface_online(name, false);
+                            Transport::deregister_interface_stub(name);
+                            Transport::unregister_outbound_handler(name);
+                        }
+                        crate::log(
+                            &format!("TCP server client {:?} has no usable socket, deregistered", iface_name),
+                            crate::LOG_WARNING, false, false,
+                        );
+                        break 'running;
+                    }
                     crate::log(
                         &format!("TCP read loop: no socket for {:?}, entering reconnect", iface_name),
                         crate::LOG_NOTICE, false, false,
@@ -1385,6 +1411,7 @@ impl TcpClientInterface {
 
                 // For server-side (accepted) connections, deregister and stop.
                 if !is_initiator {
+                    Self::teardown_accepted(&interface);
                     let iface_name = interface.lock().unwrap().base.name.clone();
                     if let Some(ref name) = iface_name {
                         crate::transport::Transport::deregister_interface_stub(name);
@@ -1557,6 +1584,23 @@ impl TcpClientInterface {
                 iface.heartbeat_running = false;
             }
         });
+    }
+
+    /// A connection a TCPServerInterface accepted has closed: it is done for
+    /// good, as RNS's teardown() makes it. Marked detached, so its
+    /// heartbeat thread exits at its next tick, and removed from the
+    /// server's list of clients, which otherwise kept every connection
+    /// ever accepted, and its heartbeat thread, alive. The gateway reached
+    /// 815 such threads and 857 MB in 12 days (2026-11-10).
+    fn teardown_accepted(interface: &Arc<Mutex<TcpClientInterface>>) {
+        let parent = {
+            let mut iface = interface.lock().unwrap();
+            iface.detached = true;
+            iface.parent_spawned.take()
+        };
+        if let Some(list) = parent.and_then(|weak| weak.upgrade()) {
+            list.lock().unwrap().retain(|client| !Arc::ptr_eq(client, interface));
+        }
     }
 
     /// Detach interface
@@ -1836,6 +1880,8 @@ impl TcpServerInterface {
                             iface.target_ip = addr.ip().to_string();
                             iface.target_port = addr.port();
                         }
+
+                        iface.parent_spawned = Some(Arc::downgrade(&spawned));
 
                         iface_name = iface.base.name.clone().unwrap_or_default();
                         println!("Spawned new TCPClient Interface: {}", iface.to_string());
@@ -2987,6 +3033,68 @@ mod keepalive_readback_tests {
                 "an option read back as not honoured (i2p_tunneled={}): see the warning logged above",
                 i2p_tunneled
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod accepted_teardown_tests {
+    use super::{TcpClientInterface, TcpServerInterface};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // ────────────────────────────────────────────────────────────────────
+    // A connection a TCPServerInterface accepted is torn down when it closes
+    //
+    // 2026-11-10, the gateway rnsd after 12 days: 841 threads, 815 of them
+    // heartbeat loops of client connections long closed, and 857 MB. The
+    // read loop deregistered a closed connection from Transport but left it
+    // in the server's list of clients and never marked it detached, the
+    // heartbeat's only exit. RNS's teardown() removes it from
+    // parent_interface.spawned_interfaces.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    fn a_closed_accepted_connection_leaves_the_server_and_stops_its_heartbeat() {
+        fn within(cond: impl Fn() -> bool, limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            while !cond() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            true
+        }
+
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut config = std::collections::HashMap::new();
+        config.insert("name".to_string(), "teardown-test".to_string());
+        config.insert("listen_ip".to_string(), "127.0.0.1".to_string());
+        config.insert("listen_port".to_string(), port.to_string());
+        let server = TcpServerInterface::new(&config).unwrap();
+
+        let peers: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+            .collect();
+        assert!(within(|| server.clients() == 3, Duration::from_secs(5)),
+            "the server never listed the 3 connections ({})", server.clients());
+        let accepted: Vec<Arc<Mutex<TcpClientInterface>>> =
+            server.spawned_interfaces.lock().unwrap().clone();
+        for client in &accepted {
+            let iface = client.lock().unwrap();
+            assert!(!iface.detached);
+            assert!(iface.heartbeat_running, "accepted connections run a heartbeat");
+        }
+
+        drop(peers);
+
+        assert!(within(|| server.clients() == 0, Duration::from_secs(5)),
+            "closed connections stayed in the server's list ({})", server.clients());
+        for client in &accepted {
+            assert!(client.lock().unwrap().detached,
+                "a closed connection was not detached, so its heartbeat thread never exits");
         }
     }
 }
