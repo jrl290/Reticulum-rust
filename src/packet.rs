@@ -327,7 +327,9 @@ impl Packet {
     /// one — OR when no interface could take it. Read `self.sent` to tell the
     /// two apart (RNS/Packet.py send() returns False for the latter; rfed's
     /// fan-out misread the former as a failure until 2026-09-24).
+    #[track_caller]
     pub fn send(&mut self) -> Result<Option<PacketReceipt>, String> {
+        let caller = std::panic::Location::caller();
         if self.sent {
             return Err("Packet was already sent".to_string());
         }
@@ -359,12 +361,37 @@ impl Packet {
         } else {
             self.sent = false;
             self.receipt = None;
-            log("No interfaces could process the outbound packet", LOG_ERROR, false, false);
+            log(&format!("No interfaces could process the outbound packet: {}", self.unsent_detail(caller)), LOG_ERROR, false, false);
             Ok(None)
         }
     }
 
+    /// DIAGNOSTIC (2026-11-10): what a packet no interface took was and
+    /// which call sent it. The gateway logged ~250 a minute of the bare
+    /// line, and nothing said which. RNS 1.5.2 logs the hop count, type and
+    /// destination at LOG_DEBUG; this keeps it at LOG_ERROR until the source
+    /// is found.
+    fn unsent_detail(&self, caller: &std::panic::Location) -> String {
+        let link = self.destination.as_ref().and_then(|d| d.link.as_ref()).map(|l| {
+            format!(" link_iface={:?} link_closed={}", l.attached_interface, l.status_closed)
+        });
+        format!(
+            "{} hop, type {} ctx {} dtype {:?} dest {} attached={:?}{} from {}:{}",
+            self.hops,
+            self.packet_type,
+            self.context,
+            self.destination_type,
+            self.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            self.attached_interface,
+            link.unwrap_or_default(),
+            caller.file(),
+            caller.line(),
+        )
+    }
+
+    #[track_caller]
     pub fn resend(&mut self) -> Result<Option<PacketReceipt>, String> {
+        let caller = std::panic::Location::caller();
         if !self.sent {
             return Err("Packet was not sent yet".to_string());
         }
@@ -375,7 +402,7 @@ impl Packet {
         } else {
             self.sent = false;
             self.receipt = None;
-            log("No interfaces could process the outbound packet", LOG_ERROR, false, false);
+            log(&format!("Re-send failed. No interfaces could process the outbound packet: {}", self.unsent_detail(caller)), LOG_ERROR, false, false);
             Ok(None)
         }
     }
