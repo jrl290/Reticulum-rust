@@ -3,7 +3,7 @@ use crate::identity::Identity;
 use crate::identity::{full_hash, truncated_hash, HASHLENGTH, SIGLENGTH};
 use crate::reticulum;
 use crate::transport::Transport;
-use crate::{log, LOG_ERROR};
+use crate::{log, LOG_DEBUG, LOG_WARNING};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -361,27 +361,31 @@ impl Packet {
         } else {
             self.sent = false;
             self.receipt = None;
-            log(&format!("No interfaces could process the outbound packet: {}", self.unsent_detail(caller)), LOG_ERROR, false, false);
+            // RNS 1.5.2 Packet.send: LOG_DEBUG. A packet no interface takes is
+            // routine: on the gateway (2026-11-10, ~170 a minute) every one was
+            // a path request discovery made on the shared-instance server,
+            // which is online but cannot send (OUT=False), as in the reference.
+            log(&format!("No interfaces could process the outbound {}", self.unsent_detail(caller)), LOG_DEBUG, false, false);
             Ok(None)
         }
     }
 
-    /// DIAGNOSTIC (2026-11-10): what a packet no interface took was and
-    /// which call sent it. The gateway logged ~250 a minute of the bare
-    /// line, and nothing said which. RNS 1.5.2 logs the hop count, type and
-    /// destination at LOG_DEBUG; this keeps it at LOG_ERROR until the source
-    /// is found.
+    /// What a packet no interface took was, and which call sent it: RNS
+    /// 1.5.2's "{hops} hop, type {type} packet for {destination}", plus the
+    /// context, the attached interface, a link's interface and state, and
+    /// the caller. The bare line told nothing (2026-11-10: the gateway logged
+    /// ~250 a minute of it, and only this detail found their source).
     fn unsent_detail(&self, caller: &std::panic::Location) -> String {
         let link = self.destination.as_ref().and_then(|d| d.link.as_ref()).map(|l| {
             format!(" link_iface={:?} link_closed={}", l.attached_interface, l.status_closed)
         });
         format!(
-            "{} hop, type {} ctx {} dtype {:?} dest {} attached={:?}{} from {}:{}",
+            "{} hop, type {} packet for {} (ctx {} dtype {:?} attached={:?}{} from {}:{})",
             self.hops,
             self.packet_type,
+            self.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
             self.context,
             self.destination_type,
-            self.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
             self.attached_interface,
             link.unwrap_or_default(),
             caller.file(),
@@ -402,7 +406,7 @@ impl Packet {
         } else {
             self.sent = false;
             self.receipt = None;
-            log(&format!("Re-send failed. No interfaces could process the outbound packet: {}", self.unsent_detail(caller)), LOG_ERROR, false, false);
+            log(&format!("Re-send failed. No interfaces could process the outbound {}", self.unsent_detail(caller)), LOG_WARNING, false, false);
             Ok(None)
         }
     }
