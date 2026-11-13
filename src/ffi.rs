@@ -565,10 +565,35 @@ pub fn rnode_iface_create(
 /// handle and wire the interface into the global Transport. Blocks for
 /// roughly 2-4 seconds while the radio is probed and configured. RX bytes
 /// must be fed in via [`rnode_iface_feed`] for this to succeed.
+/// Register a configured RNode's interface stub with Transport and bring it
+/// online as an up-edge: registered offline, then `set_interface_online`,
+/// which logs "transitioned online" and tells every interface-up listener
+/// (app-links attempts its links; the iOS host re-sends its Distro Sync
+/// outbox). Online it must be: the device handshake just succeeded and the
+/// callback transport to it is live, and an offline stub both gates outbound
+/// traffic and makes `interface_online()` lie to the UI. Until 2026-11-13 the
+/// stub was registered already online, which no listener hears, so an iPad
+/// whose only interface was an RNode never retried its RFed link once the
+/// radio came up. If the stub already existed online (a previous run that
+/// did not clean up), nothing changes.
+#[cfg(any(feature = "serial", test))]
+fn register_rnode_stub_online(name: &str, bitrate: Option<u64>) {
+    use crate::transport::{InterfaceStub, InterfaceStubConfig};
+
+    let mut stub_cfg = InterfaceStubConfig::default();
+    stub_cfg.name = name.to_string();
+    stub_cfg.mode = InterfaceStub::MODE_FULL;
+    stub_cfg.out = true;
+    stub_cfg.online = Some(false);
+    stub_cfg.bitrate = bitrate;
+    stub_cfg.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
+    Transport::register_interface_stub_config(stub_cfg);
+    Transport::set_interface_online(name, true);
+}
+
 #[cfg(feature = "serial")]
 pub fn rnode_iface_configure(iface_handle: u64) -> Result<(), String> {
     use crate::interfaces::rnode_interface::RNodeInterface;
-    use crate::transport::{InterfaceStub, InterfaceStubConfig};
 
     let h: RNodeCallbackHandle = get_handle(iface_handle)
         .ok_or_else(|| "invalid RNode handle".to_string())?;
@@ -576,22 +601,8 @@ pub fn rnode_iface_configure(iface_handle: u64) -> Result<(), String> {
     RNodeInterface::configure_device_shared(&h.interface)
         .map_err(|e| format!("RNode configure failed: {}", e))?;
 
-    let mut stub_cfg = InterfaceStubConfig::default();
-    stub_cfg.name = h.name.clone();
-    stub_cfg.mode = InterfaceStub::MODE_FULL;
-    stub_cfg.out = true;
-    // Mark the stub online — the device handshake just succeeded and we have
-    // a live callback transport to it. Without this, Transport sees the
-    // interface as offline (default), which both gates outbound traffic and
-    // makes `interface_online()` lie to UI status indicators.
-    stub_cfg.online = Some(true);
     let bitrate = h.interface.lock().unwrap().bitrate;
-    stub_cfg.bitrate = if bitrate > 0 { Some(bitrate) } else { None };
-    stub_cfg.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
-    Transport::register_interface_stub_config(stub_cfg);
-    // Belt-and-braces: if the stub already existed (e.g. previous run that
-    // didn't clean up), the register call above is a no-op. Force online.
-    Transport::set_interface_online(&h.name, true);
+    register_rnode_stub_online(&h.name, if bitrate > 0 { Some(bitrate) } else { None });
 
     let handler_iface = Arc::clone(&h.interface);
     let name = h.name.clone();
@@ -1164,6 +1175,19 @@ impl ResponseWaitState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A configured RNode's stub comes online as an up-edge that interface-up
+    // listeners hear (app-links attempts its links once the radio is up). On
+    // 2026-11-13 it was registered already online, and no listener heard it:
+    // the iPad on an RNode never retried its RFed link.
+    #[test]
+    fn an_rnode_stub_comes_online_as_an_up_edge() {
+        let name = "ffi-rnode-up-edge-test";
+        let before = Transport::interface_up_edges();
+        register_rnode_stub_online(name, Some(810));
+        assert!(Transport::online_interface_names().iter().any(|n| n == name), "the stub is online");
+        assert!(Transport::interface_up_edges() > before, "its coming online is an up-edge");
+    }
 
     #[test]
     fn with_handle_mut_changes_the_value_in_place_and_keeps_the_handle() {
