@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hkdf::Hkdf;
 use once_cell::sync::Lazy;
@@ -245,7 +245,17 @@ fn job_parallel(stamp_cost: u32, workblock: &[u8], material: &[u8]) -> (Option<V
     }
     drop(tx);
 
-    let stamp = rx.recv_timeout(Duration::from_secs(30)).ok();
+    // Wait for a worker's stamp for as long as the search takes, as the
+    // reference does (LXMF LXStamper.job_linux, `result_queue.get()`). The
+    // search ends one of two ways: a worker finds a stamp and sends it, or the
+    // work is cancelled (cancel_work), every worker leaves its loop without
+    // sending, the last sender drops, and recv() returns an error, read as no
+    // stamp. Until 2026-11-18 this gave up after 30 s, which the reference
+    // never does: on iOS, where this path runs, a propagation stamp slowed by
+    // other work came back as none, so a message to a distro went without its
+    // copy for the distro's offline devices, and the same limit could fail the
+    // router's own stamp and so the message.
+    let stamp = rx.recv().ok();
     stop_flag.store(true, Ordering::SeqCst);
     if let Ok(mut jobs) = ACTIVE_JOBS.lock() { jobs.remove(material); }
 
@@ -364,6 +374,18 @@ mod tests {
         assert_eq!(stamp.len(), LXStamper::STAMP_SIZE);
         assert!(value >= 8);
         assert!(LXStamper::stamp_valid(&stamp, 8, &workblock));
+    }
+
+    /// The parallel search (iOS, Linux, FreeBSD) returns the stamp a worker
+    /// found, and leaves no active job behind. It has no time limit of its own,
+    /// as the reference's has none.
+    #[test]
+    fn the_parallel_search_returns_a_valid_stamp() {
+        let workblock = LXStamper::stamp_workblock(b"parallel-found", 16);
+        let (stamp, _rounds) = job_parallel(8, &workblock, b"parallel-found");
+        let stamp = stamp.expect("a cost-8 search finds a stamp");
+        assert!(LXStamper::stamp_valid(&stamp, 8, &workblock));
+        assert!(!ACTIVE_JOBS.lock().unwrap().contains_key(b"parallel-found".as_slice()));
     }
 
     #[test]
