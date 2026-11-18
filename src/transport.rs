@@ -487,8 +487,8 @@ pub struct TransportState {
     pub receipts: Vec<crate::packet::PacketReceipt>,
     pub announce_table: HashMap<Vec<u8>, Vec<AnnounceEntryValue>>,
     /// Multi-path table: each destination hash maps to a bounded deque of
-    /// `PathEntry` (max N=3), newest-first. See `PathEntry::score()` for
-    /// the selection priority formula (bitrate / (hops + 1)).
+    /// `PathEntry` (max N=3), newest-first. `select_path_excluding` says
+    /// which entry a packet takes: the fewest hops, as in the reference.
     pub path_table: HashMap<Vec<u8>, VecDeque<PathEntry>>,
     pub reverse_table: HashMap<Vec<u8>, Vec<ReverseEntryValue>>,
     pub link_table: HashMap<Vec<u8>, Vec<LinkEntryValue>>,
@@ -675,14 +675,6 @@ pub struct PathEntry {
 }
 
 impl PathEntry {
-    /// Quality score: higher is better.  Uses `bitrate / (hops + 1)` so
-    /// fast interfaces with few hops win.  Falls back to a nominal
-    /// 1000 bps when the interface bitrate is unknown (still hop-aware).
-    pub fn score(&self, interface_bitrate: Option<f64>) -> f64 {
-        let br = interface_bitrate.unwrap_or(1000.0);
-        br / (self.hops as f64 + 1.0)
-    }
-
     /// True when this entry's expiry has elapsed.
     pub fn is_expired(&self, now: f64) -> bool {
         now >= self.expires
@@ -4264,7 +4256,7 @@ impl Transport {
             && packet.destination_type != Some(crate::destination::DestinationType::Group)
             && destination_hash.is_some();
 
-        let mut all_paths: Vec<(usize, f64, PathEntry)> = Vec::new();
+        let mut all_paths: Vec<(usize, PathEntry)> = Vec::new();
         if path_routable {
             let dest_hash = destination_hash.as_ref().unwrap();
             all_paths = Self::select_all_paths(&state.path_table, &state.interfaces, dest_hash, outbound_time);
@@ -4303,7 +4295,7 @@ impl Transport {
             // shortened, matching Python's mark-path-unresponsive intent.
             let single_path_only = true;
 
-            for (_idx, _score, entry) in &all_paths {
+            for (_idx, entry) in &all_paths {
                 let hops = entry.hops;
                 let outbound_interface_name = entry.receiving_interface.clone();
                 let outbound_interface_exists = outbound_interface_name
@@ -5263,10 +5255,8 @@ impl Transport {
 
     // ── Path selection helper ────────────────────────────────────────────────
 
-    /// Select the best non-expired `PathEntry` for `destination_hash`.
-    /// Iterates the deque (newest-first), skips expired entries, and
-    /// returns the one with the highest `score()` (bitrate / (hops+1)).
-    /// Returns `None` when the deque is empty or all entries are expired.
+    /// The path a packet for `destination_hash` takes: `select_path_excluding`
+    /// with no interface excluded. `None` when no entry is usable.
     fn select_path(
         table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
         interfaces: &[InterfaceStub],
@@ -5276,7 +5266,26 @@ impl Transport {
         Self::select_path_excluding(table, interfaces, destination_hash, now, None)
     }
 
-    /// `select_path` with split-horizon support.
+    /// The path a packet for `destination_hash` takes. Of the usable entries
+    /// (not expired, on an interface that is registered and online, and not
+    /// on `exclude_interface`), the one with the fewest hops; of equal hop
+    /// counts, the newest, as the deque is newest-first.
+    ///
+    /// Fewest hops is the reference's choice. RNS keeps one path per
+    /// destination and lets an announce replace it only with as few or fewer
+    /// hops, or once it has expired (RNS/Transport.py, inbound announce), so
+    /// a copy of an announce that came back the long way round never takes
+    /// the place of the short path. An interface's bitrate plays no part.
+    ///
+    /// Until 2026-11-18 the entries were ranked by bitrate / (hops + 1). A
+    /// TCPServerInterface's clients register no bitrate and counted as
+    /// 1 kbit/s, and auto-connected backbones register 5 Mbit/s, so on the
+    /// gateway a copy of rfed's announce that a backbone sent back at 3 hops
+    /// beat rfed's own 1-hop LAN connection 2,500 to 1. A link request to rfed
+    /// went out to that backbone and came back; its second pass replaced the
+    /// link-table entry, rfed's proof followed it out to the backbone, and on
+    /// its return the gateway dropped it ("Link PROOF dispatch FAILED (link
+    /// not found)"). Channel posts from the web client and the phones failed.
     ///
     /// `exclude_interface` drops any path entry whose receiving interface is
     /// the interface a transit packet just arrived on.  Forwarding a transit
@@ -5292,7 +5301,7 @@ impl Transport {
         exclude_interface: Option<&str>,
     ) -> Option<(usize, PathEntry)> {
         let entries = table.get(destination_hash)?;
-        let mut best: Option<(usize, f64, PathEntry)> = None;
+        let mut best: Option<(usize, PathEntry)> = None;
         for (idx, entry) in entries.iter().enumerate() {
             if entry.is_expired(now) {
                 continue;
@@ -5311,8 +5320,8 @@ impl Transport {
             // single-entry Python path table never holds a live path on a
             // dead interface for long because inbound re-announce overwrites
             // it; our multi-entry table keeps stale forks, so we must gate on
-            // interface online status here.  Without this a fresh path on a
-            // dead interface (e.g. RMap) out-scores a live one (MichMesh).
+            // interface online status here.  Without this a path on a dead
+            // interface (e.g. RMap) is chosen over a live one (MichMesh).
             // An interface that is not registered at all is not "online by
             // default": it is gone. A persisted route can outlive a config
             // change (the gateway kept routing rfed via a MichMesh entry for
@@ -5325,16 +5334,13 @@ impl Transport {
                     _ => continue,
                 }
             }
-            let bitrate = entry.receiving_interface.as_ref()
-                .and_then(|name| interfaces.iter().find(|i| &i.name == name))
-                .and_then(|i| i.bitrate);
-            let score = entry.score(bitrate);
-            match best {
-                Some((_, best_score, _)) if score <= best_score => {},
-                _ => { best = Some((idx, score, entry.clone())); }
+            // Fewest hops; an equal count keeps the newer entry found first.
+            match &best {
+                Some((_, chosen)) if entry.hops >= chosen.hops => {}
+                _ => best = Some((idx, entry.clone())),
             }
         }
-        best.map(|(idx, _, e)| (idx, e))
+        best
     }
 
     /// Select the best path entry for a destination (convenience wrapper).
@@ -5347,21 +5353,22 @@ impl Transport {
         Self::select_path(&state.path_table, &interfaces, destination_hash, now_ts)
     }
 
-    /// Return all non-expired path entries for `destination_hash`, sorted
-    /// by `score()` descending (best first).  Used by outbound hedging:
-    /// each stale entry triggers a fallback send on the next-best entry,
-    /// stopping at the first fresh one.
+    /// Return all usable path entries for `destination_hash` in the order
+    /// `select_path_excluding` prefers them: fewest hops first, the newer
+    /// first among equal counts (the sort is stable over the newest-first
+    /// deque).  Used by outbound hedging: each stale entry triggers a
+    /// fallback send on the next entry, stopping at the first fresh one.
     fn select_all_paths(
         table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
         interfaces: &[InterfaceStub],
         destination_hash: &[u8],
         now: f64,
-    ) -> Vec<(usize, f64, PathEntry)> {
+    ) -> Vec<(usize, PathEntry)> {
         let entries = match table.get(destination_hash) {
             Some(e) => e,
             None => return Vec::new(),
         };
-        let mut scored: Vec<(usize, f64, PathEntry)> = entries
+        let mut usable: Vec<(usize, PathEntry)> = entries
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.is_expired(now))
@@ -5376,20 +5383,10 @@ impl Transport {
                     .unwrap_or(false),
                 None => true,
             })
-            .map(|(idx, e)| {
-                let bitrate = e
-                    .receiving_interface
-                    .as_ref()
-                    .and_then(|name| interfaces.iter().find(|i| &i.name == name))
-                    .and_then(|i| i.bitrate);
-                let score = e.score(bitrate);
-                (idx, score, e.clone())
-            })
+            .map(|(idx, e)| (idx, e.clone()))
             .collect();
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored
+        usable.sort_by_key(|(_, e)| e.hops);
+        usable
     }
 
     pub fn has_path(destination_hash: &[u8]) -> bool {
@@ -6233,11 +6230,13 @@ impl Transport {
                     //      from the backbones at three hops, and the gateway then
                     //      forwarded LAN-bound pushes out to the public mesh.
                     //   5. No quality gate on admission — multiple paths coexist;
-                    //      select_path() picks the best at forwarding time via
-                    //      bitrate/hops score.
+                    //      select_path() picks one at forwarding time: the
+                    //      fewest hops, as the reference does (2026-11-18; it
+                    //      was bitrate / (hops + 1), see select_path_excluding).
                     //
                     // This eliminates:
-                    //   • Convergence race (fast-WiFi 3-hop vs slow-LoRa 2-hop)
+                    //   • Convergence race (the choice no longer depends on
+                    //     which copy of an announce landed last)
                     //   • Deadlock (UNRESPONSIVE poison blocking better paths)
                     //   • Silent discard of backup topology
                     // ──────────────────────────────────────────────────────────────────────
@@ -9998,7 +9997,7 @@ pub(crate) mod tests {
         let chosen = Transport::select_path(&table, &interfaces, &dest, now_ts).expect("the live route is selectable");
         assert_eq!(chosen.1.receiving_interface.as_deref(), Some("rns.sofia"), "the fewer-hop route on a vanished interface must lose");
         let all = Transport::select_all_paths(&table, &interfaces, &dest, now_ts);
-        assert!(all.iter().all(|(_, _, e)| e.receiving_interface.as_deref() == Some("rns.sofia")), "hedging must not fall back to the vanished interface either");
+        assert!(all.iter().all(|(_, e)| e.receiving_interface.as_deref() == Some("rns.sofia")), "hedging must not fall back to the vanished interface either");
 
         table.insert(dest.clone(), VecDeque::from(vec![route("MichMesh", 1)]));
         assert!(Transport::select_path(&table, &interfaces, &dest, now_ts).is_none(), "only a vanished route: no path, so a path request goes out instead of a drop");
@@ -12056,7 +12055,7 @@ pub(crate) mod tests {
     // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4.
 
     /// Unit-level: `select_path_excluding` must skip the arrival interface
-    /// even when that entry scores best, and fall back to a real alternate.
+    /// even when that entry would be chosen, and fall back to a real alternate.
     #[test]
     fn select_path_excluding_skips_arrival_interface() {
         let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -12086,8 +12085,8 @@ pub(crate) mod tests {
         assert_eq!(
             unrestricted.receiving_interface.as_deref(),
             Some(arrival),
-            "fixture invariant: the arrival-interface entry must be the best-scoring one, \
-             otherwise this test proves nothing"
+            "fixture invariant: the arrival-interface entry must be the one chosen without \
+             the exclusion, otherwise this test proves nothing"
         );
 
         // With exclusion we must fall back to the genuine alternate.
@@ -12142,8 +12141,8 @@ pub(crate) mod tests {
         register_test_iface(alternate, true, None);
 
         // Path table mirrors the gateway: the looped entry learned back
-        // through the arrival interface scores BEST, the genuine route is
-        // older and longer.
+        // through the arrival interface is the one chosen without the
+        // exclusion (fewer hops); the genuine route is older and longer.
         {
             let mut state = TRANSPORT.lock().unwrap();
             let mut deque = VecDeque::new();
@@ -12207,9 +12206,9 @@ pub(crate) mod tests {
         let online_name = "test-sp-online";
         let offline_name = "test-sp-offline";
 
-        // Online interface is SLOWER (lower bitrate) and its path is OLDER —
-        // naive score/freshness would prefer the offline one.  The
-        // interface.OUT gate must override that.
+        // The offline interface's path has FEWER hops and is newer — without
+        // the interface.OUT gate it would be chosen.  The gate must override
+        // that.
         register_test_iface(online_name, true, Some(1_000));
         register_test_iface(offline_name, false, Some(1_000_000));
 
@@ -12259,6 +12258,146 @@ pub(crate) mod tests {
             !Transport::has_path(&dest_hash),
             "has_path must be false when the only path is on an offline interface"
         );
+    }
+
+    // ── Regression: the path with the fewest hops is chosen ─────────────
+    //
+    // The bug (2026-11-18, production gateway): rfed's addresses were held
+    // at one hop through rfed's own LAN connection, a TCPServerInterface
+    // client that registers no bitrate, and at three hops through Sosnitz,
+    // an auto-connected backbone registered at 5 Mbit/s, which had sent
+    // rfed's announce back. Ranked by bitrate / (hops + 1) Sosnitz won,
+    // 1,250,000 to 500. A link request from the web client (arriving on the
+    // PostInterface Bridge) went out to Sosnitz and came back; the second
+    // pass replaced the link-table entry, rfed's proof followed it out to
+    // Sosnitz, and the gateway dropped it on its return. Web and iOS channel
+    // posts failed. The reference never lets a longer copy of an announce
+    // take the place of a shorter path. In both tests the backbone's entry is
+    // the newer one, so recency cannot be what decides.
+
+    #[test]
+    fn the_path_with_the_fewest_hops_is_chosen_whatever_the_bitrate() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let dest_hash = vec![0x2B; 16];
+        let lan = "test-fh-Client on LAN [192.168.2.23:34492]";
+        let backbone = "test-fh-Sosnitz";
+        let bridge = "test-fh-PostInterface Bridge";
+        // As on the gateway: a TCPServerInterface client registers no
+        // bitrate, an auto-connected backbone 5 Mbit/s, the bridge 200 kbit/s.
+        register_test_iface(lan, true, None);
+        register_test_iface(backbone, true, Some(5_000_000));
+        register_test_iface(bridge, true, Some(200_000));
+
+        let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+        let mut deque = VecDeque::new();
+        deque.push_back(make_test_path_entry(vec![0x8F; 16], 3, Some(backbone.to_string()), 0.0));
+        deque.push_back(make_test_path_entry(dest_hash.clone(), 1, Some(lan.to_string()), 60.0));
+        table.insert(dest_hash.clone(), deque);
+        let interfaces = Transport::get_interface_list();
+
+        let (_, chosen) =
+            Transport::select_path_excluding(&table, &interfaces, &dest_hash, now(), Some(bridge))
+                .expect("a path must be selectable");
+        assert_eq!(
+            chosen.receiving_interface.as_deref(),
+            Some(lan),
+            "the 1-hop LAN path must be chosen over the 3-hop backbone copy, whatever their bitrates"
+        );
+        let order: Vec<String> = Transport::select_all_paths(&table, &interfaces, &dest_hash, now())
+            .into_iter()
+            .filter_map(|(_, e)| e.receiving_interface)
+            .collect();
+        assert_eq!(order, vec![lan.to_string(), backbone.to_string()], "hedging walks the fewest hops first");
+
+        // Of equal hop counts, the newer entry (the front of the deque).
+        let mut tied = VecDeque::new();
+        tied.push_back(make_test_path_entry(vec![0x8F; 16], 2, Some(backbone.to_string()), 0.0));
+        tied.push_back(make_test_path_entry(vec![0x01; 16], 2, Some(lan.to_string()), 60.0));
+        table.insert(dest_hash.clone(), tied);
+        let (_, newer) = Transport::select_path(&table, &interfaces, &dest_hash, now())
+            .expect("a path must be selectable");
+        assert_eq!(newer.receiving_interface.as_deref(), Some(backbone), "of equal hop counts, the newer entry");
+    }
+
+    #[test]
+    fn a_transit_link_request_goes_to_the_one_hop_lan_path_not_out_to_a_backbone() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+
+        let bridge = "test-fh-transit-PostInterface Bridge";
+        let lan = "test-fh-transit-Client on LAN [192.168.2.23:34492]";
+        let backbone = "test-fh-transit-Sosnitz";
+        let dest_hash = vec![0x2C; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(local_identity);
+            state.transport_enabled = true;
+            state.is_connected_to_shared_instance = false;
+            state.link_table.clear();
+            state.packet_hashlist.clear();
+            state.packet_hashlist_prev.clear();
+        }
+
+        register_test_iface(bridge, true, Some(200_000));
+        register_test_iface(lan, true, None);
+        register_test_iface(backbone, true, Some(5_000_000));
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut deque = VecDeque::new();
+            deque.push_back(make_test_path_entry(vec![0x8F; 16], 3, Some(backbone.to_string()), 0.0));
+            deque.push_back(make_test_path_entry(dest_hash.clone(), 1, Some(lan.to_string()), 60.0));
+            state.path_table.insert(dest_hash.clone(), deque);
+        }
+
+        let captured_lan: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_backbone: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(lan, captured_lan.clone());
+        install_sync_outbound_handler(backbone, captured_backbone.clone());
+
+        // A HEADER_2 LINKREQUEST addressed to this node, from the web client
+        // through the bridge.
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let flags: u8 =
+            (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (crate::packet::LINKREQUEST & 0x03);
+        let mut raw = vec![flags, 1u8];
+        raw.extend_from_slice(&local_hash[..dst_len]);
+        raw.extend_from_slice(&dest_hash);
+        raw.push(crate::packet::NONE);
+        raw.extend_from_slice(&vec![0x55; 64]);
+
+        Transport::inbound(raw, Some(bridge.to_string()));
+
+        let to_lan = captured_lan.lock().unwrap().len();
+        let to_backbone = captured_backbone.lock().unwrap().len();
+        let next_hop_interface = {
+            let state = TRANSPORT.lock().unwrap();
+            state.link_table.values().next().and_then(|entry| {
+                entry.iter().find_map(|value| match value {
+                    LinkEntryValue::NextHopInterface(name) => name.clone(),
+                    _ => None,
+                })
+            })
+        };
+
+        uninstall_sync_outbound_handler(lan);
+        uninstall_sync_outbound_handler(backbone);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.link_table.clear();
+            state.path_table.remove(&dest_hash);
+        }
+
+        assert_eq!(to_backbone, 0, "the link request must not go out to the backbone");
+        assert_eq!(to_lan, 1, "the link request must go to the 1-hop LAN connection");
+        assert_eq!(next_hop_interface.as_deref(), Some(lan), "the link table must expect the proof from the LAN connection");
     }
 
     /// What the other interfaces saw of one announce arriving on a source
