@@ -150,6 +150,11 @@ pub struct TcpClientInterface {
     /// /memories/repo/rfed-tcp-watchdog-failure.md).
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     force_read_exit: Arc<AtomicBool>,
+    /// Set by `process_outgoing` when the socket's write limit ended the
+    /// connection (the peer took nothing for the reference's dead time);
+    /// taken by the read loop, which then counts the connection as a
+    /// reject (`next_reject_streak`).
+    dead_time_teardown: bool,
     /// Sentinel set when `start_heartbeat_loop` has spawned the
     /// per-interface heartbeat thread. Prevents double-spawn when
     /// `start_read_loop` is restarted (e.g. after detach/reattach).
@@ -191,6 +196,23 @@ impl TcpClientInterface {
             previous.saturating_add(1)
         } else {
             0
+        }
+    }
+
+    /// As `next_short_lived_streak`, but a connection the reference's dead
+    /// time ended (`stalled`: the peer took nothing for DP_EC_DEAD_TIME)
+    /// counts as a reject however long it lasted. A peer whose program has
+    /// stopped reading while its machine still accepts connections is
+    /// redialled at once otherwise: the reference waits a fixed 5 s, less
+    /// than the discovery monitor's 12 s detach threshold, so such a peer
+    /// would keep its auto-connect slot for good. With the wait climbing
+    /// (10 s, then 20 s) it is detached and its slot refilled after two
+    /// rounds.
+    pub fn next_reject_streak(previous: u32, lifetime_secs: f64, stalled: bool) -> u32 {
+        if stalled {
+            previous.saturating_add(1)
+        } else {
+            Self::next_short_lived_streak(previous, lifetime_secs)
         }
     }
     pub const INITIAL_CONNECT_TIMEOUT: u64 = 5; // seconds
@@ -273,6 +295,7 @@ impl TcpClientInterface {
             socket: None,
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
+            dead_time_teardown: false,
             heartbeat_running: false,
             parent_spawned: None,
         };
@@ -330,6 +353,7 @@ impl TcpClientInterface {
             socket: Some(socket),
             writing: false,
             force_read_exit: Arc::new(AtomicBool::new(false)),
+            dead_time_teardown: false,
             heartbeat_running: false,
             parent_spawned: None,
         }
@@ -728,6 +752,7 @@ impl TcpClientInterface {
                             self.target_port
                         );
                         crate::log(&crate::interface_writer::dead_time_notice(&iface), crate::LOG_NOTICE, false, false);
+                        self.dead_time_teardown = true;
                     } else {
                         #[cfg(unix)]
                         crate::log(&format!("TCP write failed on fd={}, marking offline: {}{}", write_fd, e, Self::defunct_note(write_fd)), crate::LOG_ERROR, false, false);
@@ -1412,8 +1437,19 @@ impl TcpClientInterface {
                 crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
                 {
                     let lifetime = connected_at.elapsed().as_secs_f64();
-                    short_lived_streak = Self::next_short_lived_streak(short_lived_streak, lifetime);
-                    if short_lived_streak > 0 {
+                    let stalled = std::mem::take(&mut interface.lock().unwrap().dead_time_teardown);
+                    short_lived_streak = Self::next_reject_streak(short_lived_streak, lifetime, stalled);
+                    if stalled {
+                        crate::log(
+                            &format!(
+                                "TCP: the peer took nothing for {}s ({} in a row) — treating it as a reject, next wait {}s",
+                                crate::interface_writer::DP_EC_DEAD_TIME.as_secs(),
+                                short_lived_streak,
+                                Self::reconnect_wait_secs(short_lived_streak)
+                            ),
+                            crate::LOG_NOTICE, false, false,
+                        );
+                    } else if short_lived_streak > 0 {
                         crate::log(
                             &format!(
                                 "TCP: connection lived only {:.1}s before the peer closed it ({} in a row) — treating it as a reject, next wait {}s",
@@ -2069,6 +2105,26 @@ mod tests {
         assert_eq!(streak, 7);
         assert_eq!(T::reconnect_wait_secs(streak), 300, "seven immediate resets → five-minute wait");
         assert_eq!(T::next_short_lived_streak(streak, 3600.0), 0, "a connection that lasted resets the streak");
+    }
+
+    /// A peer whose program stopped reading while its machine still accepts
+    /// connections: each connection lasts the time to fill the buffers plus
+    /// the 12 s dead time (19 s on loopback, 2026-11-28), longer than a
+    /// short-lived one. The wait must still climb past the discovery
+    /// monitor's 12 s detach threshold, or the peer keeps its slot.
+    #[test]
+    fn a_connection_the_dead_time_ended_counts_as_a_reject() {
+        type T = TcpClientInterface;
+        let lifetime = 19.0;
+        assert_eq!(T::next_short_lived_streak(0, lifetime), 0, "by its lifetime alone it lasted");
+        let first = T::next_reject_streak(0, lifetime, true);
+        let second = T::next_reject_streak(first, lifetime, true);
+        assert_eq!(T::reconnect_wait_secs(first), 10);
+        assert_eq!(T::reconnect_wait_secs(second), 20);
+        assert!(T::reconnect_wait_secs(second) > crate::discovery::InterfaceDiscovery::DETACH_THRESHOLD,
+            "after two rounds the peer must be down long enough to be detached");
+        assert_eq!(T::next_reject_streak(second, 3600.0, false), 0, "a connection that lasted and drained resets it");
+        assert_eq!(T::next_reject_streak(0, 0.2, false), 1, "a short-lived connection still counts as before");
     }
 
     use super::*;
