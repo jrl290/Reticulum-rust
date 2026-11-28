@@ -1056,15 +1056,101 @@ fn write_info(path: &Path, info: &InterfaceInfo) -> Result<(), String> {
     std::fs::rename(&partial, path).map_err(|e| e.to_string())
 }
 
+/// What the reference hashes into `autoconnect_hash`: the address, then
+/// ":" and the port if there is one.
+fn endpoint_specifier(info: &InterfaceInfo) -> String {
+    let mut endpoint_specifier = String::new();
+    if let Some(ref reachable_on) = info.reachable_on {
+        endpoint_specifier.push_str(reachable_on);
+    }
+    if let Some(port) = info.port {
+        endpoint_specifier.push_str(&format!(":{}", port));
+    }
+    endpoint_specifier
+}
+
+/// The endpoints in the working file, one to a line, sorted. A file that
+/// is not there is an empty list. Not in the reference (PARITY-AUDIT B46).
+fn read_working(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let mut working: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(String::from)
+                .collect();
+            working.sort();
+            working.dedup();
+            working
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            log(&format!("Could not read the working discovered interfaces from {}: {}", path.display(), e),
+                LOG_WARNING, false, false);
+            Vec::new()
+        }
+    }
+}
+
+fn write_working(path: &Path, working: &[String]) -> Result<(), String> {
+    let mut text = String::new();
+    for endpoint in working {
+        text.push_str(endpoint);
+        text.push('\n');
+    }
+    let partial = path.with_extension("tmp");
+    std::fs::write(&partial, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, path).map_err(|e| e.to_string())
+}
+
+/// The discovered interfaces in the reference's order, except that those
+/// whose endpoints were working before this start go first, in that same
+/// order, marked as having worked: each stays in the working file until it
+/// is detached, even before a pass first sees it online.
+fn working_first(interfaces: Vec<InterfaceInfo>, working: &[String]) -> Vec<(InterfaceInfo, bool)> {
+    let (first, rest): (Vec<InterfaceInfo>, Vec<InterfaceInfo>) = interfaces
+        .into_iter()
+        .partition(|info| working.contains(&endpoint_specifier(info)));
+    first.into_iter().map(|info| (info, true)).chain(rest.into_iter().map(|info| (info, false))).collect()
+}
+
+/// An auto-connected interface has worked once a pass of the monitor sees
+/// it online.
+fn worked_after(worked: bool, watch: Watch) -> bool {
+    worked || matches!(watch, Watch::Online | Watch::Reconnected)
+}
+
+/// What the working file holds after a pass of the monitor: the endpoints
+/// of the auto-connected interfaces that have been seen online since they
+/// were connected, or were working before this start, less those the pass
+/// detaches. One that is down but not yet detached stays, so a stop or a
+/// short drop changes nothing.
+fn working_endpoints<'a>(entries: impl Iterator<Item = (&'a str, bool, Watch)>) -> Vec<String> {
+    let mut working: Vec<String> = entries
+        .filter(|(endpoint, worked, watch)| {
+            worked_after(*worked, *watch) && *watch != Watch::Detach && !endpoint.contains(['\n', '\r'])
+        })
+        .map(|(endpoint, _, _)| endpoint.to_string())
+        .collect();
+    working.sort();
+    working.dedup();
+    working
+}
+
 /// One auto-connected interface. The reference keeps these facts on the
 /// interface object (`autoconnect_hash`, `autoconnect_source`,
 /// `autoconnect_down`) and the object in `monitored_interfaces`.
 struct Autoconnected {
     name: String,
     repr: String,
+    endpoint: String,
     endpoint_hash: Vec<u8>,
     interface: Arc<Mutex<TcpClientInterface>>,
     down_since: Option<f64>,
+    /// Seen online by the monitor since it was connected, or working
+    /// before this start. Not in the reference (PARITY-AUDIT B46).
+    worked: bool,
 }
 
 #[derive(Default)]
@@ -1167,6 +1253,11 @@ pub struct InterfaceDiscovery {
     stopped: AtomicBool,
     autoconnects: Mutex<Autoconnects>,
     blackholed: Mutex<Option<(Instant, HashSet<Vec<u8>>)>>,
+    /// The working file, and what it holds. It is read when this is made,
+    /// before anything is dialled, and written by the monitor when the
+    /// working set changes. Not in the reference (PARITY-AUDIT B46).
+    working_path: PathBuf,
+    working: Mutex<Vec<String>>,
 }
 
 impl InterfaceDiscovery {
@@ -1207,18 +1298,23 @@ impl InterfaceDiscovery {
     const DEFAULT_IFAC_SIZE: usize = 16;
     const BLACKHOLED_REFRESH: Duration = Duration::from_secs(60);
 
+    /// Next to the reference's `discovery/interfaces`, which it lists as
+    /// entries, so it never reads this.
+    pub const WORKING_FILE: &'static str = "working_interfaces";
+
     pub fn new(
         required_value: Option<u32>,
         callback: Option<Box<dyn Fn(InterfaceInfo) + Send + Sync>>,
     ) -> Result<Self, String> {
-        let storagepath = crate::reticulum::storage_path().join("discovery").join("interfaces");
-        Self::with_storagepath(required_value, callback, storagepath)
+        let discovery = crate::reticulum::storage_path().join("discovery");
+        Self::with_storagepath(required_value, callback, discovery.join("interfaces"), discovery.join(Self::WORKING_FILE))
     }
 
     fn with_storagepath(
         required_value: Option<u32>,
         callback: Option<Box<dyn Fn(InterfaceInfo) + Send + Sync>>,
         storagepath: PathBuf,
+        working_path: PathBuf,
     ) -> Result<Self, String> {
         let required_value = required_value.unwrap_or(InterfaceAnnouncer::DEFAULT_STAMP_VALUE);
 
@@ -1238,6 +1334,8 @@ impl InterfaceDiscovery {
             stopped: AtomicBool::new(false),
             autoconnects: Mutex::new(Autoconnects::default()),
             blackholed: Mutex::new(None),
+            working: Mutex::new(read_working(&working_path)),
+            working_path,
         })
     }
 
@@ -1430,7 +1528,7 @@ impl InterfaceDiscovery {
         let bootstrap = crate::transport::Transport::bootstrap_interfaces();
         let max_autoconnected = crate::reticulum::max_autoconnected_interfaces();
 
-        let (pass, detached) = {
+        let (pass, detached, working) = {
             let mut autoconnects = self.autoconnects.lock().unwrap();
             let autoconnected = autoconnects.monitored.len() + autoconnects.dialling.len();
             let seen: Vec<(bool, Option<f64>)> = autoconnects.monitored
@@ -1448,6 +1546,7 @@ impl InterfaceDiscovery {
             );
             let mut detached = Vec::new();
             for (entry, watch) in autoconnects.monitored.iter_mut().zip(&pass.watches) {
+                entry.worked = worked_after(entry.worked, *watch);
                 match watch {
                     Watch::Reconnected => {
                         log(&format!("Auto-discovered interface {} reconnected", entry.repr), LOG_NOTICE, false, false);
@@ -1466,8 +1565,22 @@ impl InterfaceDiscovery {
                     Watch::Online | Watch::Down => {}
                 }
             }
-            (pass, detached)
+            // `stop` sets `stopped` before it takes the list, so a pass
+            // that finds it unset here still holds the whole list.
+            let working = if self.stopped.load(Ordering::SeqCst) {
+                None
+            } else {
+                Some(working_endpoints(autoconnects.monitored
+                    .iter()
+                    .zip(&pass.watches)
+                    .map(|(entry, watch)| (entry.endpoint.as_str(), entry.worked, *watch))))
+            };
+            (pass, detached, working)
         };
+
+        if let Some(working) = working {
+            self.remember_working(working);
+        }
 
         if pass.teardown_bootstrap {
             for (_, repr) in &bootstrap {
@@ -1530,16 +1643,27 @@ impl InterfaceDiscovery {
             .to_string()
     }
 
+    /// Save the working set if it changed. A failed write is logged once:
+    /// the next change writes again.
+    fn remember_working(&self, working: Vec<String>) {
+        let mut saved = self.working.lock().unwrap();
+        if *saved == working {
+            return;
+        }
+        match write_working(&self.working_path, &working) {
+            Ok(()) => {
+                let ms = if working.len() == 1 { "" } else { "s" };
+                log(&format!("Remembering {} working auto-connected interface{}", working.len(), ms), LOG_DEBUG, false, false);
+            }
+            Err(e) => log(&format!("Could not save the working discovered interfaces to {}: {}", self.working_path.display(), e),
+                LOG_ERROR, false, false),
+        }
+        *saved = working;
+    }
+
     /// Compute endpoint hash from reachable_on and port
     pub fn endpoint_hash(&self, info: &InterfaceInfo) -> Vec<u8> {
-        let mut endpoint_specifier = String::new();
-        if let Some(ref reachable_on) = info.reachable_on {
-            endpoint_specifier.push_str(reachable_on);
-        }
-        if let Some(port) = info.port {
-            endpoint_specifier.push_str(&format!(":{}", port));
-        }
-        identity::full_hash(endpoint_specifier.as_bytes())
+        identity::full_hash(endpoint_specifier(info).as_bytes())
     }
 
     /// Check if an interface with the given info already exists
@@ -1574,15 +1698,24 @@ impl InterfaceDiscovery {
         crate::transport::Transport::bootstrap_interfaces().len()
     }
 
-    /// Connect to all eligible discovered interfaces
+    /// Connect to all eligible discovered interfaces. Those that were
+    /// working before this start go first; the reference keeps no record of
+    /// them and dials in its listing's order (PARITY-AUDIT B46).
     pub fn connect_discovered(self: &Arc<Self>) {
         if crate::reticulum::should_autoconnect_discovered_interfaces() {
-            let discovered_interfaces = self.list_discovered_interfaces(false, true);
-            for info in &discovered_interfaces {
+            let working = self.working.lock().unwrap().clone();
+            let discovered_interfaces = working_first(self.list_discovered_interfaces(false, true), &working);
+            let remembered = discovered_interfaces.iter().filter(|(_, worked)| *worked).count();
+            if remembered > 0 {
+                let ms = if remembered == 1 { "" } else { "s" };
+                log(&format!("Auto-connecting first {} discovered interface{} working before this start", remembered, ms),
+                    LOG_NOTICE, false, false);
+            }
+            for (info, worked) in &discovered_interfaces {
                 if self.autoconnect_count() >= crate::reticulum::max_autoconnected_interfaces() {
                     break;
                 }
-                self.autoconnect(info);
+                self.autoconnect_as(info, *worked);
             }
             self.initial_autoconnect_ran.store(true, Ordering::SeqCst);
         }
@@ -1590,17 +1723,24 @@ impl InterfaceDiscovery {
 
     /// Autoconnect to a specific discovered interface
     pub fn autoconnect(self: &Arc<Self>, info: &InterfaceInfo) {
-        if let Err(e) = self.try_autoconnect(info) {
+        self.autoconnect_as(info, false);
+    }
+
+    /// `worked`: it was working before this start, so it stays in the
+    /// working file until it is detached.
+    fn autoconnect_as(self: &Arc<Self>, info: &InterfaceInfo, worked: bool) {
+        if let Err(e) = self.try_autoconnect(info, worked) {
             log(&format!("Error while auto-connecting discovered interface: {}", e), LOG_ERROR, false, false);
         }
     }
 
-    fn try_autoconnect(self: &Arc<Self>, info: &InterfaceInfo) -> Result<(), String> {
+    fn try_autoconnect(self: &Arc<Self>, info: &InterfaceInfo, worked: bool) -> Result<(), String> {
         if self.stopped.load(Ordering::SeqCst) || !crate::reticulum::should_autoconnect_discovered_interfaces() {
             return Ok(());
         }
         let interface_type = info.interface_type.as_str();
-        let endpoint_hash = self.endpoint_hash(info);
+        let endpoint = endpoint_specifier(info);
+        let endpoint_hash = identity::full_hash(endpoint.as_bytes());
         let (name, address, port) = {
             let mut autoconnects = self.autoconnects.lock().unwrap();
             if autoconnects.monitored.len() + autoconnects.dialling.len() >= crate::reticulum::max_autoconnected_interfaces() {
@@ -1632,7 +1772,7 @@ impl InterfaceDiscovery {
             (name, address, port)
         };
 
-        let connected = self.connect_backbone(info, &name, &address, port, &endpoint_hash);
+        let connected = self.connect_backbone(info, &name, &address, port, &endpoint, worked);
         let mut autoconnects = self.autoconnects.lock().unwrap();
         autoconnects.dialling.retain(|(dialling, _)| *dialling != endpoint_hash);
         let entry = connected?;
@@ -1656,7 +1796,7 @@ impl InterfaceDiscovery {
     /// over TCP), and like the reference's client, and unlike this port's
     /// BackboneClientInterface, it exists offline when its first dial fails,
     /// so the monitor can detach it.
-    fn connect_backbone(&self, info: &InterfaceInfo, name: &str, address: &str, port: u16, endpoint_hash: &[u8]) -> Result<Autoconnected, String> {
+    fn connect_backbone(&self, info: &InterfaceInfo, name: &str, address: &str, port: u16, endpoint: &str, worked: bool) -> Result<Autoconnected, String> {
         let mut config = HashMap::new();
         config.insert("name".to_string(), name.to_string());
         config.insert("target_host".to_string(), address.to_string());
@@ -1698,9 +1838,11 @@ impl InterfaceDiscovery {
         Ok(Autoconnected {
             name: name.to_string(),
             repr,
-            endpoint_hash: endpoint_hash.to_vec(),
+            endpoint: endpoint.to_string(),
+            endpoint_hash: identity::full_hash(endpoint.as_bytes()),
             interface,
             down_since: None,
+            worked,
         })
     }
 
@@ -1719,6 +1861,7 @@ impl InterfaceDiscovery {
     }
 
     /// Stop the monitor and detach every auto-connected interface (shutdown).
+    /// The working file keeps what the last pass saved.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.monitoring_autoconnects.store(false, Ordering::SeqCst);
@@ -1981,7 +2124,7 @@ mod tests {
 
         // Heard, then heard again a minute later: the files the reference wrote.
         let dir = scratch_dir("stored");
-        let discovery = Arc::new(InterfaceDiscovery::with_storagepath(None, None, dir.clone()).unwrap());
+        let discovery = Arc::new(InterfaceDiscovery::with_storagepath(None, None, dir.clone(), dir.with_extension("working")).unwrap());
         assert_eq!(crate::hexrep(&discovery.endpoint_hash(&info), false), vectors["stored"]["endpoint_hash"]);
         let mut heard = InterfaceInfo { discovered: None, last_heard: None, heard_count: None, ..info };
         let path = dir.join(crate::hexrep(heard.discovery_hash.as_ref().unwrap(), false));
@@ -2031,7 +2174,7 @@ mod tests {
     #[test]
     fn listing_sorts_filters_and_removes_as_the_reference() {
         let dir = scratch_dir("listing");
-        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone()).unwrap();
+        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone(), dir.with_extension("working")).unwrap();
         let now = now();
         let day = 24.0 * 60.0 * 60.0;
         let base = stored_entry(now);
@@ -2084,7 +2227,7 @@ mod tests {
     #[test]
     fn an_entry_heard_again_keeps_what_it_could_read() {
         let dir = scratch_dir("reheard");
-        let discovery = Arc::new(InterfaceDiscovery::with_storagepath(None, None, dir.clone()).unwrap());
+        let discovery = Arc::new(InterfaceDiscovery::with_storagepath(None, None, dir.clone(), dir.with_extension("working")).unwrap());
         let now = now();
         let info = InterfaceInfo { discovered: None, last_heard: None, heard_count: None, received: now, ..stored_entry(now) };
         let path = dir.join(crate::hexrep(info.discovery_hash.as_ref().unwrap(), false));
@@ -2147,7 +2290,7 @@ mod tests {
     #[test]
     fn a_dial_in_progress_holds_its_endpoint_and_its_name() {
         let dir = scratch_dir("dialling");
-        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone()).unwrap();
+        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone(), dir.with_extension("working")).unwrap();
         let info = InterfaceInfo {
             name: "Discovery Test Dial".into(),
             reachable_on: Some("198.51.100.77".into()),
@@ -2165,5 +2308,107 @@ mod tests {
                    "Discovery Test Other");
         drop(autoconnects);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interfaces_that_were_working_are_dialled_first_in_the_reference_order() {
+        let entry = |address: &str, port: u16| InterfaceInfo {
+            reachable_on: Some(address.into()),
+            port: Some(port),
+            ..stored_entry(0.0)
+        };
+        // As list_discovered_interfaces orders them.
+        let listed = vec![
+            entry("198.51.100.1", 4242),
+            entry("198.51.100.2", 4243),
+            entry("198.51.100.2", 4242),
+            entry("198.51.100.3", 4242),
+            entry("198.51.100.4", 4242),
+        ];
+        let plan = |working: &[String]| working_first(listed.clone(), working)
+            .iter()
+            .map(|(info, worked)| (endpoint_specifier(info), *worked))
+            .collect::<Vec<_>>();
+        let marked = |entries: &[(&str, bool)]| entries.iter().map(|(e, w)| (e.to_string(), *w)).collect::<Vec<_>>();
+        // The two still listed go first, marked as having worked; one no
+        // longer listed is passed over; the port is part of the endpoint.
+        let working = ["198.51.100.4:4242".to_string(), "198.51.100.2:4242".into(), "203.0.113.9:4242".into()];
+        assert_eq!(plan(&working), marked(&[("198.51.100.2:4242", true), ("198.51.100.4:4242", true),
+            ("198.51.100.1:4242", false), ("198.51.100.2:4243", false), ("198.51.100.3:4242", false)]));
+        // Nothing remembered: the reference's order as it is.
+        assert_eq!(plan(&[]), marked(&[("198.51.100.1:4242", false), ("198.51.100.2:4243", false),
+            ("198.51.100.2:4242", false), ("198.51.100.3:4242", false), ("198.51.100.4:4242", false)]));
+        // The specifier is what the reference hashes into autoconnect_hash.
+        let dir = scratch_dir("specifier");
+        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone(), dir.with_extension("working")).unwrap();
+        assert_eq!(discovery.endpoint_hash(&listed[0]), identity::full_hash(b"198.51.100.1:4242"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_working_set_keeps_what_worked_until_it_is_detached() {
+        use Watch::*;
+        let after = |entries: &[(&'static str, bool, Watch)]| working_endpoints(entries.iter().copied());
+        let none: Vec<String> = Vec::new();
+        // Seen online now, or working before this start: kept, sorted, once.
+        assert_eq!(after(&[("b:2", false, Online), ("a:1", true, Down), ("c:3", false, Reconnected), ("a:1", true, Online)]),
+                   ["a:1", "b:2", "c:3"]);
+        // Down but not detached yet: kept, so a stop or a short drop changes nothing.
+        assert_eq!(after(&[("a:1", true, Disconnected), ("b:2", true, Down)]), ["a:1", "b:2"]);
+        // Detached as dead: dropped. Never seen online: not added.
+        assert_eq!(after(&[("a:1", true, Detach), ("b:2", false, Down), ("c:3", false, Disconnected)]), none);
+        // An endpoint that would break the file's lines is never written.
+        assert_eq!(after(&[("a:1\nb:2", true, Online), ("c:3\r", true, Online)]), none);
+        assert!(worked_after(false, Online) && worked_after(false, Reconnected) && worked_after(true, Down));
+        assert!(!worked_after(false, Down) && !worked_after(false, Disconnected) && !worked_after(false, Detach));
+    }
+
+    #[test]
+    fn the_working_file_is_one_endpoint_to_a_line() {
+        let dir = scratch_dir("working-file");
+        let path = dir.join(InterfaceDiscovery::WORKING_FILE);
+        assert!(read_working(&path).is_empty());
+        write_working(&path, &["198.51.100.2:4242".into(), "::1:4243".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "198.51.100.2:4242\n::1:4243\n");
+        assert_eq!(read_working(&path), ["198.51.100.2:4242", "::1:4243"]);
+        assert!(!path.with_extension("tmp").exists());
+        // Read back sorted, once, without blank lines or spaces round them.
+        std::fs::write(&path, "b:2\n\n a:1 \r\nb:2\n").unwrap();
+        assert_eq!(read_working(&path), ["a:1", "b:2"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_discovery_reads_the_working_file_when_made_and_writes_only_a_change() {
+        let dir = scratch_dir("working-saved");
+        let path = scratch_dir("working-saved-file").join(InterfaceDiscovery::WORKING_FILE);
+        std::fs::write(&path, "198.51.100.2:4242\n").unwrap();
+        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone(), path.clone()).unwrap();
+        assert_eq!(*discovery.working.lock().unwrap(), ["198.51.100.2:4242"]);
+        // The same set again: the file is left alone.
+        std::fs::write(&path, "left alone\n").unwrap();
+        discovery.remember_working(vec!["198.51.100.2:4242".into()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "left alone\n");
+        // A change is written.
+        discovery.remember_working(vec!["198.51.100.3:4242".into(), "198.51.100.4:4242".into()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "198.51.100.3:4242\n198.51.100.4:4242\n");
+        assert_eq!(*discovery.working.lock().unwrap(), ["198.51.100.3:4242", "198.51.100.4:4242"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_pass_after_stop_leaves_the_working_file_as_it_was() {
+        let dir = scratch_dir("working-stop");
+        let path = scratch_dir("working-stop-file").join(InterfaceDiscovery::WORKING_FILE);
+        std::fs::write(&path, "198.51.100.2:4242\n").unwrap();
+        let discovery = Arc::new(InterfaceDiscovery::with_storagepath(None, None, dir.clone(), path.clone()).unwrap());
+        // stop empties the list of auto-connected interfaces; a pass that
+        // saved what is left would forget everything that was working.
+        discovery.stop();
+        discovery.monitor_pass();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "198.51.100.2:4242\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
