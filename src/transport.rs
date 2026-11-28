@@ -658,7 +658,7 @@ pub enum AnnounceEntryValue {
 /// A single learned path to a destination. Replaces the old sparse-vector
 /// `Vec<PathEntryValue>` encoding. Each destination now stores a bounded
 /// `VecDeque<PathEntry>` (max N=3), ordered newest-first.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PathEntry {
     /// Wall-clock timestamp when this path was learned (Unix seconds).
     pub timestamp: f64,
@@ -672,6 +672,13 @@ pub struct PathEntry {
     pub receiving_interface: Option<String>,
     /// Packet hash of the announce that established this path.
     pub packet_hash: Vec<u8>,
+    /// Emission time of the announce copy that last set this route: the
+    /// 5-byte timebase in its random blob (RNS/Transport.py
+    /// `announce_emitted`), 0 when not known. Every copy of one announce
+    /// carries the same value, whichever way it came round, so it tells a
+    /// newer announce from an echo of the same one (`transit_route`).
+    #[serde(default)]
+    pub emitted: u64,
 }
 
 impl PathEntry {
@@ -679,6 +686,19 @@ impl PathEntry {
     pub fn is_expired(&self, now: f64) -> bool {
         now >= self.expires
     }
+}
+
+/// What becomes of a packet in transit (`Transport::transit_route`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TransitRoute {
+    /// It goes out once, on this route.
+    Send(PathEntry),
+    /// Dropped: this is its path, and the path's interface is offline.
+    Offline(PathEntry),
+    /// Dropped: every live route leads back down the interface it came in on.
+    ArrivalOnly,
+    /// Dropped: no route is live on a registered interface.
+    NoLiveRoute,
 }
 
 // ── Legacy sparse-vector type — kept during migration for tunnel paths ──────
@@ -1487,6 +1507,7 @@ impl Transport {
                                     } else {
                                         Some(String::from_utf8_lossy(&entry.interface_hash).to_string())
                                     };
+                                    let emitted = newest_blob_emitted(&entry.random_blobs);
                                     let pe = PathEntry {
                                         timestamp: entry.timestamp,
                                         next_hop: entry.received_from,
@@ -1494,6 +1515,7 @@ impl Transport {
                                         expires: entry.expires,
                                         receiving_interface: interface_name,
                                         packet_hash: entry.packet_hash,
+                                        emitted,
                                     };
                                     if loaded_dests.len() < 32 {
                                         loaded_dests.push(crate::hexrep(
@@ -3107,12 +3129,14 @@ impl Transport {
             let mut hops = None;
             let mut path_expires = None;
             let mut packet_hash = Vec::new();
+            let mut emitted = 0u64;
             for value in &values {
                 match value {
                     PathEntryValue::NextHop(n) => next_hop = Some(n.clone()),
                     PathEntryValue::Hops(h) => hops = Some(*h),
                     PathEntryValue::Expires(e) => path_expires = Some(*e),
                     PathEntryValue::PacketHash(p) => packet_hash = p.clone(),
+                    PathEntryValue::RandomBlobs(blobs) => emitted = newest_blob_emitted(blobs),
                     _ => {}
                 }
             }
@@ -3150,6 +3174,7 @@ impl Transport {
                 expires: path_expires,
                 receiving_interface: Some(interface.to_string()),
                 packet_hash,
+                emitted,
             });
             state.path_table_dirty = true;
             restored += 1;
@@ -5285,6 +5310,77 @@ impl Transport {
         Self::select_path_excluding(table, interfaces, destination_hash, now, None)
     }
 
+    /// The route a packet in transit for `destination_hash` goes out on, once
+    /// (`Transport::inbound`, the transport block). RNS/Transport.py 1.5.2
+    /// transmits it on its one path and on nothing else, lines 2021-2119.
+    ///
+    /// The live routes are those not expired on an interface that is
+    /// registered; a route over the interface the packet `arrived` on is
+    /// never one (split-horizon, see `select_path_excluding`). Of these the
+    /// path is the one with the fewest hops, the newest of equals, as in
+    /// `select_path`. When its interface is online the packet goes on it.
+    ///
+    /// When it is offline the reference sends nothing (its transmit to an
+    /// interface that is down sends nothing), and it never takes a copy of an
+    /// announce it has already heard in place of its path (lines 2236-2296).
+    /// So another route may carry the packet only if it brought a NEWER
+    /// announce than every live route on an offline interface: the reference
+    /// replaces its path with one over more hops for a newer emission (line
+    /// 2281). An echo, the same announce come back round through a
+    /// neighbour, carries the same emission and never qualifies. Until
+    /// 2026-11-28 transit went to the best route on any online interface,
+    /// and so out along the echo while the path's interface was down.
+    pub(crate) fn transit_route(
+        table: &HashMap<Vec<u8>, VecDeque<PathEntry>>,
+        interfaces: &[InterfaceStub],
+        destination_hash: &[u8],
+        now: f64,
+        arrived: Option<&str>,
+    ) -> TransitRoute {
+        let Some(entries) = table.get(destination_hash) else {
+            return TransitRoute::NoLiveRoute;
+        };
+        let mut back_down_arrival = false;
+        let mut live: Vec<(&PathEntry, bool)> = Vec::new();
+        for entry in entries {
+            if entry.is_expired(now) {
+                continue;
+            }
+            let Some(name) = entry.receiving_interface.as_deref() else { continue };
+            let Some(iface) = interfaces.iter().find(|i| i.name == name) else { continue };
+            if Some(name) == arrived {
+                back_down_arrival = true;
+                continue;
+            }
+            live.push((entry, iface.online));
+        }
+        // Fewest hops; an equal count keeps the newer entry, found first.
+        fn fewest_hops<'a>(
+            routes: impl Iterator<Item = &'a (&'a PathEntry, bool)>,
+        ) -> Option<(&'a PathEntry, bool)> {
+            routes.fold(None, |best: Option<(&PathEntry, bool)>, &(entry, online)| match best {
+                Some((chosen, _)) if entry.hops >= chosen.hops => best,
+                _ => Some((entry, online)),
+            })
+        }
+        let Some((path, path_online)) = fewest_hops(live.iter()) else {
+            return if back_down_arrival { TransitRoute::ArrivalOnly } else { TransitRoute::NoLiveRoute };
+        };
+        if path_online {
+            return TransitRoute::Send(path.clone());
+        }
+        let newest_down = live
+            .iter()
+            .filter(|(_, online)| !online)
+            .map(|(entry, _)| entry.emitted)
+            .max()
+            .unwrap_or(0);
+        match fewest_hops(live.iter().filter(|(entry, online)| *online && entry.emitted > newest_down)) {
+            Some((newer, _)) => TransitRoute::Send(newer.clone()),
+            None => TransitRoute::Offline(path.clone()),
+        }
+    }
+
     /// The path a packet for `destination_hash` takes. Of the usable entries
     /// (not expired, on an interface that is registered and online, and not
     /// on `exclude_interface`), the one with the fewest hops; of equal hop
@@ -6304,6 +6400,10 @@ impl Transport {
                             expires,
                             receiving_interface: packet.receiving_interface.clone(),
                             packet_hash: packet_hash.clone(),
+                            emitted: new_blob
+                                .as_deref()
+                                .and_then(|blob| <[u8; RANDOM_BLOB_LEN]>::try_from(blob).ok())
+                                .map_or(0, |blob| random_blob_emitted(&blob)),
                         };
 
                         // Insert: get or create deque, dedup by ROUTE, push_front,
@@ -6627,23 +6727,31 @@ impl Transport {
                     .unwrap_or(false)
                 {
                     if let Some(destination_hash) = &packet.destination_hash {
-                        let (next_hop, remaining_hops, outbound_interface_name) =
-                            Self::select_path_excluding(
-                                &state.path_table,
-                                &state.interfaces,
-                                destination_hash,
-                                now(),
-                                packet.receiving_interface.as_deref(),
-                            )
-                                .map(|(_, e)| (e.next_hop.clone(), e.hops, e.receiving_interface.clone()))
-                                .unwrap_or((Vec::new(), 0, None));
+                        // The one place a packet in transit is sent from; see
+                        // `transit_route` for the route it takes.
+                        let route = Self::transit_route(
+                            &state.path_table,
+                            &state.interfaces,
+                            destination_hash,
+                            now(),
+                            packet.receiving_interface.as_deref(),
+                        );
+                        // A packet that is dropped still leaves its link-table
+                        // or reverse-table entry, with no interface, as it did
+                        // before: an unproven link request is how jobs() comes
+                        // to ask for the path again (RNS/Transport.py:875-955).
+                        let (next_hop, remaining_hops, outbound_interface_name) = match &route {
+                            TransitRoute::Send(r) => (r.next_hop.clone(), r.hops, r.receiving_interface.clone()),
+                            TransitRoute::Offline(r) => (r.next_hop.clone(), r.hops, None),
+                            TransitRoute::ArrivalOnly | TransitRoute::NoLiveRoute => (Vec::new(), 0, None),
+                        };
 
                         if !next_hop.is_empty() || state.path_table.contains_key(destination_hash) {
 
-                            // Match Python Transport.py line 1448-1462:
+                            // RNS/Transport.py:2026-2055:
                             // remaining_hops > 1 → replace transport_id with next_hop, update hops
                             // remaining_hops == 1 → strip transport headers (HEADER_2 → HEADER_1), update hops
-                            // remaining_hops == 0 → just update hops
+                            // otherwise → just update hops
                             let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8; // 16
                             let mut new_raw = packet.raw.clone();
                             if remaining_hops > 1 {
@@ -6668,10 +6776,10 @@ impl Transport {
                                 if new_raw.len() > 2 + dst_len * 2 {
                                     new_raw.drain(2..2 + dst_len);
                                 }
-                            } else if remaining_hops == 0 {
-                                if new_raw.len() > 1 {
-                                    new_raw[1] = packet.hops;
-                                }
+                            } else if new_raw.len() > 1 {
+                                // remaining_hops == 0, or a HEADER_1 packet one
+                                // hop from its destination: just the hop count.
+                                new_raw[1] = packet.hops;
                             }
 
                             if packet.packet_type == LINKREQUEST {
@@ -6754,30 +6862,50 @@ impl Transport {
                                 state.reverse_table.insert(packet.get_truncated_hash(), reverse_entry);
                             }
 
-                            if let Some(name) = outbound_interface_name.as_ref() {
-                                deferred_outbound.push((name.clone(), new_raw));
-                            } else {
-                                // No usable path once split-horizon has excluded
-                                // the arrival interface.  Dropping is correct —
-                                // the only route we know points back where the
-                                // packet came from — but say so, because a
-                                // silent drop here is indistinguishable from a
-                                // lost packet when debugging a relay chain.
+                            if let (TransitRoute::Send(used), Some(name)) = (&route, outbound_interface_name.as_ref()) {
                                 crate::log(
-                                    &format!("[TRANSIT-DROP] no usable path for ptype={} dest={} arrived_on={} (split-horizon)",
+                                    &format!("[TRANSIT] ptype={} dest={} via={} remaining_hops={} raw_len={}",
                                         packet.packet_type,
                                         crate::hexrep(destination_hash, false),
-                                        packet.receiving_interface.as_deref().unwrap_or("?")),
+                                        name, remaining_hops, new_raw.len()),
+                                    crate::LOG_DEBUG, false, false,
+                                );
+                                deferred_outbound.push((name.clone(), new_raw));
+                                // RNS/Transport.py:2113 refreshes the path it
+                                // used, and only that.
+                                if let Some(deque) = state.path_table.get_mut(destination_hash) {
+                                    if let Some(entry) = deque.iter_mut().find(|e| {
+                                        e.receiving_interface == used.receiving_interface && e.next_hop == used.next_hop
+                                    }) {
+                                        entry.timestamp = now();
+                                    }
+                                }
+                            } else {
+                                // Say why, because a silent drop here is
+                                // indistinguishable from a lost packet when
+                                // debugging a relay chain.
+                                let why = match &route {
+                                    TransitRoute::Offline(path) => format!(
+                                        "its path's interface {} is offline, and no other route has a newer announce",
+                                        path.receiving_interface.as_deref().unwrap_or("?")),
+                                    TransitRoute::ArrivalOnly => "its only route leads back where it came from (split-horizon)".to_string(),
+                                    _ => "no route is live".to_string(),
+                                };
+                                crate::log(
+                                    &format!("[TRANSIT-DROP] ptype={} dest={} arrived_on={}: {}",
+                                        packet.packet_type,
+                                        crate::hexrep(destination_hash, false),
+                                        packet.receiving_interface.as_deref().unwrap_or("?"),
+                                        why),
                                     crate::LOG_NOTICE, false, false,
                                 );
                             }
-
-                            // Refresh timestamp on the best path entry
-                            if let Some(deque) = state.path_table.get_mut(destination_hash) {
-                                if let Some(front) = deque.front_mut() {
-                                    front.timestamp = now();
-                                }
-                            }
+                        } else {
+                            crate::log(
+                                &format!("Got packet in transport, but no known path to final destination {}. Dropping packet.",
+                                    crate::hexrep(destination_hash, true)),
+                                crate::LOG_EXTREME, false, false,
+                            );
                         }
                     }
                 }
@@ -6836,31 +6964,15 @@ impl Transport {
                             *ts = now();
                         }
                     }
-                } else {
-                    // ── No link_table entry: try path-table forwarding ──
-                    let forward: Option<(String, Vec<u8>)> = {
-                        if let Some(entries) = state.path_table.get(destination_hash) {
-                            let now_ts = now();
-                            entries.iter()
-                                .filter(|e| !e.is_expired(now_ts))
-                                .min_by_key(|e| e.hops)
-                                .and_then(|path| {
-                                    path.receiving_interface.as_ref().map(|out_iface| {
-                                        let mut new_raw = packet.raw.clone();
-                                        if new_raw.len() > 1 {
-                                            new_raw[1] = packet.hops;
-                                        }
-                                        (out_iface.clone(), new_raw)
-                                    })
-                                })
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((out_iface, new_raw)) = forward {
-                        deferred_outbound.push((out_iface.clone(), new_raw));
-                    }
                 }
+                // A packet that is not on a transported link goes nowhere from
+                // here. Until 2026-11-28 a "path-table forwarding" fallback
+                // here sent any packet whose destination had a route on, as it
+                // arrived: every packet in transit went out a second time,
+                // still carrying this node's own transport_id (stock receivers
+                // drop it), and back down the arrival interface when that was
+                // the only route. The transport block above sends a packet in
+                // transit, once.
             }
         }
 
@@ -6897,76 +7009,10 @@ impl Transport {
                         }
                     }
                     if matched == 0 {
-                        // ── Path-table-based forwarding ────────────────────
-                        // If no local destination matched, try the path table.
-                        // This enables bridge/relay operation — packets from
-                        // the backbone (PostInterface) or local TCP clients
-                        // are forwarded toward their destination via the best
-                        // known path, even when the destination is not locally
-                        // registered.
-                        //
-                        // Python parity: RNS/Transport.py forwards non-ANNOUNCE
-                        // packets via path_table when transport_id matches.
-                        // In standalone bridge mode we accept all transport_ids
-                        // (filter bypass) so this forwarding applies to all
-                        // non-local DATA packets.
-
-                        // Extract best path info before any mutable borrow
-                        let forward: Option<(String, Vec<u8>)> = {
-                            if let Some(entries) = state.path_table.get(destination_hash) {
-                                let now_ts = crate::transport::now();
-                                entries.iter()
-                                    .filter(|e| !e.is_expired(now_ts))
-                                    .min_by_key(|e| e.hops)
-                                    .and_then(|path| {
-                                        path.receiving_interface.as_ref().map(|out_iface| {
-                                            crate::log(
-                                                &format!("[FWD-PATH] DATA dest={} via_iface={} hops={} pkt_hops={}",
-                                                    crate::hexrep(destination_hash, false),
-                                                    out_iface,
-                                                    path.hops,
-                                                    packet.hops,
-                                                ),
-                                                crate::LOG_NOTICE, false, false,
-                                            );
-                                            let mut new_raw = packet.raw.clone();
-                                            if new_raw.len() > 1 {
-                                                new_raw[1] = packet.hops;
-                                            }
-                                            (out_iface.clone(), new_raw)
-                                        })
-                                    })
-                            } else {
-                                None
-                            }
-                        };
-
-                        if let Some((out_iface, new_raw)) = forward {
-                            crate::log(
-                                &format!("[FWD-DATA] dispatching dest={} to iface={} raw_len={}",
-                                    crate::hexrep(destination_hash, false),
-                                    out_iface, new_raw.len(),
-                                ),
-                                crate::LOG_NOTICE, false, false,
-                            );
-                            deferred_outbound.push((out_iface.clone(), new_raw));
-                            // Refresh path timestamp
-                            if let Some(entries) = state.path_table.get_mut(destination_hash) {
-                                let now_ts = crate::transport::now();
-                                for e in entries.iter_mut() {
-                                    e.timestamp = now_ts;
-                                }
-                            }
-                        } else {
-                            crate::log(
-                                &format!("[FWD-NOPATH] DATA dest={} — no path entry found in path_table (table_size={})",
-                                    crate::hexrep(destination_hash, false),
-                                    state.path_table.len(),
-                                ),
-                                crate::LOG_NOTICE, false, false,
-                            );
-                        }
-
+                        // No local destination. A DATA packet in transit was
+                        // sent, once, by the transport block above. Until
+                        // 2026-11-28 a `[FWD-DATA]` "path-table forwarding"
+                        // here sent it again, as it arrived, a third time.
                         let registered: Vec<String> = state.destinations.iter()
                             .map(|d| format!("{}({:?})", crate::hexrep(&d.hash, false), d.dest_type))
                             .collect();
@@ -7614,6 +7660,18 @@ fn announce_wire_fields(raw: &[u8]) -> Option<(Vec<u8>, u64)> {
 /// big-endian seconds (RNS/Transport.py timebase_from_random_blob).
 fn random_blob_emitted(blob: &[u8; RANDOM_BLOB_LEN]) -> u64 {
     blob[5..10].iter().fold(0u64, |acc, b| (acc << 8) | *b as u64)
+}
+
+/// The newest emission time among announce random blobs, 0 when none is a
+/// whole blob: what a route learned from those announces records as
+/// `PathEntry::emitted`.
+fn newest_blob_emitted(blobs: &[Vec<u8>]) -> u64 {
+    blobs
+        .iter()
+        .filter_map(|blob| <[u8; RANDOM_BLOB_LEN]>::try_from(blob.as_slice()).ok())
+        .map(|blob| random_blob_emitted(&blob))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Whether a route can still carry traffic at `now`: not past its expiry,
@@ -8730,6 +8788,7 @@ pub(crate) mod tests {
                 expires: now() + 3600.0,
                 receiving_interface: Some("dead-iface".to_string()),
                 packet_hash: vec![0xAB; crate::identity::HASHLENGTH / 8],
+                emitted: 0,
             });
             state.path_table.insert(dest_hash.clone(), deque);
         }
@@ -9267,7 +9326,7 @@ pub(crate) mod tests {
             let deque = state.path_table.entry(dest.clone()).or_insert_with(VecDeque::new);
             admit_route(deque, PathEntry {
                 timestamp: now(), next_hop: next_hop.clone(), hops: 2, expires,
-                receiving_interface: Some(old_iface.to_string()), packet_hash: vec![1; 32],
+                receiving_interface: Some(old_iface.to_string()), packet_hash: vec![1; 32], emitted: 0,
             });
             Transport::record_tunnel_path(&mut state, Some(old_iface), &dest, &next_hop, 2, expires, Some(vec![7; 10]), &[1; 32]);
             let entry = state.tunnels.get(&tunnel_id).expect("tunnel");
@@ -9464,6 +9523,7 @@ pub(crate) mod tests {
                 expires: now() + 3600.0,
                 receiving_interface: Some(outbound_iface_name.to_string()),
                 packet_hash: Vec::new(),
+                emitted: 0,
             });
             state.path_table.insert(dest_hash.clone(), deque);
         }
@@ -10008,6 +10068,7 @@ pub(crate) mod tests {
             expires: now_ts + 3600.0,
             receiving_interface: Some(iface.to_string()),
             packet_hash: vec![hops; 32],
+            emitted: 0,
         };
         let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
         table.insert(dest.clone(), VecDeque::from(vec![route("MichMesh", 1), route("rns.sofia", 2)]));
@@ -12030,6 +12091,7 @@ pub(crate) mod tests {
             expires: now_ts + DESTINATION_TIMEOUT,
             receiving_interface,
             packet_hash: vec![0xAB; 16],
+            emitted: 0,
         }
     }
 
@@ -12214,6 +12276,432 @@ pub(crate) mod tests {
             state.link_table.clear();
             state.path_table.remove(&dest_hash);
         }
+    }
+
+    // ── Transit: one send, in the reference's form, and no echo fallback ──
+    //
+    // Found 2026-11-28 on loopback (stock RNS 1.5.2 nodes around the rnsd
+    // under test): every DATA packet in transit was queued three times for
+    // its next hop. To a one-hop peer that was the reference's stripped
+    // HEADER_1 copy (403 bytes) plus two copies of the packet as it arrived
+    // (419 bytes, still carrying this node's own transport_id, which every
+    // stock receiver drops as meant for another transport instance): the
+    // transport block, the link-table block's "path-table forwarding"
+    // fallback and the DATA block's `[FWD-DATA]` each queued one. And while
+    // the path's interface was offline, the transport block sent the packet
+    // out of another interface along an echo route, a copy of the
+    // destination's announce that came back round through a neighbour.
+    // RNS/Transport.py 1.5.2 inbound() transmits a transit packet once
+    // (lines 2018-2119) and never puts a copy of an announce it has already
+    // heard in place of its path.
+
+    /// A HEADER_2 DATA packet addressed to `local_hash` in transit for
+    /// `dest`, as it arrives (hops 0), with `payload` as its ciphertext.
+    fn transit_data_raw(local_hash: &[u8], dest: &[u8], payload: &[u8]) -> Vec<u8> {
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let flags: u8 = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (DATA & 0x03);
+        let mut raw = vec![flags, 0u8];
+        raw.extend_from_slice(&local_hash[..dst_len]);
+        raw.extend_from_slice(dest);
+        raw.push(crate::packet::NONE);
+        raw.extend_from_slice(payload);
+        raw
+    }
+
+    /// Sets this node up as a transport node with a fresh identity and
+    /// empty tables, and returns its identity hash.
+    fn become_transport_node() -> Vec<u8> {
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+        let mut state = TRANSPORT.lock().unwrap();
+        state.identity = Some(local_identity);
+        state.transport_enabled = true;
+        state.is_connected_to_shared_instance = false;
+        state.link_table.clear();
+        state.reverse_table.clear();
+        state.packet_hashlist.clear();
+        state.packet_hashlist_prev.clear();
+        local_hash
+    }
+
+    fn route_entry(next_hop: Vec<u8>, hops: u8, iface: &str, emitted: u64) -> PathEntry {
+        let mut entry = make_test_path_entry(next_hop, hops, Some(iface.to_string()), 60.0);
+        entry.emitted = emitted;
+        entry
+    }
+
+    /// One send per transit packet, in the form RNS/Transport.py gives it:
+    /// stripped to HEADER_1 when the next hop is the destination
+    /// (remaining_hops == 1), otherwise the hop count and the next hop's
+    /// transport_id written in (remaining_hops > 1). Nothing else goes out.
+    #[test]
+    fn a_transit_packet_is_sent_once_in_the_reference_form() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let local_hash = become_transport_node();
+
+        let arrival = "test-once-arrival";
+        let next = "test-once-next";
+        let other = "test-once-other";
+        register_test_iface(arrival, true, None);
+        register_test_iface(next, true, None);
+        register_test_iface(other, true, None);
+        let neighbour = vec![0xD1; 16]; // one hop away: the next hop is the destination
+        let far = vec![0xD3; 16]; // three hops away, through next_hop
+        let next_hop = vec![0xC3; 16];
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state
+                .path_table
+                .insert(neighbour.clone(), VecDeque::from(vec![route_entry(neighbour.clone(), 1, next, 100)]));
+            // A longer route to `far` sits in front, as the newest admitted.
+            state.path_table.insert(
+                far.clone(),
+                VecDeque::from(vec![
+                    route_entry(vec![0xE5; 16], 5, other, 100),
+                    route_entry(next_hop.clone(), 3, next, 100),
+                ]),
+            );
+        }
+        let stamps_before: Vec<f64> = {
+            let state = TRANSPORT.lock().unwrap();
+            state.path_table[&far].iter().map(|e| e.timestamp).collect()
+        };
+
+        let captured: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
+            (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        for (name, sink) in [arrival, next, other].iter().zip(captured.iter()) {
+            install_sync_outbound_handler(name, sink.clone());
+        }
+
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let to_neighbour = transit_data_raw(&local_hash, &neighbour, &crate::identity::Identity::get_random_hash());
+        let to_far = transit_data_raw(&local_hash, &far, &crate::identity::Identity::get_random_hash());
+        Transport::inbound(to_neighbour.clone(), Some(arrival.to_string()));
+        Transport::inbound(to_far.clone(), Some(arrival.to_string()));
+
+        let mut stripped = vec![(crate::packet::HEADER_1 << 6) | (BROADCAST << 4) | (to_neighbour[0] & 0x0F), 1u8];
+        stripped.extend_from_slice(&to_neighbour[2 + dst_len..]);
+        let mut rewritten = vec![to_far[0], 1u8];
+        rewritten.extend_from_slice(&next_hop);
+        rewritten.extend_from_slice(&to_far[2 + dst_len..]);
+
+        let sent_next = captured[1].lock().unwrap().clone();
+        let sent_elsewhere = captured[0].lock().unwrap().len() + captured[2].lock().unwrap().len();
+        for name in [arrival, next, other] {
+            uninstall_sync_outbound_handler(name);
+        }
+        let stamps_after: Vec<f64> = {
+            let mut state = TRANSPORT.lock().unwrap();
+            let stamps = state.path_table[&far].iter().map(|e| e.timestamp).collect();
+            state.path_table.remove(&neighbour);
+            state.path_table.remove(&far);
+            state.reverse_table.clear();
+            stamps
+        };
+
+        assert_eq!(
+            sent_next,
+            vec![stripped, rewritten],
+            "each transit packet must go out once, in the reference's form: stripped to HEADER_1 \
+             for the one-hop neighbour, the next hop written in for the far destination ({} frames \
+             went out on '{}', sizes {:?})",
+            sent_next.len(),
+            next,
+            sent_next.iter().map(|f| f.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(sent_elsewhere, 0, "nothing may go out on any other interface");
+        // RNS/Transport.py:2113 refreshes the path it used, and only that.
+        assert!(stamps_after[1] > stamps_before[1] + 30.0, "the route used must be refreshed");
+        assert_eq!(stamps_after[0], stamps_before[0], "a route not used must not be refreshed");
+    }
+
+    /// A HEADER_1 packet that this node takes into transit (the
+    /// `[INJECT-TID]` departure, for PHP peers that send without a
+    /// transport_id) one hop from its destination goes out once with its hop
+    /// count written in. Until 2026-11-28 it went out with the count it
+    /// arrived with.
+    #[test]
+    fn a_header_1_packet_taken_into_transit_carries_its_hop_count() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let _local_hash = become_transport_node();
+
+        let arrival = "test-h1-arrival";
+        let next = "test-h1-next";
+        register_test_iface(arrival, true, None);
+        register_test_iface(next, true, None);
+        let dest = vec![0xDD; 16];
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state
+                .path_table
+                .insert(dest.clone(), VecDeque::from(vec![route_entry(dest.clone(), 1, next, 100)]));
+        }
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(next, captured.clone());
+
+        let mut raw = vec![(crate::packet::HEADER_1 << 6) | (BROADCAST << 4) | (DATA & 0x03), 0u8];
+        raw.extend_from_slice(&dest);
+        raw.push(crate::packet::NONE);
+        raw.extend_from_slice(&crate::identity::Identity::get_random_hash());
+        Transport::inbound(raw.clone(), Some(arrival.to_string()));
+
+        let sent = captured.lock().unwrap().clone();
+        uninstall_sync_outbound_handler(next);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest);
+            state.reverse_table.clear();
+        }
+        let mut expected = raw.clone();
+        expected[1] = 1;
+        assert_eq!(sent, vec![expected], "once, as it arrived but for its hop count");
+    }
+
+    /// A transit DATA packet whose only route points back down the interface
+    /// it arrived on is dropped (split-horizon), not sent back. Until
+    /// 2026-11-28 the two fallbacks after the transport block sent it back
+    /// twice, as it arrived, carrying this node's own transport_id.
+    #[test]
+    fn a_transit_data_packet_is_not_sent_back_down_its_arrival_interface() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let local_hash = become_transport_node();
+
+        let arrival = "test-back-arrival";
+        register_test_iface(arrival, true, None);
+        let dest = vec![0xD5; 16];
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state
+                .path_table
+                .insert(dest.clone(), VecDeque::from(vec![route_entry(vec![0xC5; 16], 2, arrival, 100)]));
+        }
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        install_sync_outbound_handler(arrival, captured.clone());
+
+        let raw = transit_data_raw(&local_hash, &dest, &crate::identity::Identity::get_random_hash());
+        Transport::inbound(raw, Some(arrival.to_string()));
+
+        let sent_back = captured.lock().unwrap().len();
+        uninstall_sync_outbound_handler(arrival);
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest);
+            state.reverse_table.clear();
+        }
+        assert_eq!(sent_back, 0, "a transit packet must never go back down the interface it arrived on");
+    }
+
+    /// While the path's interface is offline, a copy of the same announce
+    /// that came back round through a neighbour (an echo: same emission,
+    /// more hops) must not carry the packet: it is dropped, as the
+    /// reference's transmit to an interface that is down sends nothing.
+    /// Nothing is dispatched to the offline interface either.
+    #[test]
+    fn a_transit_packet_does_not_fall_back_to_an_echo_while_its_path_is_down() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let local_hash = become_transport_node();
+
+        let arrival = "test-echo-arrival";
+        let direct = "test-echo-direct";
+        let around = "test-echo-around";
+        register_test_iface(arrival, true, None);
+        register_test_iface(direct, false, None);
+        register_test_iface(around, true, None);
+        let dest = vec![0xD7; 16];
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.insert(
+                dest.clone(),
+                VecDeque::from(vec![
+                    // The echo arrived last, so it is the newest admitted.
+                    route_entry(vec![0xC7; 16], 3, around, 1_000),
+                    route_entry(dest.clone(), 1, direct, 1_000),
+                ]),
+            );
+        }
+        let captured: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
+            (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        for (name, sink) in [arrival, direct, around].iter().zip(captured.iter()) {
+            install_sync_outbound_handler(name, sink.clone());
+        }
+
+        let raw = transit_data_raw(&local_hash, &dest, &crate::identity::Identity::get_random_hash());
+        Transport::inbound(raw, Some(arrival.to_string()));
+
+        let sent: Vec<usize> = captured.iter().map(|c| c.lock().unwrap().len()).collect();
+        for name in [arrival, direct, around] {
+            uninstall_sync_outbound_handler(name);
+        }
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest);
+            state.reverse_table.clear();
+        }
+        assert_eq!(
+            sent,
+            vec![0, 0, 0],
+            "with the path's interface offline the packet must be dropped: frames on \
+             [arrival, the offline direct route, the echo route] = {:?}",
+            sent
+        );
+    }
+
+    /// The reference does replace its path with a route over more hops when
+    /// that route brings a NEWER announce (RNS/Transport.py:2281). So while
+    /// the path's interface is offline, such a route carries the packet, once.
+    #[test]
+    fn a_newer_announce_over_another_route_carries_transit_while_the_path_is_down() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReceiptStateRestore::new();
+        let _ifaces_restore = InterfacesRestore::new();
+        let local_hash = become_transport_node();
+
+        let arrival = "test-newer-arrival";
+        let direct = "test-newer-direct";
+        let around = "test-newer-around";
+        register_test_iface(arrival, true, None);
+        register_test_iface(direct, false, None);
+        register_test_iface(around, true, None);
+        let dest = vec![0xD9; 16];
+        let around_hop = vec![0xC9; 16];
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.insert(
+                dest.clone(),
+                VecDeque::from(vec![
+                    route_entry(around_hop.clone(), 3, around, 1_001),
+                    route_entry(dest.clone(), 1, direct, 1_000),
+                ]),
+            );
+        }
+        let captured: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
+            (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        for (name, sink) in [arrival, direct, around].iter().zip(captured.iter()) {
+            install_sync_outbound_handler(name, sink.clone());
+        }
+
+        let raw = transit_data_raw(&local_hash, &dest, &crate::identity::Identity::get_random_hash());
+        Transport::inbound(raw.clone(), Some(arrival.to_string()));
+
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let mut rewritten = vec![raw[0], 1u8];
+        rewritten.extend_from_slice(&around_hop);
+        rewritten.extend_from_slice(&raw[2 + dst_len..]);
+        let sent: Vec<Vec<Vec<u8>>> = captured.iter().map(|c| c.lock().unwrap().clone()).collect();
+        for name in [arrival, direct, around] {
+            uninstall_sync_outbound_handler(name);
+        }
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.path_table.remove(&dest);
+            state.reverse_table.clear();
+        }
+        assert!(sent[0].is_empty() && sent[1].is_empty(), "nothing on the arrival or the offline interface");
+        assert_eq!(sent[2], vec![rewritten], "the newer route carries it once, the next hop written in");
+    }
+
+    /// `transit_route` on its own: the cases the transport block meets.
+    #[test]
+    fn transit_route_takes_the_path_and_only_a_newer_announce_in_its_place() {
+        let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _ifaces_restore = InterfacesRestore::new();
+        let (arrival, up, up2, down, down2) =
+            ("test-tr-arrival", "test-tr-up", "test-tr-up2", "test-tr-down", "test-tr-down2");
+        for (name, online) in [(arrival, true), (up, true), (up2, true), (down, false), (down2, false)] {
+            register_test_iface(name, online, None);
+        }
+        let interfaces = { TRANSPORT.lock().unwrap().interfaces.clone() };
+        let dest = vec![0xDB; 16];
+        let choose = |routes: Vec<PathEntry>| {
+            let mut table: HashMap<Vec<u8>, VecDeque<PathEntry>> = HashMap::new();
+            table.insert(dest.clone(), VecDeque::from(routes));
+            Transport::transit_route(&table, &interfaces, &dest, now(), Some(arrival))
+        };
+        let base = now();
+        let r = |hops: u8, iface: &str, emitted: u64| {
+            let mut route = route_entry(vec![hops; 16], hops, iface, emitted);
+            route.timestamp = base;
+            route.expires = base + 3600.0;
+            route
+        };
+
+        // The path, fewest hops, on an online interface: it goes there.
+        assert_eq!(choose(vec![r(3, up2, 10), r(2, up, 10)]), TransitRoute::Send(r(2, up, 10)));
+        // Equal hops: the newer entry, the one found first.
+        assert_eq!(choose(vec![r(2, up2, 10), r(2, up, 10)]), TransitRoute::Send(r(2, up2, 10)));
+        // The path's interface is offline and the other route is an echo
+        // (same emission) or older: dropped, on the path.
+        assert_eq!(choose(vec![r(3, up, 10), r(1, down, 10)]), TransitRoute::Offline(r(1, down, 10)));
+        assert_eq!(choose(vec![r(3, up, 9), r(1, down, 10)]), TransitRoute::Offline(r(1, down, 10)));
+        // A newer announce over more hops takes the path's place, as in the
+        // reference; of several, the fewest hops.
+        assert_eq!(
+            choose(vec![r(4, up2, 11), r(3, up, 11), r(1, down, 10)]),
+            TransitRoute::Send(r(3, up, 11))
+        );
+        // It must be newer than every live route that is down, not just the
+        // shortest one.
+        assert_eq!(
+            choose(vec![r(3, up, 11), r(2, down2, 12), r(1, down, 10)]),
+            TransitRoute::Offline(r(1, down, 10))
+        );
+        // Split-horizon: a route over the arrival interface is never one, and
+        // does not stand in the way of the others.
+        assert_eq!(choose(vec![r(1, arrival, 12), r(3, up, 10)]), TransitRoute::Send(r(3, up, 10)));
+        assert_eq!(choose(vec![r(1, arrival, 10)]), TransitRoute::ArrivalOnly);
+        // An expired route, and a route on an interface that is no longer
+        // registered (gone, as the reference culls its path), are not live.
+        let mut expired = r(1, up, 10);
+        expired.expires = now() - 1.0;
+        assert_eq!(choose(vec![expired, r(3, up2, 10)]), TransitRoute::Send(r(3, up2, 10)));
+        assert_eq!(choose(vec![r(1, "test-tr-gone", 10), r(3, up, 10)]), TransitRoute::Send(r(3, up, 10)));
+        assert_eq!(choose(vec![r(1, "test-tr-gone", 10)]), TransitRoute::NoLiveRoute);
+        assert_eq!(
+            Transport::transit_route(&HashMap::new(), &interfaces, &dest, now(), Some(arrival)),
+            TransitRoute::NoLiveRoute
+        );
+    }
+
+    /// The route an announce copy sets records that copy's emission time, so
+    /// `transit_route` can tell a newer announce from an echo; a table
+    /// written before the field existed loads with 0 (not known).
+    #[test]
+    fn a_route_records_the_emission_of_its_announce() {
+        let mut blob = [0u8; RANDOM_BLOB_LEN];
+        blob[5..10].copy_from_slice(&[0x00, 0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(random_blob_emitted(&blob), 0x010203);
+        assert_eq!(newest_blob_emitted(&[blob.to_vec(), vec![0u8; RANDOM_BLOB_LEN]]), 0x010203);
+        assert_eq!(newest_blob_emitted(&[vec![1, 2, 3]]), 0, "not a whole blob");
+
+        #[derive(Serialize)]
+        struct Before {
+            timestamp: f64,
+            next_hop: Vec<u8>,
+            hops: u8,
+            expires: f64,
+            receiving_interface: Option<String>,
+            packet_hash: Vec<u8>,
+        }
+        let old = to_vec_named(&vec![(vec![1u8; 16], vec![Before {
+            timestamp: 1.0,
+            next_hop: vec![2; 16],
+            hops: 2,
+            expires: 3.0,
+            receiving_interface: Some("x".to_string()),
+            packet_hash: vec![4; 32],
+        }])])
+        .unwrap();
+        let loaded: Vec<(Vec<u8>, Vec<PathEntry>)> = from_slice(&old).expect("an older table still loads");
+        assert_eq!(loaded[0].1[0].emitted, 0);
+        assert_eq!(loaded[0].1[0].hops, 2);
     }
 
     #[test]
@@ -13020,6 +13508,55 @@ pub(crate) mod tests {
             assert_eq!(queued_blob, blob.to_vec());
         }
 
+        /// Each route records the emission of the announce copy that set it,
+        /// so while the shorter route's interface is down, transit takes the
+        /// longer one only once it brings a newer announce than the shorter
+        /// route holds (`Transport::transit_route`).
+        #[test]
+        fn each_route_records_its_announce_emission_for_transit() {
+            let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let fx = EmissionFixture::new();
+            let emitted = now() as u64;
+            fx.deliver(&fx.emission(0x21, emitted), ROUTE_A, RELAY_A, 1);
+            fx.deliver(&fx.emission(0x21, emitted), ROUTE_B, RELAY_B, 3);
+            let emissions = || -> Vec<(Option<String>, u64)> {
+                let state = TRANSPORT.lock().unwrap();
+                let mut routes: Vec<_> = state.path_table[&fx.dest()]
+                    .iter()
+                    .map(|r| (r.receiving_interface.clone(), r.emitted))
+                    .collect();
+                routes.sort();
+                routes
+            };
+            assert_eq!(
+                emissions(),
+                vec![(Some(ROUTE_A.to_string()), emitted), (Some(ROUTE_B.to_string()), emitted)],
+                "both copies of one announce record its emission"
+            );
+            let transit = || {
+                let state = TRANSPORT.lock().unwrap();
+                let mut interfaces = state.interfaces.clone();
+                for iface in interfaces.iter_mut().filter(|i| i.name == ROUTE_A) {
+                    iface.online = false;
+                }
+                Transport::transit_route(&state.path_table, &interfaces, &fx.dest(), now(), None)
+            };
+            assert!(
+                matches!(transit(), TransitRoute::Offline(ref path) if path.receiving_interface.as_deref() == Some(ROUTE_A)),
+                "the copy over route B is an echo of route A's announce: it must not carry transit"
+            );
+
+            fx.deliver(&fx.emission(0x22, emitted + 5), ROUTE_B, RELAY_B, 3);
+            assert_eq!(
+                emissions(),
+                vec![(Some(ROUTE_A.to_string()), emitted), (Some(ROUTE_B.to_string()), emitted + 5)]
+            );
+            assert!(
+                matches!(transit(), TransitRoute::Send(ref route) if route.receiving_interface.as_deref() == Some(ROUTE_B)),
+                "a newer announce over route B carries transit while route A is down"
+            );
+        }
+
         #[test]
         fn a_second_copy_of_one_emission_still_records_its_route() {
             let _test_guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -13132,6 +13669,7 @@ pub(crate) mod tests {
                 expires: 0.0,
                 receiving_interface: Some(ROUTE_A.to_string()),
                 packet_hash: Vec::new(),
+                emitted: 0,
             };
             let routes: VecDeque<PathEntry> = vec![route].into();
             let seen: VecDeque<[u8; RANDOM_BLOB_LEN]> = vec![EmissionFixture::blob(1, 1000)].into();
@@ -13897,6 +14435,7 @@ mod route_eviction_tests {
             expires: ts + 1_000_000.0,
             receiving_interface: Some(iface.to_string()),
             packet_hash: vec![0u8; 32],
+            emitted: 0,
         }
     }
 
