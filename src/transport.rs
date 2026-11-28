@@ -1101,6 +1101,25 @@ impl Transport {
             handler,
             crate::interface_writer::DEFAULT_WRITER_QUEUE_DEPTH,
         );
+        Self::mark_outbound_handler(name);
+    }
+
+    /// Register the outbound handler of a TCP connection (a TCP or Backbone
+    /// client, or a connection accepted by a TCP or Backbone server). Its
+    /// writer keeps stock RNS 1.5.2's egress control: a queue bounded at
+    /// 4 MiB rather than at a number of frames, gated while the peer drains
+    /// too slowly (see `interface_writer`). The connection's socket carries
+    /// the matching write limit, so a peer that takes nothing for
+    /// `DP_EC_DEAD_TIME` is torn down as in the reference.
+    pub fn register_outbound_handler_with_egress_control(
+        name: &str,
+        handler: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    ) {
+        crate::interface_writer::register_with_egress_control(name, handler);
+        Self::mark_outbound_handler(name);
+    }
+
+    fn mark_outbound_handler(name: &str) {
         // Keep the legacy registry populated so any direct lookup of
         // OUTBOUND_HANDLERS still finds *something* — but the dispatcher
         // prefers the writer below. We store a no-op marker so the entry

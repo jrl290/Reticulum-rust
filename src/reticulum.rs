@@ -1544,7 +1544,7 @@ impl Reticulum {
         let interface = Arc::new(Mutex::new(interface));
         let handler_iface = Arc::clone(&interface);
         let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
-        crate::transport::Transport::register_outbound_handler(
+        crate::transport::Transport::register_outbound_handler_with_egress_control(
             &name,
             Arc::new(move |raw| {
                 let mut iface = handler_iface.lock().unwrap();
@@ -2119,7 +2119,7 @@ impl Reticulum {
                             let interface = Arc::new(Mutex::new(interface));
                             let handler_iface = Arc::clone(&interface);
                             let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
-                            crate::transport::Transport::register_outbound_handler(
+                            crate::transport::Transport::register_outbound_handler_with_egress_control(
                                 &name,
                                 Arc::new(move |raw| {
                                     let mut iface = handler_iface.lock().unwrap();

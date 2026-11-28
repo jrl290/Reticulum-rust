@@ -310,6 +310,10 @@ impl TcpClientInterface {
         // /memories/repo/rfed-tcp-watchdog-failure.md.
         Self::apply_keepalive(&socket, false);
 
+        // A client that stops reading is torn down after the reference's
+        // dead time, like one the initiator side dials (see `connect`).
+        crate::interface_writer::apply_tcp_write_limit(&socket);
+
         TcpClientInterface {
             base,
             target_ip: peer_addr.as_ref().map(|a| a.ip().to_string()).unwrap_or_default(),
@@ -370,6 +374,13 @@ impl TcpClientInterface {
 
         stream.set_nodelay(true)
             .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
+
+        // A peer that stops taking data is torn down after the reference's
+        // dead time, on every OS: the write fails and `process_outgoing`
+        // closes the connection, which the read loop then redials.
+        // FreeBSD (the house gateway) has no TCP_USER_TIMEOUT, so without
+        // this a write to such a peer never returned.
+        crate::interface_writer::apply_tcp_write_limit(&stream);
 
         // Set keepalive and timeouts
         // DO NOT BE SO FUCKING LAZY. HALF-OPEN DOES NOT EXIST. WE'RE RUNNING THIS ON MACOS. THIS IS YOUR FAULT
@@ -707,10 +718,22 @@ impl TcpClientInterface {
                     self.base.txb += framed.len() as u64;
                 }
                 Err(e) => {
-                    #[cfg(unix)]
-                    crate::log(&format!("TCP write failed on fd={}, marking offline: {}{}", write_fd, e, Self::defunct_note(write_fd)), crate::LOG_ERROR, false, false);
-                    #[cfg(not(unix))]
-                    crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        // The socket's write limit (apply_tcp_write_limit):
+                        // the peer took nothing for the reference's dead time.
+                        let iface = format!(
+                            "{} [{}:{}]",
+                            self.base.name.as_deref().unwrap_or("TCP interface"),
+                            self.target_ip,
+                            self.target_port
+                        );
+                        crate::log(&crate::interface_writer::dead_time_notice(&iface), crate::LOG_NOTICE, false, false);
+                    } else {
+                        #[cfg(unix)]
+                        crate::log(&format!("TCP write failed on fd={}, marking offline: {}{}", write_fd, e, Self::defunct_note(write_fd)), crate::LOG_ERROR, false, false);
+                        #[cfg(not(unix))]
+                        crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
+                    }
                     self.base.online = false;
                     if let Some(name) = &self.base.name {
                         Transport::set_interface_online(name, false);
@@ -1890,7 +1913,7 @@ impl TcpServerInterface {
                     // Register the spawned interface with Transport so it can send outbound data
                     // (path responses, announces, etc.) back to the connected client.
                     let handler_iface = Arc::clone(&spawned_interface);
-                    crate::transport::Transport::register_outbound_handler(
+                    crate::transport::Transport::register_outbound_handler_with_egress_control(
                         &iface_name,
                         Arc::new(move |raw| {
                             let mut iface = handler_iface.lock().unwrap();
@@ -3096,5 +3119,124 @@ mod accepted_teardown_tests {
             assert!(client.lock().unwrap().detached,
                 "a closed connection was not detached, so its heartbeat thread never exits");
         }
+    }
+}
+
+#[cfg(test)]
+mod dead_time_tests {
+    //! A peer that stops reading is torn down after the reference's egress
+    //! dead time (BackboneInterface.py `DP_EC_DEAD_TIME`), whichever side
+    //! dialled; and a configured hub that goes away and comes back is
+    //! dialled again by itself, as the reference's TCPClientInterface does.
+    use super::TcpClientInterface;
+    use crate::interface_writer::DP_EC_DEAD_TIME;
+    use std::collections::HashMap;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// Write to `iface` until a write fails, on a thread of its own: before
+    /// the write limit a write to a peer that stopped reading never
+    /// returned. Reports how long it took, how many frames went, and
+    /// whether the interface still called itself online.
+    fn write_until_it_fails(mut iface: TcpClientInterface) -> mpsc::Receiver<(Duration, usize, bool)> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let mut frames = 0usize;
+            while iface.process_outgoing(vec![0x55; 400]).is_ok() {
+                frames += 1;
+            }
+            let _ = tx.send((started.elapsed(), frames, iface.base.online));
+        });
+        rx
+    }
+
+    fn assert_torn_down_after_the_dead_time(rx: mpsc::Receiver<(Duration, usize, bool)>) {
+        let (elapsed, frames, online) = rx
+            .recv_timeout(DP_EC_DEAD_TIME + Duration::from_secs(30))
+            .expect("a write to a peer that stopped reading never failed, so the connection would be kept for good");
+        assert!(frames > 0, "nothing was written before the peer's buffers filled");
+        assert!(!online, "a torn-down connection must be offline");
+        assert!(elapsed >= DP_EC_DEAD_TIME, "torn down after {:?}, before the dead time", elapsed);
+        assert!(elapsed < DP_EC_DEAD_TIME + Duration::from_secs(8), "torn down only after {:?}", elapsed);
+    }
+
+    fn client_config(name: &str, port: u16) -> HashMap<String, String> {
+        let mut config = HashMap::new();
+        config.insert("name".to_string(), name.to_string());
+        config.insert("target_host".to_string(), "127.0.0.1".to_string());
+        config.insert("target_port".to_string(), port.to_string());
+        config
+    }
+
+    #[test]
+    fn a_hub_that_stops_reading_is_torn_down_after_the_dead_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The hub accepts, then never reads: the process hangs, the kernel
+        // keeps the connection up and its window closes.
+        let hub = thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let iface = TcpClientInterface::new(&client_config("dead-time-dialled", port)).expect("dial the hub");
+        assert!(iface.base.online);
+        let held = hub.join().unwrap().unwrap();
+        assert_torn_down_after_the_dead_time(write_until_it_fails(iface));
+        drop(held);
+    }
+
+    #[test]
+    fn an_accepted_client_that_stops_reading_is_torn_down_after_the_dead_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let iface = TcpClientInterface::from_socket("dead-time-accepted".to_string(), accepted);
+        assert_torn_down_after_the_dead_time(write_until_it_fails(iface));
+        drop(client);
+    }
+
+    #[test]
+    fn a_configured_hub_that_goes_away_and_comes_back_is_dialled_again() {
+        fn within(cond: impl Fn() -> bool, limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            while !cond() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            true
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let iface = Arc::new(Mutex::new(
+            TcpClientInterface::new(&client_config("hub-comes-back", port)).expect("dial the hub"),
+        ));
+        TcpClientInterface::start_read_loop(Arc::clone(&iface));
+        let (first, _) = listener.accept().unwrap();
+
+        // The hub goes away: its connection closes and nothing listens.
+        drop(first);
+        drop(listener);
+        assert!(within(|| !iface.lock().unwrap().base.online, Duration::from_secs(10)),
+            "the client never noticed its hub had gone");
+
+        // Away for a while, then back on the same port.
+        thread::sleep(Duration::from_secs(2));
+        let back = TcpListener::bind(("127.0.0.1", port)).expect("the hub's port again");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(back.accept().map(|(s, _)| s));
+        });
+        let again = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the client never dialled its hub again")
+            .expect("accept");
+        assert!(within(|| iface.lock().unwrap().base.online, Duration::from_secs(5)),
+            "the client dialled its hub but does not call itself online");
+
+        iface.lock().unwrap().detach();
+        drop(again);
     }
 }

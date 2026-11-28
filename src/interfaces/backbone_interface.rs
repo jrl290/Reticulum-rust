@@ -231,7 +231,7 @@ impl BackboneInterface {
                 {
                     let handler_iface = Arc::clone(&spawned_arc);
                     let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
-                    RnsTransport::register_outbound_handler(
+                    RnsTransport::register_outbound_handler_with_egress_control(
                         &name,
                         Arc::new(move |raw| {
                             let mut iface = handler_iface.lock().unwrap();
@@ -419,6 +419,7 @@ impl BackboneClientInterface {
         }
 
         let _ = stream.set_nodelay(true);
+        crate::interface_writer::apply_tcp_write_limit(&stream);
         #[cfg(target_os = "linux")]
         Self::set_timeouts_linux(&stream)?;
 
@@ -549,6 +550,7 @@ impl BackboneClientInterface {
         ).map_err(|e| format!("Connection failed: {}", e))?;
 
         stream.set_nodelay(true).map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
+        crate::interface_writer::apply_tcp_write_limit(&stream);
 
         #[cfg(target_os = "linux")]
         Self::set_timeouts_linux(&stream)?;
@@ -969,6 +971,15 @@ impl BackboneClientInterface {
         };
 
         if let Err(e) = write_result {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                let iface = format!(
+                    "{} [{}:{}]",
+                    self.base.name.as_deref().unwrap_or("Backbone interface"),
+                    self.target_ip,
+                    self.target_port
+                );
+                crate::log(&crate::interface_writer::dead_time_notice(&iface), crate::LOG_NOTICE, false, false);
+            }
             self.base.online = false;
             if let Some(name) = &self.base.name {
                 crate::transport::Transport::set_interface_online(name, false);
