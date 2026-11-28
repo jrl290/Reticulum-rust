@@ -1235,6 +1235,52 @@ fn try_detach(interface: &Arc<Mutex<TcpClientInterface>>) -> bool {
     }
 }
 
+/// Hears the working set: the endpoints `working_interfaces` holds.
+pub type WorkingListener = Box<dyn Fn(&[String]) + Send>;
+
+/// The running discovery's working set as last told, and who hears it.
+struct WorkingSet {
+    now: Option<Vec<String>>,
+    listeners: Vec<WorkingListener>,
+}
+
+impl WorkingSet {
+    const fn new() -> Self {
+        Self { now: None, listeners: Vec::new() }
+    }
+
+    fn listen(&mut self, listener: WorkingListener) {
+        if let Some(now) = &self.now {
+            listener(now);
+        }
+        self.listeners.push(listener);
+    }
+
+    fn tell(&mut self, working: &[String]) {
+        self.now = Some(working.to_vec());
+        for listener in &self.listeners {
+            listener(working);
+        }
+    }
+}
+
+static WORKING_SET: Mutex<WorkingSet> = Mutex::new(WorkingSet::new());
+
+/// Hear the running discovery's working set: at once if it has told one,
+/// then each time it changes. The PostInterface sends it to its node, which
+/// gives it to the apps as the servers to connect to first (Reticulum-post's
+/// GatewayServers; James, 2026-11-28: "The gateway's list"). Not in the
+/// reference. A listener runs under this module's lock, so it must be quick
+/// and must not listen again.
+pub fn listen_working(listener: WorkingListener) {
+    WORKING_SET.lock().unwrap().listen(listener);
+}
+
+/// What the running discovery tells (`Transport::discover_interfaces`).
+pub(crate) fn tell_working(working: &[String]) {
+    WORKING_SET.lock().unwrap().tell(working);
+}
+
 /// Manages discovered interfaces
 ///
 /// Only `Transport::discover_interfaces` starts one listening: it registers
@@ -1258,6 +1304,10 @@ pub struct InterfaceDiscovery {
     /// working set changes. Not in the reference (PARITY-AUDIT B46).
     working_path: PathBuf,
     working: Mutex<Vec<String>>,
+    /// Who is told the working set: set on the running discovery by
+    /// `Transport::discover_interfaces` (`tell_working_to`), no one on a
+    /// discovery made for a listing or a test.
+    working_told: Mutex<Option<Box<dyn Fn(&[String]) + Send + Sync>>>,
 }
 
 impl InterfaceDiscovery {
@@ -1336,7 +1386,17 @@ impl InterfaceDiscovery {
             blackholed: Mutex::new(None),
             working: Mutex::new(read_working(&working_path)),
             working_path,
+            working_told: Mutex::new(None),
         })
+    }
+
+    /// Tell `teller` the working set now (as read from the file, before
+    /// anything is dialled) and each time the monitor changes it.
+    pub fn tell_working_to(&self, teller: Box<dyn Fn(&[String]) + Send + Sync>) {
+        let working = self.working.lock().unwrap();
+        let mut told = self.working_told.lock().unwrap();
+        let teller = told.insert(teller);
+        teller(&working);
     }
 
     fn blackholed_identities(&self) -> HashSet<Vec<u8>> {
@@ -1659,6 +1719,9 @@ impl InterfaceDiscovery {
                 LOG_ERROR, false, false),
         }
         *saved = working;
+        if let Some(teller) = self.working_told.lock().unwrap().as_ref() {
+            teller(&saved);
+        }
     }
 
     /// Compute endpoint hash from reachable_on and port
@@ -2408,6 +2471,51 @@ mod tests {
         discovery.stop();
         discovery.monitor_pass();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "198.51.100.2:4242\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ── The gateway's list (Reticulum-post GatewayServers) ───────────────
+
+    type Heard = Arc<Mutex<Vec<Vec<String>>>>;
+
+    fn hearer(heard: &Heard) -> WorkingListener {
+        let heard = Arc::clone(heard);
+        Box::new(move |working: &[String]| heard.lock().unwrap().push(working.to_vec()))
+    }
+
+    #[test]
+    fn a_listener_hears_the_working_set_at_once_and_at_each_change() {
+        let mut set = WorkingSet::new();
+        let early: Heard = Arc::default();
+        set.listen(hearer(&early));
+        assert!(early.lock().unwrap().is_empty(), "nothing told yet, nothing heard");
+        set.tell(&["198.51.100.2:4242".into()]);
+        let late: Heard = Arc::default();
+        set.listen(hearer(&late));
+        assert_eq!(*late.lock().unwrap(), [vec!["198.51.100.2:4242".to_string()]], "a late listener hears the set at once");
+        set.tell(&[]);
+        let expected = [vec!["198.51.100.2:4242".to_string()], vec![]];
+        assert_eq!(*early.lock().unwrap(), expected);
+        assert_eq!(*late.lock().unwrap(), expected, "an empty set is told too");
+    }
+
+    #[test]
+    fn the_running_discovery_tells_the_file_s_set_then_each_change() {
+        let dir = scratch_dir("working-told");
+        let path = scratch_dir("working-told-file").join(InterfaceDiscovery::WORKING_FILE);
+        std::fs::write(&path, "198.51.100.3:4242\n198.51.100.2:4242\n").unwrap();
+        let discovery = InterfaceDiscovery::with_storagepath(None, None, dir.clone(), path.clone()).unwrap();
+        // Before anyone is to be told, a change is told to no one.
+        discovery.remember_working(vec!["198.51.100.2:4242".into()]);
+        let heard: Heard = Arc::default();
+        let told = Arc::clone(&heard);
+        discovery.tell_working_to(Box::new(move |working: &[String]| told.lock().unwrap().push(working.to_vec())));
+        assert_eq!(*heard.lock().unwrap(), [vec!["198.51.100.2:4242".to_string()]], "the set as it stands, at once");
+        discovery.remember_working(vec!["198.51.100.2:4242".into()]);
+        assert_eq!(heard.lock().unwrap().len(), 1, "an unchanged set is not told again");
+        discovery.remember_working(vec!["198.51.100.2:4242".into(), "198.51.100.4:4242".into()]);
+        assert_eq!(heard.lock().unwrap().last().unwrap(), &["198.51.100.2:4242", "198.51.100.4:4242"]);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

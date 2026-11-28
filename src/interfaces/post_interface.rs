@@ -90,6 +90,9 @@ struct ExchangeRequest {
     packets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_id: Option<String>,
+    /// The gateway's servers, while the node has not answered them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    servers: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -111,6 +114,23 @@ struct ExchangeResponse {
     idle_exchange_interval_ms: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+    /// Only to an exchange that carried servers: whether the node kept them.
+    #[serde(default)]
+    servers_stored: Option<bool>,
+}
+
+/// The gateway's servers for the node (James, 2026-11-28: "The gateway's
+/// list"): discovery's working set, the public servers the gateway is
+/// connected to. The node keeps them only from the gateway's bridge and
+/// gives them to the apps as the servers to connect to first (Reticulum-post
+/// GatewayServers). Sent with an exchange whenever discovery tells a new set
+/// and after every registration, until the node answers.
+#[derive(Default)]
+struct ServersToSend {
+    /// The set discovery last told; none before it tells one.
+    list: Option<Vec<String>>,
+    /// The node has not answered `list` yet.
+    pending: bool,
 }
 
 pub struct PostInterface {
@@ -142,6 +162,7 @@ pub struct PostInterface {
     pub wake_listen_host: Option<String>,
     pub wake_listen_port: Option<u16>,
     exchange_signal: Arc<(Mutex<bool>, Condvar)>,
+    servers: Arc<Mutex<ServersToSend>>,
     /// Tests only: the identity `register_with_remote` signs with, in place
     /// of the transport's.
     #[cfg(test)]
@@ -272,9 +293,53 @@ impl PostInterface {
             wake_listen_host,
             wake_listen_port,
             exchange_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            servers: Arc::new(Mutex::new(ServersToSend::default())),
             #[cfg(test)]
             test_identity: None,
         })
+    }
+
+    /// Discovery told a new working set: owed to the node, and an exchange
+    /// starts now to carry it.
+    fn servers_changed(servers: &Mutex<ServersToSend>, signal: &(Mutex<bool>, Condvar), list: &[String]) {
+        {
+            let mut servers = servers.lock().unwrap();
+            servers.list = Some(list.to_vec());
+            servers.pending = true;
+        }
+        let (lock, cvar) = signal;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+    }
+
+    /// The servers this exchange carries: the set discovery last told,
+    /// while the node owes it an answer.
+    fn servers_to_send(&self) -> Option<Vec<String>> {
+        let servers = self.servers.lock().unwrap();
+        if servers.pending { servers.list.clone() } else { None }
+    }
+
+    /// The node answered an exchange that carried `sent`. Whatever it said,
+    /// the set is not sent again until discovery tells a new one or the
+    /// interface registers again: a node that refused it (not the gateway's
+    /// bridge, or a bad list) or does not know the field would answer the
+    /// same way. A set told while `sent` was on its way is still owed.
+    fn servers_answered(&self, sent: &[String], stored: Option<bool>) {
+        {
+            let mut servers = self.servers.lock().unwrap();
+            if servers.list.as_deref() == Some(sent) {
+                servers.pending = false;
+            }
+        }
+        let s = if sent.len() == 1 { "" } else { "s" };
+        match stored {
+            Some(true) => log(&format!("PostInterface: {} keeps the gateway's {} server{}", self.node_url, sent.len(), s),
+                crate::LOG_NOTICE, false, false),
+            Some(false) => log(&format!("PostInterface: {} did not keep the gateway's {} server{}; its log says why ([SERVERS-REFUSED])",
+                self.node_url, sent.len(), s), crate::LOG_WARNING, false, false),
+            None => log(&format!("PostInterface: {} does not take the gateway's servers", self.node_url),
+                crate::LOG_NOTICE, false, false),
+        }
     }
 
     /// Poll-mode floor, as in the Python PostInterface (`_min_interval`): the node's own
@@ -456,6 +521,18 @@ impl PostInterface {
 
         self.interface_id = Some(register_response.interface_id.clone());
         self.session_token = Some(session_token);
+        // The node may hold a new row for us now: it is owed the gateway's
+        // servers again, by an exchange that starts now.
+        let owed = {
+            let mut servers = self.servers.lock().unwrap();
+            servers.pending = servers.list.is_some();
+            servers.pending
+        };
+        if owed {
+            let (lock, cvar) = &*self.exchange_signal;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
         self.max_batch_packets = register_response.max_batch_packets.unwrap_or(Self::DEFAULT_MAX_BATCH_PACKETS);
         self.max_packet_bytes = register_response.max_packet_bytes.unwrap_or(Self::DEFAULT_MAX_PACKET_BYTES);
         if let Some(ms) = register_response.idle_exchange_interval_ms.filter(|ms| *ms > 0) {
@@ -567,6 +644,7 @@ impl PostInterface {
         };
 
         let ack_ids: Vec<String> = std::mem::take(&mut self.ack_batch_ids);
+        let servers = self.servers_to_send();
 
         let request = ExchangeRequest {
             interface_id,
@@ -575,6 +653,7 @@ impl PostInterface {
             max_packets: max_batch,
             packets: b64_packets,
             batch_id: batch_id.clone(),
+            servers: servers.clone(),
         };
 
         let body = serde_json::to_string(&request)
@@ -657,6 +736,10 @@ impl PostInterface {
         if let Some(ref err) = exchange_response.error {
             requeue_packets(&mut self.outbound_queue, &mut raw_packets, &self.queue_lock);
             return Err(format!("Exchange returned error: {}", err));
+        }
+
+        if let Some(ref sent) = servers {
+            self.servers_answered(sent, exchange_response.servers_stored);
         }
 
         let mut recv_count: usize = 0;
@@ -786,10 +869,19 @@ impl PostInterface {
             guard.running.store(true, Ordering::SeqCst);
             Arc::clone(&guard.running)
         };
-        let exchange_signal = {
+        let (exchange_signal, servers) = {
             let guard = iface.lock().unwrap();
-            Arc::clone(&guard.exchange_signal)
+            (Arc::clone(&guard.exchange_signal), Arc::clone(&guard.servers))
         };
+
+        // Discovery's working set, the gateway's servers for the node: heard
+        // from now on, and at once if discovery has told one already.
+        {
+            let signal = Arc::clone(&exchange_signal);
+            crate::discovery::listen_working(Box::new(move |list: &[String]| {
+                Self::servers_changed(&servers, &signal, list);
+            }));
+        }
 
         // Spawn wake HTTP server if configured
         {
@@ -1492,6 +1584,101 @@ mod tests {
         assert_eq!(paths, [CHALLENGE, REGISTER, EXCHANGE, CHALLENGE, REGISTER, EXCHANGE]);
         assert!(waited >= Duration::from_millis(1500) && waited < Duration::from_secs(3), "the first delay is 2 s, waited {waited:?}");
     }
+    // ── The gateway's servers (Reticulum-post GatewayServers) ────────────
+
+    const TWO: [&str; 2] = ["207.174.40.24:4242", "rns.reticulum.at:4242"];
+
+    fn told(p: &PostInterface, list: &[&str]) {
+        let list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        PostInterface::servers_changed(&p.servers, &p.exchange_signal, &list);
+    }
+
+    fn triggered(p: &PostInterface) -> bool {
+        *p.exchange_signal.0.lock().unwrap()
+    }
+
+    /// A gateway with a session at the fake node.
+    fn exchanging(url: &str) -> PostInterface {
+        let mut p = PostInterface::new(&cfg(&[("node_url", url)])).unwrap();
+        p.interface_id = Some("0123456789abcdef0123456789abcdef".into());
+        p.session_token = Some("feedface".repeat(8));
+        p
+    }
+
+    fn accepted(servers_stored: Option<bool>) -> Value {
+        let mut answer = json!({"status": "accepted", "delivery_packets": [], "delivery_more": false});
+        if let Some(stored) = servers_stored {
+            answer["servers_stored"] = json!(stored);
+        }
+        answer
+    }
+
+    /// What each exchange the node saw carried as `servers` (null: none).
+    fn servers_sent(seen: &Seen) -> Vec<Value> {
+        seen.lock().unwrap().iter().map(|(_, body)| body.get("servers").cloned().unwrap_or(Value::Null)).collect()
+    }
+
+    #[test]
+    fn the_gateway_s_servers_ride_each_exchange_until_the_node_answers() {
+        let (url, seen) = fake_php_node(vec![(500, json!({"error": "busy"})), (200, accepted(Some(true))), (200, accepted(None))]);
+        let mut p = exchanging(&url);
+        told(&p, &TWO);
+        assert!(triggered(&p), "a new set starts an exchange");
+        assert!(p.exchange().is_err());
+        assert!(p.servers.lock().unwrap().pending, "a failed exchange leaves the set to the next one");
+        p.exchange().unwrap();
+        assert!(!p.servers.lock().unwrap().pending, "the node's answer ends it");
+        p.exchange().unwrap();
+        assert_eq!(servers_sent(&seen), [json!(TWO), json!(TWO), Value::Null]);
+    }
+
+    #[test]
+    fn a_refusal_or_a_node_without_the_field_is_not_sent_the_set_again() {
+        let (url, seen) = fake_php_node(vec![(200, accepted(Some(false))), (200, accepted(None)), (200, accepted(None)), (200, accepted(None))]);
+        let mut p = exchanging(&url);
+        told(&p, &TWO[1..]);
+        p.exchange().unwrap();
+        p.exchange().unwrap();
+        told(&p, &TWO[1..]);
+        p.exchange().unwrap();
+        p.exchange().unwrap();
+        assert_eq!(servers_sent(&seen), [json!([TWO[1]]), Value::Null, json!([TWO[1]]), Value::Null],
+            "refused, then not again until told; unknown to the node, then not again");
+    }
+
+    #[test]
+    fn a_set_told_while_another_was_on_its_way_is_still_owed() {
+        let p = PostInterface::new(&cfg(&[])).unwrap();
+        told(&p, &TWO[..1]);
+        let sent = p.servers_to_send().unwrap();
+        told(&p, &TWO);
+        p.servers_answered(&sent, Some(true));
+        assert_eq!(p.servers_to_send(), Some(TWO.iter().map(|s| s.to_string()).collect()));
+    }
+
+    #[test]
+    fn a_registration_owes_the_node_the_set_again() {
+        let doc = vectors::doc();
+        let gateway = vectors::identity(&doc, "gateway");
+        let v = vectors::registration(&doc, "gateway-wake");
+        let c = vectors::challenge(&doc, v["challenge_id"].as_str().unwrap());
+        let answers = || vec![(200, c["challenge_response"].clone()), (200, v["response_example"].clone())];
+
+        let (url, _) = fake_php_node(answers());
+        let mut p = vector_gateway(&url, v);
+        told(&p, &TWO);
+        p.servers_answered(&TWO.iter().map(|s| s.to_string()).collect::<Vec<_>>(), Some(true));
+        *p.exchange_signal.0.lock().unwrap() = false;
+        p.register_signed(&gateway).unwrap();
+        assert!(p.servers.lock().unwrap().pending, "a registration owes the node the set");
+        assert!(triggered(&p), "and starts an exchange to carry it");
+
+        let (url, _) = fake_php_node(answers());
+        let mut p = vector_gateway(&url, v);
+        p.register_signed(&gateway).unwrap();
+        assert!(!p.servers.lock().unwrap().pending && !triggered(&p), "with no set told, it owes nothing");
+    }
+
 }
 
 /// Whole-request ceiling for one accepted wake connection.
@@ -1717,4 +1904,5 @@ mod wake_body_tests {
         assert_eq!(wake_body_waker_url("not json"), "");
         assert_eq!(wake_body_waker_url(""), "");
     }
+
 }

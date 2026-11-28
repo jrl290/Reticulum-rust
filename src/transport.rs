@@ -2360,6 +2360,9 @@ impl Transport {
             state.interface_discovery = Some(Arc::clone(&discovery));
             state.interface_announce_handler = Some(Arc::new(handler));
         }
+        // The running discovery's working set goes to whoever listens (the
+        // PostInterface: the servers its node gives the apps).
+        discovery.tell_working_to(Box::new(|working: &[String]| crate::discovery::tell_working(working)));
         let spawned = thread::Builder::new()
             .name("connect_discovered".to_string())
             .spawn(move || discovery.connect_discovered());
